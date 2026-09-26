@@ -16,7 +16,9 @@
 //! drifts, which is exactly what a search-once-and-hold method fits, so that
 //! is what this module uses.
 
-use crate::signal::dsp::timing::{find_phase, interpolate};
+#[cfg(test)]
+use crate::signal::dsp::timing::find_phase;
+use crate::signal::dsp::timing::interpolate;
 
 /// How many candidate phases [`slice`] tries per symbol period. 16 puts the
 /// worst-case phase error at 1/32 of a symbol - a sixteenth either side of
@@ -41,14 +43,16 @@ pub fn slice(
     slice_at(discriminator, sps, symbols, threshold, phase)
 }
 
-/// The sampling phase within a symbol that [`slice`] would search for,
-/// found once over `discriminator`.
+/// The phase search [`slice`] makes, over a capture that grows: the same
+/// answer as searching the whole capture each time
+/// (`dsp::timing::PhaseSearch`), for a receiver that tries a capture as it
+/// arrives.
 ///
-/// Exposed so a caller slicing the same signal from several starting points
-/// a whole number of symbols apart can search once: a shift by whole symbols
-/// moves where the slicing starts, not where inside each symbol it samples.
-pub fn phase(discriminator: &[f32], sps: f64, symbols: usize) -> f64 {
-    find_phase(discriminator, sps, symbols, PHASE_RESOLUTION)
+/// A shift by whole symbols moves where slicing starts, not where inside
+/// each symbol it samples, so one search serves every candidate start a
+/// whole number of symbols apart.
+pub fn growing(sps: f64) -> crate::signal::dsp::timing::PhaseSearch {
+    crate::signal::dsp::timing::PhaseSearch::new(sps, PHASE_RESOLUTION)
 }
 
 /// Recover one bit per symbol from a discriminator's instantaneous-frequency

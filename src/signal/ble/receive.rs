@@ -461,6 +461,18 @@ pub struct Receiver {
     history: std::collections::VecDeque<Complex<f32>>,
     capture: Vec<Complex<f32>>,
     capturing: bool,
+    /// The capture through the discriminator, grown as the capture grows:
+    /// a reading depends on two samples only, so the ones already made
+    /// never change. A capture is tried every octet, and discriminating the
+    /// whole of it each time made the work grow with the square of the
+    /// packet.
+    inst: Vec<f32>,
+    /// `inst_sums[i]` is the sum of the first `i` readings: each candidate's
+    /// threshold, the mean from its start, as one difference.
+    inst_sums: Vec<f64>,
+    /// The phase search over the capture so far (`sync::growing`), grown
+    /// with it.
+    search: crate::signal::dsp::timing::PhaseSearch,
     /// What happened to each trigger since the worker last asked
     /// ([`Self::take_funnel`]).
     funnel: Funnel,
@@ -553,6 +565,9 @@ impl Receiver {
             phy,
             history: std::collections::VecDeque::with_capacity(LOOKBACK_SAMPLES + 1),
             capture: Vec::new(),
+            inst: Vec::new(),
+            inst_sums: vec![0.0],
+            search: super::sync::growing(WORKING_SPS as f64),
             capturing: false,
             funnel: Funnel::default(),
             raw_per_working: raw_rate / working_rate_hz(phy),
@@ -864,6 +879,10 @@ impl Receiver {
                     self.capturing = true;
                     self.trigger_pair = first_pair + (j as f64 * self.raw_per_working) as u64;
                     self.capture = self.history.iter().copied().collect();
+                    self.inst.clear();
+                    self.inst_sums.clear();
+                    self.inst_sums.push(0.0);
+                    self.search = super::sync::growing(WORKING_SPS as f64);
                     self.trigger_len = self.capture.len();
                     // The history ends with this sample.
                     self.capture_origin = worked + j as u64 + 1 - self.trigger_len as u64;
@@ -903,7 +922,7 @@ impl Receiver {
     /// either side of [`LOOKBACK_SAMPLES`], which is `self.capture`'s own
     /// nominal boundary once `push` starts seeding it from
     /// [`Receiver::history`] rather than empty.
-    fn try_decode(&self) -> Option<Packet> {
+    fn try_decode(&mut self) -> Option<Packet> {
         self.candidates()
             .into_iter()
             .find(|(.., packet)| packet.crc_ok)
@@ -913,33 +932,45 @@ impl Receiver {
     /// Every alignment [`Self::try_decode`] searches, in order, decoded: the
     /// header start it was read from, the phase it was sliced at, and the
     /// packet, CRC passed or not, not yet measured ([`Self::measured`]).
-    fn candidates(&self) -> Vec<(usize, f64, Packet)> {
+    fn candidates(&mut self) -> Vec<(usize, f64, Packet)> {
         let center = LOOKBACK_SAMPLES as isize;
         let step = WORKING_SPS as isize;
         let span = HEADER_SEARCH_SYMBOLS as isize;
-        // One discriminator pass for every candidate: see `decode_at`.
-        let inst = self.discriminated();
+        // One discriminator pass for every candidate (see `decode_at`),
+        // grown by what arrived since the last try.
+        self.grow();
         // And one phase search. The candidates are whole symbols apart, so
         // they share where inside a symbol to sample; searching from the
         // earliest one uses every symbol any of them will read. Thirteen
         // searches, each over nearly the same samples, were most of what a
-        // capture that never passed its CRC cost.
+        // capture that never passed its CRC cost; one search from scratch
+        // on every try was most of what was left.
         let earliest = (center - span * step).max(0) as usize;
-        let from_earliest = &inst[earliest.min(inst.len())..];
-        let phase = super::sync::phase(
-            from_earliest,
-            WORKING_SPS as f64,
-            from_earliest.len() / WORKING_SPS,
-        );
+        let from_earliest = &self.inst[earliest.min(self.inst.len())..];
+        let phase = self
+            .search
+            .phase(from_earliest, from_earliest.len() / WORKING_SPS);
         let mut out = Vec::new();
-        for k in -span..=span {
+        // From the nominal boundary outwards, where the right one nearly
+        // always is: each alignment that decodes costs a slice of the whole
+        // packet, and at most one passes its CRC, so the order only decides
+        // how many are sliced before it.
+        let order = (0..=span).flat_map(|d| if d == 0 { vec![0] } else { vec![-d, d] });
+        for k in order {
             let skip = center + k * step;
             if skip < 0 {
                 continue;
             }
-            if let Some(packet) = self.decode_at(&inst, skip as usize, Some(phase)) {
+            let skip = skip as usize;
+            if skip >= self.inst.len() {
+                continue;
+            }
+            // The capture's own mean from here on: see `decode_at`.
+            let n = self.inst.len();
+            let mean = (self.inst_sums[n] - self.inst_sums[skip]) / (n - skip) as f64;
+            if let Some(packet) = self.decode_at(&self.inst, skip, phase, mean as f32) {
                 let passed = packet.crc_ok;
-                out.push((skip as usize, phase, packet));
+                out.push((skip, phase, packet));
                 // The search stops at the first CRC that passes, as it
                 // always has: later alignments cannot beat a passing one.
                 if passed {
@@ -972,7 +1003,7 @@ impl Receiver {
     /// on the same recording. This reports those three (one address bit
     /// flipped in each) and 9 of the 41, where their length agrees with the
     /// signal; the CRC-good output is byte-identical on both recordings.
-    fn best_failed_candidate(&self) -> Option<Packet> {
+    fn best_failed_candidate(&mut self) -> Option<Packet> {
         let end = energy_end(&self.capture, LOOKBACK_SAMPLES)?;
         let tolerance = END_TOLERANCE_SYMBOLS * WORKING_SPS;
         self.candidates()
@@ -986,11 +1017,15 @@ impl Receiver {
             .map(|(_, skip, phase, packet)| self.measured(skip, phase, packet))
     }
 
-    /// The whole capture through the discriminator, once.
-    fn discriminated(&self) -> Vec<f32> {
-        let mut inst = Vec::new();
-        discriminate(&self.capture, working_rate_hz(self.phy), &mut inst);
-        inst
+    /// The discriminator over the capture, extended to its end.
+    fn grow(&mut self) {
+        let rate = working_rate_hz(self.phy);
+        for i in self.inst.len()..self.capture.len().saturating_sub(1) {
+            let f = instantaneous_freq_hz(self.capture[i], self.capture[i + 1], rate);
+            self.inst.push(f);
+            let total = self.inst_sums[self.inst_sums.len() - 1] + f as f64;
+            self.inst_sums.push(total);
+        }
     }
 
     /// The decode at one candidate header start, `skip` samples into the
@@ -1001,9 +1036,10 @@ impl Receiver {
     /// function of two neighbouring samples and nothing else - so the search
     /// over candidate boundaries slices one pass rather than making thirteen.
     ///
-    /// `phase`, when given, is the sub-symbol sampling phase already found
-    /// for this capture (see `try_decode`); `None` searches for it here.
-    fn decode_at(&self, whole: &[f32], skip: usize, phase: Option<f64>) -> Option<Packet> {
+    /// `phase` is the sub-symbol sampling phase found for the capture (see
+    /// `candidates`), and `threshold` the mean of the readings from `skip`
+    /// on.
+    fn decode_at(&self, whole: &[f32], skip: usize, phase: f64, threshold: f32) -> Option<Packet> {
         if skip >= self.capture.len() {
             return None;
         }
@@ -1024,10 +1060,7 @@ impl Receiver {
         // any real stretch of bits - and this only needs a point estimate:
         // a threshold decision does not need a calibrated uncertainty, only
         // the displayed reading below does, and gets its own.
-        let rough_offset = crate::signal::dsp::uncertainty::mean_with_uncertainty(inst);
         let sps = WORKING_SPS as f64;
-        let phase = phase.unwrap_or_else(|| super::sync::phase(inst, sps, symbols));
-        let threshold = rough_offset.value() as f32;
         // The header first, alone. Most attempts come before the packet has
         // finished arriving, and its length says so from sixteen bits;
         // slicing and decoding the rest only to find it short was most of
@@ -1036,10 +1069,15 @@ impl Receiver {
         // only skips work whose answer was already `None`.
         let (mut header, _) = super::sync::slice_at(inst, sps, pdu::HEADER_BITS, threshold, phase);
         whiten(&mut header, self.channel);
-        if pdu::used_bits(pdu::length(&header)?) > symbols {
+        let wanted = pdu::used_bits(pdu::length(&header)?);
+        if wanted > symbols {
             return None;
         }
-        let (mut bits, _) = super::sync::slice_at(inst, sps, symbols, threshold, phase);
+        // The packet's own bits, not the whole capture: a candidate whose
+        // header reads a short length would otherwise slice everything
+        // captured so far on every try, which a busy channel paid for with
+        // the square of the capture. `decode` reads no further than this.
+        let (mut bits, _) = super::sync::slice_at(inst, sps, wanted, threshold, phase);
         // The modulation-quality measurement needs the physically
         // transmitted (still-whitened) symbols - exactly what `bits` is
         // before the next line undoes whitening to recover the data
@@ -1049,21 +1087,12 @@ impl Receiver {
         let raw_bits = bits.clone();
         whiten(&mut bits, self.channel);
         let mut packet = pdu::decode(&bits)?;
-        // Trimmed to exactly this packet's own bits before measuring: `bits`
-        // runs to the end of whatever has been captured,
-        // which is deliberately more than one packet's worth (see this
-        // struct's own `push`), and letting the search wander into trailing
-        // noise or the next packet's preamble would mix an unrelated
-        // signal's deviation into this one's own reading.
+        // Exactly this packet's own bits: the capture runs on past it
+        // (see this struct's own `push`), and letting a measurement wander
+        // into trailing noise or the next packet's preamble would mix an
+        // unrelated signal's deviation into this one's own reading.
         let used = pdu::used_bits(packet.length).min(raw_bits.len());
         let raw_bits = &raw_bits[..used];
-        // The *reported* offset is read against the sync word, not the
-        // packet's data: see `sync_offset`. `rough_offset` above never had to
-        // be exact, only good enough to slice against; this one is what a
-        // reader sees a `+/-` on.
-        let offset = self.sync_offset();
-        packet.freq_offset_hz = offset;
-        packet.snr_db = offset.and_then(|o| self.corrected_snr_db(o.value()));
         // Where the PDU sits in the stream, for the measurement to find it
         // again in the raw samples: `inst[i]` stands for capture instant
         // `i + 0.5`, and working sample `w` for raw instant `delay + w * d`
@@ -1076,7 +1105,7 @@ impl Receiver {
         Some(packet)
     }
 
-    /// `packet`, decoded at `skip` and `phase`, with its modulation and drift
+    /// `packet`, decoded at `skip` and `phase`, with its offset, SNR, modulation and drift
     /// read: once, for the packet the search settled on, never for the
     /// alignments it tried on the way. Building the rebuilt waveform for
     /// every alignment that decoded, CRC or not, on every attempt while a
@@ -1088,21 +1117,44 @@ impl Receiver {
     /// and as the test suites define them (`dsp::deviation::suite_readings`).
     /// The slicer keeps the plain readings: a bit is decided by which side
     /// of the line it falls, and that the chord gets right. `inst[i]` sits
-    /// halfway between capture samples `i` and `i + 1`. On either PHY, each
-    /// scaled by its own symbol rate; for LE 1M the worker reads them again
-    /// from the raw samples (`signal::net::measure`).
+    /// halfway between capture samples `i` and `i + 1`, scaled by the PHY's
+    /// own symbol rate.
+    ///
+    /// **The modulation and drift on LE 2M only.** LE 1M is read by the
+    /// worker from the raw samples
+    /// (`signal::net::measure`), through the measurement filter and timed by
+    /// the packet's known bits, and reading it here as well built the
+    /// rebuilt waveform twice for every packet, a fifth of what a busy
+    /// channel cost, for figures the worker then replaced.
     fn measured(&self, skip: usize, phase: f64, mut packet: Packet) -> Packet {
+        // The *reported* offset is read against the sync word, not the
+        // packet's data: see `sync_offset`. The slicing threshold never had
+        // to be exact, only good enough to slice against; this one is what a
+        // reader sees a `+/-` on. It and the SNR depend on the sync word
+        // alone, not on the alignment: worked out for every alignment that
+        // decoded, they were a sine and a cosine a sample of the sync word,
+        // many times a packet.
+        let offset = self.sync_offset();
+        packet.freq_offset_hz = offset;
+        packet.snr_db = offset.and_then(|o| self.corrected_snr_db(o.value()));
+        if self.phy == Phy::OneM {
+            return packet;
+        }
         let fine = Oversampled::new(&self.capture, working_rate_hz(self.phy));
         let sps = WORKING_SPS as f64;
         // Bit `x` periods into the PDU, as a capture instant: bit `k`'s
         // centre, `k + 0.5`, is where the slicer sampled it.
         let at = |x: f64| fine.at(skip as f64 + phase + (x - 0.5) * sps + 0.5);
-        packet.modulation = crate::signal::dsp::deviation::suite_readings(&packet.air, at)
-            .and_then(|(settled, alternating)| {
-                super::measure::modulation_from(&settled, &alternating, self.phy)
-            });
+        // Every bit read once, for the modulation and the carrier both.
+        let readings = crate::signal::dsp::deviation::BitReadings::read(packet.air.len(), at);
+        packet.modulation =
+            crate::signal::dsp::deviation::suite_readings_from(&packet.air, &readings).and_then(
+                |(settled, alternating)| {
+                    super::measure::modulation_from(&settled, &alternating, self.phy)
+                },
+            );
         // The preamble is not in the capture: the first block stands for f0.
-        let carrier = crate::signal::dsp::carrier::by_bit(&packet.air, at);
+        let carrier = crate::signal::dsp::carrier::by_bit_from(&packet.air, &readings);
         let crc_start = packet.air.len().saturating_sub(pdu::CRC_BITS);
         let blocks = crate::signal::dsp::carrier::ten_bit_blocks(&carrier, 1, crc_start);
         packet.drift = super::measure::drift_from(None, &blocks, self.phy);
@@ -1653,16 +1705,10 @@ mod tests {
             assert!(p.crc_ok, "{offset_hz} Hz off: CRC failed");
             let cfo = p.freq_offset_hz.expect("an offset is measured").value();
             assert!(cfo.abs() < 10_000.0, "{offset_hz} Hz off: CFO {cfo} Hz");
-            let index = p
-                .modulation
-                .as_ref()
-                .expect("the modulation is measured")
-                .modulation_index
-                .value();
-            assert!(
-                (0.45..=0.55).contains(&index),
-                "{offset_hz} Hz off: index {index}"
-            );
+            // LE 1M's modulation is the worker's to read, from the raw
+            // samples (`signal::net::measure::le_1m`, whose own test runs a
+            // channel off the tuning).
+            assert!(p.modulation.is_none(), "{offset_hz} Hz off: read twice");
         }
     }
 

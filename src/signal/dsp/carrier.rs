@@ -27,18 +27,8 @@
 //! `signal::net::conformance` holds the blocks this gives on random traffic
 //! to the carrier the reference transmitter was given.
 
-use super::deviation::READINGS_PER_BIT;
+use super::deviation::{BitReadings, READINGS_PER_BIT};
 use super::uncertainty::Uncertain;
-
-/// The mean of `at` over bit `k`, at [`READINGS_PER_BIT`] evenly spaced
-/// instants: the suites' reading of one bit.
-fn bit_mean(at: &impl Fn(f64) -> f32, k: usize) -> f64 {
-    let n = READINGS_PER_BIT;
-    (0..n)
-        .map(|j| at(k as f64 + (j as f64 + 0.5) / n as f64) as f64)
-        .sum::<f64>()
-        / n as f64
-}
 
 /// The initial carrier f0: the mean of `at` (the frequency at `x` bit
 /// periods from the start of bit 0) from the centre of bit `first` to the
@@ -67,13 +57,19 @@ pub fn initial(at: impl Fn(f64) -> f32, first: usize, preamble_bits: usize) -> f
 /// the two, which converges to it), and a bit's carrier is its reading less
 /// its context's offset: a linear drift then leaves nothing behind, and a
 /// curved one only its bend.
+#[cfg(test)]
 pub fn by_bit(bits: &[bool], at: impl Fn(f64) -> f32) -> Vec<Option<f64>> {
+    by_bit_from(bits, &BitReadings::read(bits.len(), at))
+}
+
+/// [`by_bit`], from readings already taken.
+pub fn by_bit_from(bits: &[bool], readings: &BitReadings) -> Vec<Option<f64>> {
     const ROUNDS: usize = 12;
     let n = bits.len();
     let context =
         |k: usize| (bits[k - 1] as usize) << 2 | (bits[k] as usize) << 1 | bits[k + 1] as usize;
     let inner: Vec<(usize, usize, f64)> = (1..n.saturating_sub(1))
-        .map(|k| (k, context(k), bit_mean(&at, k)))
+        .map(|k| (k, context(k), readings.mean(k)))
         .collect();
     let counts = inner.iter().fold([0usize; 8], |mut c, &(_, ctx, _)| {
         c[ctx] += 1;

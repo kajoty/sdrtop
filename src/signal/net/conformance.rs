@@ -1439,6 +1439,56 @@ mod chain {
         }
     }
 
+    /// **What a packet costs, measured with packets in it.** Not a check:
+    /// run by hand, in release, for a profiler (`cargo test --release
+    /// what_the_chain_costs_with_packets -- --ignored --nocapture`).
+    /// `measure_the_receive_chain` feeds noise and so never prices a packet;
+    /// this builds the report's densest streams once (LE 1M at 8 Msps, a
+    /// packet every 0.7 ms; BR at 4 Msps, a header every 3.2 ms, one
+    /// channel) and runs the chain over them twenty times, so the reference
+    /// that built them is a twentieth of the profile.
+    #[test]
+    #[ignore]
+    fn what_the_chain_costs_with_packets() {
+        let le = {
+            let tx = Gfsk::new(1e6, LE_DEVIATION_HZ, 0.5);
+            let built: Vec<_> = (0..12)
+                .map(|p| le_packet([0x10 + p as u8, 0x22, 0x33, 0x44, 0x55, 0xC6]))
+                .collect();
+            let bursts: Vec<Burst> = built
+                .iter()
+                .map(|(bits, ..)| Burst::new(tx, bits))
+                .collect();
+            stream(&bursts, 8e6, 300e-6, 700e-6, 40.0, 57)
+        };
+        let br = {
+            let tx = Gfsk::new(1e6, BR_DEVIATION_HZ, 0.5);
+            let mut rng = Rng::new(5);
+            let built: Vec<_> = (0..12).map(|_| br_packet(BR_LAP, &mut rng)).collect();
+            let bursts: Vec<Burst> = built.iter().map(|(bits, _)| Burst::new(tx, bits)).collect();
+            stream(&bursts, 4e6, 300e-6, 3.2e-3, 40.0, 69)
+        };
+        let only = std::env::var("SDRTOP_CHAIN").ok();
+        let br_tuned = crate::signal::bt::channel::centre_hz(BR_CHANNEL).unwrap();
+        for (name, preset, tuned, rate, bytes, per_s) in [
+            ("le", "net_ble", LE_TUNED_HZ, 8e6, &le, 12.0 / 8.7e-3),
+            ("br", "net_bt", br_tuned, 4e6, &br, 12.0 / 38.7e-3),
+        ] {
+            if only.as_deref().is_some_and(|o| o != name) {
+                continue;
+            }
+            let loads: Vec<f64> = (0..20)
+                .map(|_| run(preset, tuned, rate, bytes, 1).1)
+                .collect();
+            let load = loads.iter().sum::<f64>() / loads.len() as f64;
+            eprintln!(
+                "{name}: {load:.2}x real time at {per_s:.0} packets a second, \
+                 {:.2} ms of chain a packet, idle share included",
+                load * bytes.len() as f64 / 2.0 / rate / 12.0 * 1e3
+            );
+        }
+    }
+
     /// **The chain held to the reference, on every run.** One clean case a
     /// protocol, small enough for the debug build: the figures sdrtop shows
     /// are the suites' definitions of them, read from the transmitter's

@@ -63,23 +63,67 @@ pub const READINGS_PER_BIT: usize = 32;
 /// puts on the carrier just the same. A drift over the span moves the
 /// midpoint to the middle of it, and one polarity's readings up and the
 /// other's down by the same amount, which the averages of both then cancel.
+#[cfg(test)]
 pub fn suite_readings(bits: &[bool], at: impl Fn(f64) -> f32) -> Option<(Vec<f32>, Vec<f32>)> {
-    let n = READINGS_PER_BIT;
-    let within = |k: usize| -> Vec<f32> {
-        (0..n)
-            .map(|j| at(k as f64 + (j as f64 + 0.5) / n as f64))
-            .collect()
-    };
+    suite_readings_from(bits, &BitReadings::read(bits.len(), at))
+}
+
+/// A span's readings, taken once: [`READINGS_PER_BIT`] across each bit and
+/// one at its centre, at `at(x)` for `x` in bit periods from the start of bit
+/// 0. What [`suite_readings_from`] and `dsp::carrier::by_bit_from` both
+/// read, so a burst read for both is read once: they asked for the same
+/// thirty-two readings of every bit, each on its own.
+pub struct BitReadings {
+    within: Vec<f32>,
+    centres: Vec<f32>,
+}
+
+impl BitReadings {
+    /// The readings of `bits` bits.
+    pub fn read(bits: usize, at: impl Fn(f64) -> f32) -> Self {
+        let n = READINGS_PER_BIT;
+        let mut within = Vec::with_capacity(bits * n);
+        let mut centres = Vec::with_capacity(bits);
+        for k in 0..bits {
+            within.extend((0..n).map(|j| at(k as f64 + (j as f64 + 0.5) / n as f64)));
+            centres.push(at(k as f64 + 0.5));
+        }
+        Self { within, centres }
+    }
+
+    /// The same readings from bit `from` on, as if read from there.
+    pub fn tail_from(&self, from: usize) -> Self {
+        Self {
+            within: self.within[(from * READINGS_PER_BIT).min(self.within.len())..].to_vec(),
+            centres: self.centres[from.min(self.centres.len())..].to_vec(),
+        }
+    }
+
+    /// Bit `k`'s mean reading, as the suites read a bit.
+    pub fn mean(&self, k: usize) -> f64 {
+        let n = READINGS_PER_BIT;
+        self.within[k * n..(k + 1) * n]
+            .iter()
+            .map(|&f| f as f64)
+            .sum::<f64>()
+            / n as f64
+    }
+
+    /// Bit `k`'s reading at its centre.
+    pub fn centre(&self, k: usize) -> f32 {
+        self.centres[k]
+    }
+}
+
+/// [`suite_readings`], from readings already taken.
+pub fn suite_readings_from(bits: &[bool], readings: &BitReadings) -> Option<(Vec<f32>, Vec<f32>)> {
     let neighbours = |k: usize| (bits[k - 1], bits[k], bits[k + 1]);
     let mut settled = Vec::new();
     let mut alternating = Vec::new();
     for k in 1..bits.len().saturating_sub(1) {
         match neighbours(k) {
-            (a, b, c) if a == b && b == c => {
-                let r = within(k);
-                settled.push((b, r.iter().map(|&f| f as f64).sum::<f64>() / n as f64));
-            }
-            (a, b, c) if a != b && b != c => alternating.push((b, at(k as f64 + 0.5) as f64)),
+            (a, b, c) if a == b && b == c => settled.push((b, readings.mean(k))),
+            (a, b, c) if a != b && b != c => alternating.push((b, readings.centre(k) as f64)),
             _ => {}
         }
     }

@@ -36,7 +36,7 @@ use num_complex::Complex;
 use crate::signal::ble::measure::{drift_from, modulation_from, Drift, ModulationQuality};
 use crate::signal::ble::Phy;
 use crate::signal::bt::piconet::Deviation;
-use crate::signal::dsp::deviation::suite_readings;
+use crate::signal::dsp::deviation::{suite_readings_from, BitReadings};
 use crate::signal::dsp::discriminate::Oversampled;
 use crate::signal::dsp::fir::{design_lowpass_to_spec, StreamingDecimator};
 use crate::signal::dsp::nco::Nco;
@@ -376,7 +376,7 @@ pub fn classic(
     sync_end_pair: f64,
 ) -> Option<ClassicReading> {
     use crate::signal::bt::header::{HEADER_AIR_BITS, TRAILER_BITS};
-    use crate::signal::dsp::carrier::{by_bit, initial, ten_bit_blocks};
+    use crate::signal::dsp::carrier::{by_bit_from, initial, ten_bit_blocks};
     const PREAMBLE: usize = 4;
     let sync = crate::signal::bt::access_code::access_code_bits(lap);
     let (s0, s63) = (sync[0], sync[63]);
@@ -428,10 +428,12 @@ pub fn classic(
         header.extend([sum > 0.0; 3]);
     }
     let all: Vec<bool> = known.iter().chain(&header).copied().collect();
-    let deviation = suite_readings(&all[PREAMBLE..], |x| at(x + PREAMBLE as f64))
+    // Every bit read once, for the modulation and the carrier both.
+    let readings = BitReadings::read(all.len(), at);
+    let deviation = suite_readings_from(&all[PREAMBLE..], &readings.tail_from(PREAMBLE))
         .map(|(settled, alternating)| Deviation::from_readings(&settled, &alternating))?;
     let f0 = initial(at, 0, PREAMBLE);
-    let blocks = ten_bit_blocks(&by_bit(&all, at), PREAMBLE + 1, all.len() - 1);
+    let blocks = ten_bit_blocks(&by_bit_from(&all, &readings), PREAMBLE + 1, all.len() - 1);
     let carrier = crate::signal::dsp::carrier::drift_from(Some((f0, PREAMBLE)), &blocks, 1e6)
         .map(|drift| (f0, drift));
     Some(ClassicReading { deviation, carrier })
@@ -458,7 +460,7 @@ pub fn le_1m(
     use crate::signal::ble::detect::{
         access_address_bits, preamble_bits, ADVERTISING_ACCESS_ADDRESS,
     };
-    use crate::signal::dsp::carrier::{by_bit, initial, ten_bit_blocks};
+    use crate::signal::dsp::carrier::{by_bit_from, initial, ten_bit_blocks};
     let preamble = preamble_bits(ADVERTISING_ACCESS_ADDRESS, Phy::OneM);
     let mut known = preamble.clone();
     known.extend(access_address_bits(ADVERTISING_ACCESS_ADDRESS));
@@ -471,10 +473,12 @@ pub fn le_1m(
         return None;
     };
     let all: Vec<bool> = known.iter().chain(air).copied().collect();
-    let modulation = suite_readings(&all, |x| aligned.at(x))
+    // Every bit read once, for the modulation and the carrier both.
+    let readings = BitReadings::read(all.len(), |x| aligned.at(x));
+    let modulation = suite_readings_from(&all, &readings)
         .and_then(|(settled, alternating)| modulation_from(&settled, &alternating, Phy::OneM));
     let f0 = initial(|x| aligned.at(x), 0, preamble.len());
-    let carrier = by_bit(&all, |x| aligned.at(x));
+    let carrier = by_bit_from(&all, &readings);
     let pdu = known.len();
     let crc = pdu + air.len().saturating_sub(crate::signal::ble::pdu::CRC_BITS);
     let blocks = ten_bit_blocks(&carrier, pdu + 1, crc);
@@ -508,6 +512,75 @@ mod tests {
                 assert!(db <= -40.0, "{rate}: {db} dB at {hz}");
                 hz += 25e3;
             }
+        }
+    }
+
+    /// An LE 1M packet off the tuned centre, handed over with its PDU's
+    /// start misplaced by up to 0.3 of a bit: timed back from its preamble
+    /// and access address, it reads the suites' figures as the reference
+    /// reads the same bits, and its carrier as sent.
+    #[test]
+    fn an_le_packet_reads_as_the_suites_define() {
+        use crate::signal::ble::detect::{
+            access_address_bits, preamble_bits, ADVERTISING_ACCESS_ADDRESS,
+        };
+        let rate = 8e6;
+        let offset = 1e6;
+        let mut rng = Rng::new(12);
+        let mut bits = preamble_bits(ADVERTISING_ACCESS_ADDRESS, Phy::OneM);
+        bits.extend(access_address_bits(ADVERTISING_ACCESS_ADDRESS));
+        let pdu_at = bits.len();
+        let air: Vec<bool> = (0..312).map(|_| rng.next_u64() & 1 == 1).collect();
+        bits.extend(&air);
+        let lead = 20;
+        let mut all: Vec<bool> = (0..lead).map(|_| rng.next_u64() & 1 == 1).collect();
+        all.extend(&bits);
+        all.extend((0..20).map(|_| rng.next_u64() & 1 == 1));
+
+        let tx = Gfsk::new(1e6, 250_000.0, 0.5).with_cfo(offset + 12_000.0);
+        let burst = Burst::new(tx, &all);
+        let n = burst.len_at(rate);
+        let iq: Vec<Complex<f32>> = burst
+            .iq(rate, n)
+            .iter()
+            .map(|z| Complex::new(z.re as f32 * 0.5, z.im as f32 * 0.5))
+            .collect();
+        let base = 500_000u64;
+        let recent = Recent::new([(base, &iq[..])]);
+
+        // The reference: the suites' readings of the same bits, ideally.
+        let ideal = Burst::new(Gfsk::new(1e6, 250_000.0, 0.5), &all);
+        let from = lead;
+        let (settled, alternating) = crate::signal::dsp::deviation::suite_readings(&bits, |x| {
+            ideal.frequency((from as f64 + x) * 1e-6) as f32
+        })
+        .unwrap();
+        let want = modulation_from(&settled, &alternating, Phy::OneM).unwrap();
+
+        let bit = rate / 1e6;
+        let pdu_centre = base as f64 + ((lead + pdu_at) as f64 + 0.5) * bit;
+        for wrong in [-0.3, 0.0, 0.3] {
+            let (modulation, drift) =
+                le_1m(&recent, rate, offset, pdu_centre + wrong * bit, &air).expect("held");
+            let got = modulation.expect("both kinds of bit");
+            for (name, g, w) in [
+                (
+                    "df1",
+                    got.delta_f1_avg_hz.value(),
+                    want.delta_f1_avg_hz.value(),
+                ),
+                (
+                    "df2",
+                    got.delta_f2_avg_hz.value(),
+                    want.delta_f2_avg_hz.value(),
+                ),
+            ] {
+                assert!((g - w).abs() < 0.01 * w, "{wrong}: {name} {g} vs {w}");
+            }
+            let drift = drift.expect("blocks enough");
+            let f0 = drift.initial_hz.value();
+            assert!((f0 - 12_000.0).abs() < 1_000.0, "{wrong}: f0 {f0}");
+            assert!(drift.drift_hz.value().abs() < 3_000.0, "{wrong}: {drift:?}");
         }
     }
 

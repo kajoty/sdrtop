@@ -184,6 +184,11 @@ pub fn recover(x: &[f32], start: f64, sps: f64, gain: f64, symbols: usize) -> Ve
 /// less of it. `the_cubic_probe_is_flatter_under_noise_than_linear_was`
 /// measures the reduction directly, on a noisy signal, rather than trusting
 /// the four coefficients' own arithmetic to be enough on its own.
+///
+/// Test-only since the receiver searches a growing capture with
+/// [`PhaseSearch`]: this is the definition that search is held to, bit for
+/// bit.
+#[cfg(test)]
 pub fn find_phase(x: &[f32], sps: f64, symbols: usize, resolution: usize) -> f64 {
     let resolution = resolution.max(1);
     let mut best_phase = 0.0;
@@ -201,10 +206,95 @@ pub fn find_phase(x: &[f32], sps: f64, symbols: usize, resolution: usize) -> f64
     best_phase
 }
 
+/// [`find_phase`] over a buffer that only grows, without starting again.
+///
+/// **A decoder searching a capture as it arrives searched all of it every
+/// time.** A BLE capture is tried every octet, and each try searched every
+/// phase over every symbol so far: the work grew with the square of the
+/// packet, and was the largest single cost of a busy channel. A symbol's
+/// probe reads four samples; once the fourth has arrived, its value can
+/// never change again, because the buffer only grows at its end. So each
+/// phase keeps the sum of its probes that are final, and a search adds the
+/// new final ones and computes only the last one or two, whose four
+/// samples are not all there yet.
+///
+/// **The same number, bit for bit**: the terms are added in [`find_phase`]'s
+/// own order, `the_growing_search_is_find_phase` holds it to that over
+/// every prefix of a buffer.
+pub struct PhaseSearch {
+    sps: f64,
+    resolution: usize,
+    /// For each phase, the sum of its first `settled` probes.
+    sums: Vec<f64>,
+    settled: Vec<usize>,
+}
+
+impl PhaseSearch {
+    pub fn new(sps: f64, resolution: usize) -> Self {
+        let resolution = resolution.max(1);
+        Self {
+            sps,
+            resolution,
+            sums: vec![0.0; resolution],
+            settled: vec![0; resolution],
+        }
+    }
+
+    /// `find_phase(x, sps, symbols, resolution)`, for an `x` that has only
+    /// grown since the last call, and a `symbols` that has not shrunk.
+    pub fn phase(&mut self, x: &[f32], symbols: usize) -> f64 {
+        let mut best_phase = 0.0;
+        let mut best_score = f64::NEG_INFINITY;
+        // A probe is final once the last of its four samples is there.
+        let complete = |pos: f64| pos >= 0.0 && (pos.floor() as usize) + 2 < x.len();
+        for step in 0..self.resolution {
+            let phase = self.sps * step as f64 / self.resolution as f64;
+            let at = |k: usize| phase + k as f64 * self.sps;
+            while self.settled[step] < symbols && complete(at(self.settled[step])) {
+                let k = self.settled[step];
+                self.sums[step] += cubic_interpolate(x, at(k)).abs() as f64;
+                self.settled[step] += 1;
+            }
+            let mut score = self.sums[step];
+            for k in self.settled[step]..symbols {
+                score += cubic_interpolate(x, at(k)).abs() as f64;
+            }
+            if score > best_score {
+                best_score = score;
+                best_phase = phase;
+            }
+        }
+        best_phase
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::signal::dsp::testkit::Rng;
+
+    /// The growing search is [`find_phase`], exactly, at every length of a
+    /// buffer fed in ragged pieces: what a capture growing an octet at a
+    /// time asks of it.
+    #[test]
+    fn the_growing_search_is_find_phase() {
+        let mut rng = Rng::new(9);
+        let x: Vec<f32> = (0..3000)
+            .map(|i| (i as f32 * 0.7).sin() * 2.0 + rng.unit() as f32 - 0.5)
+            .collect();
+        let sps = 4.0;
+        let mut search = PhaseSearch::new(sps, 16);
+        let mut len = 0;
+        let mut piece = 1;
+        while len < x.len() {
+            len = (len + piece).min(x.len());
+            piece = piece % 37 + 5;
+            let symbols = len / 4;
+            let grown = search.phase(&x[..len], symbols);
+            let fresh = find_phase(&x[..len], sps, symbols, 16);
+            assert_eq!(grown.to_bits(), fresh.to_bits(), "at {len}");
+        }
+    }
 
     /// A straight line interpolates exactly at any fractional position - the
     /// definition of linear interpolation, checked so a later refactor of
