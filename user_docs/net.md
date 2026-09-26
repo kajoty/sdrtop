@@ -338,8 +338,9 @@ The selected packet, spelled out:
   (interval, latency, timeout, channel map, sleep-clock accuracy) and the
   first channels the connection will hop to, predicted from them with
   Channel Selection Algorithm #1 or #2, **predicted, not followed**.
-- **Physics**: SNR, carrier offset in kHz and ppm, the offset at the start
-  and end of the packet.
+- **Physics**: SNR, carrier offset in kHz and ppm, and the carrier at the
+  start and end of the packet: the start is the preamble's mean frequency
+  (the test suite's f0), the end the last ten bits before the CRC.
 - **Modulation**: the transmitter's modulation index, deviation and drift
   against the specification's limits, each drawn as a bar with the limit
   marked. Read from the packet's own symbols; a packet whose CRC failed is
@@ -356,6 +357,19 @@ The selected packet, spelled out:
   piconets are (see its detail below); on LE 1M the packet is taken again
   from the raw samples and timed from the access address, on LE 2M read
   through the receiver's own filter.
+
+  The **drift** rows are the test suite's too: the carrier is read over
+  every ten bits of the PDU, and `drift` is the block furthest from the
+  start, `drift rate` the steepest change over five blocks (50 µs on
+  LE 1M). The suite sends a `1010` for this, whose ten bits average to the
+  carrier; ordinary traffic does not balance like that, so each bit's own
+  modulation, as the packet itself shows it, comes out first. Both are
+  maxima, and a maximum of noisy blocks finds the noise too: with nothing
+  drifting at all, noise alone reads about 1, 3 and 9 kHz of drift and 20,
+  50 and 150 Hz/µs of rate at 40, 30 and 20 dB above the noise. The `±`
+  says how noisy the blocks were, and past the panel's resolution the row
+  shows a dash rather than a drift the transmitter may not have. On LE 2M
+  the preamble is not kept, so the first block stands in for the start.
 
 With **no packet selected**, the detail shows the session's **frame error
 rate against SNR**: for each 2 dB of SNR, what share of packets failed their

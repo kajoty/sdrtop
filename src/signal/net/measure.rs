@@ -33,9 +33,10 @@
 
 use num_complex::Complex;
 
-use crate::signal::ble::measure::{drift, modulation_from, Drift, ModulationQuality};
+use crate::signal::ble::measure::{drift_from, modulation_from, Drift, ModulationQuality};
 use crate::signal::ble::Phy;
 use crate::signal::bt::piconet::Deviation;
+use crate::signal::dsp::deviation::suite_readings;
 use crate::signal::dsp::discriminate::Oversampled;
 use crate::signal::dsp::fir::{design_lowpass_to_spec, StreamingDecimator};
 use crate::signal::dsp::nco::Nco;
@@ -270,33 +271,45 @@ fn timing(tester: &Tester, first: f64, bit: f64, known: &[bool]) -> f64 {
     steps[best].0 + shift / TIMING_STEPS as f64
 }
 
-/// The suites' readings (`dsp::deviation::suite_readings`) of `known`
-/// bits and the `after` bits that follow them on the air, and each of the
-/// `after` bits' reading at its centre: `first` is the estimated stream
-/// position of `known[0]`'s centre, `rate` the stream's, `offset_hz` the
-/// channel's distance from the tuning. The timing comes from `known`
-/// ([`timing`]). `None` as [`Tester::new`] refuses, or with no carrier to
-/// measure from.
-type Readings = ((Vec<f32>, Vec<f32>), Vec<f32>);
+/// A burst lined up on its own bits: the tester over it, and where bit `x`
+/// (bit `k` spans `k..k + 1`, `known[0]` being bit 0) sits in the stream.
+struct Aligned {
+    tester: Tester,
+    first: f64,
+    bit: f64,
+    tau: f64,
+}
 
-/// What reading a burst came to.
-enum Read {
-    Readings(Readings),
+impl Aligned {
+    /// The frequency at bit position `x`, in Hz.
+    fn at(&self, x: f64) -> f32 {
+        self.tester.at(self.first + (x - 0.5 + self.tau) * self.bit)
+    }
+}
+
+/// What lining a burst up came to.
+enum Lined {
+    Up(Aligned),
     /// A neighbour was louder than [`NEIGHBOUR_LIMIT_DB`] allows.
     NeighbourBusy,
 }
 
-fn read_after_known(
+/// The burst whose `known` bits start with the one centred near stream
+/// position `first`, followed by `after` more bits, on a channel `offset_hz`
+/// from the tuning at `rate`, timed from `known` ([`timing`]). `neighbours`,
+/// when given, is the channel spacing to guard. `None` as [`Tester::new`]
+/// refuses.
+fn align(
     recent: &Recent,
     rate: f64,
     offset_hz: f64,
     known: &[bool],
     first: f64,
-    after: &[bool],
+    after: usize,
     neighbours: Option<f64>,
-) -> Option<Read> {
+) -> Option<Lined> {
     let bit = rate / 1e6;
-    let last = first + (known.len() + after.len()) as f64 * bit;
+    let last = first + (known.len() + after) as f64 * bit;
     let tester = Tester::new(
         recent,
         rate,
@@ -309,17 +322,15 @@ fn read_after_known(
         .neighbour_db
         .is_some_and(|db| db >= NEIGHBOUR_LIMIT_DB)
     {
-        return Some(Read::NeighbourBusy);
+        return Some(Lined::NeighbourBusy);
     }
     let tau = timing(&tester, first, bit, known);
-    // Bit position `x` (bit `k` spans `k..k + 1`) as a stream position.
-    let at = |x: f64| tester.at(first + (x - 0.5 + tau) * bit);
-    let all: Vec<bool> = known.iter().chain(after).copied().collect();
-    let readings = crate::signal::dsp::deviation::suite_readings(&all, at)?;
-    let centres = (0..after.len())
-        .map(|i| at((known.len() + i) as f64 + 0.5))
-        .collect();
-    Some(Read::Readings((readings, centres)))
+    Some(Lined::Up(Aligned {
+        tester,
+        first,
+        bit,
+        tau,
+    }))
 }
 
 /// A classic header's modulation readings, as a tester reads them: `lap`'s
@@ -338,30 +349,33 @@ pub fn classic(
 ) -> Option<Deviation> {
     let sync = crate::signal::bt::access_code::access_code_bits(lap);
     let first = sync_end_pair - (sync.len() - 1) as f64 * rate / 1e6;
-    match read_after_known(
+    let aligned = match align(
         recent,
         rate,
         offset_hz,
         &sync,
         first,
-        air,
+        air.len(),
         Some(CLASSIC_SPACING_HZ),
     )? {
-        Read::Readings(((settled, alternating), _)) => {
-            Some(Deviation::from_readings(&settled, &alternating))
-        }
-        Read::NeighbourBusy => Some(Deviation::neighbour_busy()),
-    }
+        Lined::Up(aligned) => aligned,
+        Lined::NeighbourBusy => return Some(Deviation::neighbour_busy()),
+    };
+    let all: Vec<bool> = sync.iter().chain(air).copied().collect();
+    let (settled, alternating) = suite_readings(&all, |x| aligned.at(x))?;
+    Some(Deviation::from_readings(&settled, &alternating))
 }
 
-/// An LE 1M packet's modulation and drift, as a tester reads them: `air`
-/// is its PDU as sent (header through CRC, whitened), whose first bit the
-/// receiver's slicer centred at stream position `pdu_pair`, on a channel
-/// `offset_hz` from the tuning. Timed by the preamble and the advertising
-/// access address before it, the 40 bits every such packet starts with.
+/// An LE 1M packet's modulation and carrier, as the test suites define
+/// them: `air` is its PDU as sent (header through CRC, whitened), whose
+/// first bit the receiver's slicer centred at stream position `pdu_pair`, on
+/// a channel `offset_hz` from the tuning. Timed by the preamble and the
+/// advertising access address before it, the 40 bits every such packet
+/// starts with; f0 from the preamble's 8 bits, the drift blocks from the
+/// PDU's second bit to its CRC (RF-PHY.TS.4.2.1 TP/TRM-LE/CA/BV-06-C).
 ///
-/// LE 1M only: the suites' filter is written for 1 Msym/s, and LE 2M, twice
-/// the rate and the deviation, would lose half its signal in it. `None` as
+/// LE 1M only: LE 2M is read by the receiver (`ble::receive`), whose
+/// capture does not hold the samples 2M's rate needs from here. `None` as
 /// [`classic`] refuses.
 pub fn le_1m(
     recent: &Recent,
@@ -373,21 +387,29 @@ pub fn le_1m(
     use crate::signal::ble::detect::{
         access_address_bits, preamble_bits, ADVERTISING_ACCESS_ADDRESS,
     };
-    let mut known = preamble_bits(ADVERTISING_ACCESS_ADDRESS, Phy::OneM);
+    use crate::signal::dsp::carrier::{by_bit, initial, ten_bit_blocks};
+    let preamble = preamble_bits(ADVERTISING_ACCESS_ADDRESS, Phy::OneM);
+    let mut known = preamble.clone();
     known.extend(access_address_bits(ADVERTISING_ACCESS_ADDRESS));
     let first = pdu_pair - known.len() as f64 * rate / 1e6;
     // No guard: LE's neighbours are 2 MHz away, in the measurement filter's
     // stopband, and one 15 dB down moves the readings 0.3 %
     // (`conformance::a_neighbour_25_db_down_moves_the_readings_under_one_
     // percent`, which also runs LE at 15).
-    let Read::Readings(((settled, alternating), centres)) =
-        read_after_known(recent, rate, offset_hz, &known, first, air, None)?
-    else {
+    let Lined::Up(aligned) = align(recent, rate, offset_hz, &known, first, air.len(), None)? else {
         return None;
     };
+    let all: Vec<bool> = known.iter().chain(air).copied().collect();
+    let modulation = suite_readings(&all, |x| aligned.at(x))
+        .and_then(|(settled, alternating)| modulation_from(&settled, &alternating, Phy::OneM));
+    let f0 = initial(|x| aligned.at(x), 0, preamble.len());
+    let carrier = by_bit(&all, |x| aligned.at(x));
+    let pdu = known.len();
+    let crc = pdu + air.len().saturating_sub(crate::signal::ble::pdu::CRC_BITS);
+    let blocks = ten_bit_blocks(&carrier, pdu + 1, crc);
     Some((
-        modulation_from(&settled, &alternating, Phy::OneM),
-        drift(&centres, Phy::OneM),
+        modulation,
+        drift_from(Some((f0, preamble.len())), &blocks, Phy::OneM),
     ))
 }
 

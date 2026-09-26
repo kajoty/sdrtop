@@ -159,6 +159,9 @@ fn body_bits(length: u8) -> usize {
 /// can be called at all: the 16-bit header alone.
 pub const HEADER_BITS: usize = 16;
 
+/// The CRC at the end of every PDU, in bits: 24 (Core 5.4 Vol 6 Part B 2.1).
+pub const CRC_BITS: usize = 24;
+
 /// The whole PDU's own length in bits, header through CRC, once `length` is
 /// known - the same figure `decode` requires before it returns `Some`.
 ///

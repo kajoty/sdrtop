@@ -1101,8 +1101,11 @@ impl Receiver {
             .and_then(|(settled, alternating)| {
                 super::measure::modulation_from(&settled, &alternating, self.phy)
             });
-        let centres: Vec<f32> = (0..packet.air.len()).map(|k| at(k as f64 + 0.5)).collect();
-        packet.drift = super::measure::drift(&centres, self.phy);
+        // The preamble is not in the capture: the first block stands for f0.
+        let carrier = crate::signal::dsp::carrier::by_bit(&packet.air, at);
+        let crc_start = packet.air.len().saturating_sub(pdu::CRC_BITS);
+        let blocks = crate::signal::dsp::carrier::ten_bit_blocks(&carrier, 1, crc_start);
+        packet.drift = super::measure::drift_from(None, &blocks, self.phy);
         packet
     }
 }

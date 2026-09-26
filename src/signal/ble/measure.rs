@@ -119,74 +119,94 @@ pub fn modulation_from(
     })
 }
 
-/// A packet's own frequency offset, measured early and late, and the drift
-/// between them - design section 2.2's measurements 6 through 8, read as one
-/// structure rather than two numbers a reader has to subtract by hand.
+/// A packet's carrier as the test suites read it: where it started, where
+/// it ended, and the two drift figures the Core Specification limits, each
+/// with the noise it carries.
+///
+/// **The suites' maxima, with a `±` from the packet's own blocks.** The
+/// suites take the largest `|fn - f0|` and `|fn - fn-5|` over the payload's
+/// ten-bit blocks (RF-PHY.TS.4.2.1 TP/TRM-LE/CA/BV-06-C). On a cable that is
+/// the transmitter; over the air a maximum of noisy blocks also finds the
+/// noise, and with nothing drifting noise alone reads 0.9, 2.9 and 9.2 kHz
+/// at 40, 30 and 20 dB in 1 MHz (`signal::net::conformance`). Kept as the
+/// suites define it (Viktor, 2026-09-26), with a `±` from the blocks'
+/// scatter about a straight line, which the panels print it against: a
+/// reading whose `±` is past their resolution shows as a dash.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Drift {
-    /// The mean discriminator reading over the first half of the capture.
+    /// f0, the preamble's mean frequency (TP/TRM-LE/CA/BV-06-C step 4), or
+    /// the first block's where the preamble is not held, in Hz.
     pub initial_hz: Uncertain,
-    /// The mean discriminator reading over the second half.
+    /// The last ten-bit block before the CRC, in Hz.
     pub final_hz: Uncertain,
-    /// `final_hz - initial_hz`.
+    /// The block furthest from f0, as `fk - f0`, signed: the suites'
+    /// `|f0 - fn|`, which the Core's "frequency drift during any packet"
+    /// is held to.
     pub drift_hz: Uncertain,
-    /// `drift_hz`, divided by the time between the two halves' own centres.
+    /// The largest change over five blocks, `fn - fn-5`, signed, over the
+    /// time five blocks span: the suites' drift rate, in Hz/us.
     pub drift_rate_hz_per_us: Uncertain,
 }
 
-/// Frequency drift within one packet, from the **per-symbol** discriminator
-/// readings: one value per on-air symbol, each at the bit's centre.
-///
-/// **Not the raw oversampled trace, and that is a finding of its own, not a
-/// preference.** A first version read straight from `receive.rs`'s raw
-/// `inst` array at the working sample rate (four samples per symbol here),
-/// the same array B7's own CFO figure is built from. Its own "no drift
-/// injected" test failed: [`crate::signal::dsp::uncertainty::mean_with_uncertainty`]
-/// assumes independent samples to turn a sample variance into `Var(mean) =
-/// sigma^2 / N`, and four samples spanning one symbol of a Gaussian-filtered
-/// waveform are not independent draws - they are one slowly-varying value
-/// sampled four times. Feeding it the raw trace divides by an `N` four times
-/// too large and reports a sigma roughly half what the data can actually
-/// support, which a null-drift signal then reliably clears by several times
-/// its own reported uncertainty - a measurement that looks more precise than
-/// it is, which is exactly the failure this whole arc's uncertainty
-/// discipline exists to catch. One value per symbol removes the
-/// oversampling correlation the same way reading one value a bit does for
-/// [`modulation_from`]; the residual correlation between *adjacent
-/// symbols*, from the Gaussian filter's own few-symbol impulse response, is
-/// smaller and not accounted for here either, so this is a improvement, not
-/// a claim of statistical purity.
-///
-/// **Splits the capture in half and reads the mean of each half.** A single
-/// mean answers "what was the average offset"; two means, early and late,
-/// answer "did it move" - design section 2.2's measurement 8 ("initial
-/// frequency offset versus final") asked for directly, and what a drifting
-/// PLL or a thermally pulling crystal actually does to a burst.
-///
-/// The two halves' own centres sit `n / 2` symbols apart regardless of
-/// which half is longer when `n` is odd, which is close enough: a legacy
-/// advertising PDU is at most a few hundred symbols, and one symbol's worth
-/// of that is a rounding error next to the drift this measures. `None`
-/// under four symbols, where a half would have fewer than the two
-/// [`crate::signal::dsp::uncertainty::mean_with_uncertainty`] needs to
-/// report a variance rather than an unknown one.
-pub fn drift(samples: &[f32], phy: Phy) -> Option<Drift> {
-    let n = samples.len();
-    let half = n / 2;
-    if half < 2 {
+/// The ten-bit blocks' scatter about a straight line through them: the
+/// noise one block carries, with any curve in the drift counted in, which
+/// only makes it more cautious. `None` below three blocks.
+fn block_sigma(blocks: &[f64]) -> Option<f64> {
+    let n = blocks.len();
+    if n < 3 {
         return None;
     }
-    let initial_hz = crate::signal::dsp::uncertainty::mean_with_uncertainty(&samples[..half]);
-    let final_hz = crate::signal::dsp::uncertainty::mean_with_uncertainty(&samples[n - half..]);
-    let drift_hz = final_hz.difference(&initial_hz);
-    let separation_us = half as f64 / phy.symbol_rate_hz() * 1e6;
-    let drift_rate_hz_per_us = drift_hz.scale(1.0 / separation_us);
+    let nf = n as f64;
+    let (sx, sy) = (nf * (nf - 1.0) / 2.0, blocks.iter().sum::<f64>());
+    let sxx = (0..n).map(|i| (i * i) as f64).sum::<f64>();
+    let sxy = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, y)| i as f64 * y)
+        .sum::<f64>();
+    let slope = (nf * sxy - sx * sy) / (nf * sxx - sx * sx);
+    let icept = (sy - slope * sx) / nf;
+    let ss = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, y)| (y - icept - slope * i as f64).powi(2))
+        .sum::<f64>();
+    Some((ss / (nf - 2.0)).sqrt())
+}
 
+/// A packet's carrier from its f0 (the preamble's mean and how many bits it
+/// was read over, or `None` where the preamble is not held, and the first
+/// block stands in) and its ten-bit blocks (`dsp::carrier::ten_bit_blocks`),
+/// on `phy`'s clock. `None` under six blocks, where the suites' five-block
+/// rate cannot be read.
+pub fn drift_from(initial: Option<(f64, usize)>, blocks: &[f64], phy: Phy) -> Option<Drift> {
+    const SPAN: usize = 5;
+    if blocks.len() <= SPAN {
+        return None;
+    }
+    let sigma = block_sigma(blocks)?;
+    // f0 is read from the same per-bit noise over fewer bits.
+    let (f0, f0_sigma, from) = match initial {
+        Some((f0, bits)) => (f0, sigma * (10.0 / bits.max(1) as f64).sqrt(), 0),
+        None => (blocks[0], sigma, 1),
+    };
+    let furthest = *blocks[from..]
+        .iter()
+        .max_by(|a, b| (*a - f0).abs().total_cmp(&(*b - f0).abs()))?;
+    let initial_hz = Uncertain::from_sigma(f0, f0_sigma);
+    let steepest = blocks
+        .windows(SPAN + 1)
+        .map(|w| w[SPAN] - w[0])
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))?;
+    let span_us = (SPAN * 10) as f64 / phy.symbol_rate_hz() * 1e6;
     Some(Drift {
         initial_hz,
-        final_hz,
-        drift_hz,
-        drift_rate_hz_per_us,
+        final_hz: Uncertain::from_sigma(*blocks.last()?, sigma),
+        drift_hz: Uncertain::from_sigma(furthest, sigma).difference(&initial_hz),
+        drift_rate_hz_per_us: Uncertain::from_sigma(
+            steepest / span_us,
+            sigma * std::f64::consts::SQRT_2 / span_us,
+        ),
     })
 }
 
@@ -198,11 +218,6 @@ mod tests {
     use crate::signal::dsp::discriminate::discriminate;
     use crate::signal::dsp::testkit::{at_snr, Rng};
 
-    /// A random on-air bit stream and the discriminator samples recovered
-    /// from it at `deviation_hz`, sliced against zero - the same shape
-    /// `receive.rs` hands this module, built without any of that module's
-    /// own detection or timing-search machinery, which this measurement
-    /// does not touch.
     /// The suites' readings of per-symbol `samples`, each held across its
     /// bit, aggregated: what the receivers do with a rebuilt waveform, on
     /// the one reading a bit these tests build.
@@ -213,6 +228,11 @@ mod tests {
         modulation_from(&settled, &alternating, phy)
     }
 
+    /// A random on-air bit stream and the discriminator samples recovered
+    /// from it at `deviation_hz`, sliced against zero - the same shape
+    /// `receive.rs` hands this module, built without any of that module's
+    /// own detection or timing-search machinery, which this measurement
+    /// does not touch.
     fn symbols_and_samples(
         deviation_hz: f64,
         n_bits: usize,
@@ -407,6 +427,15 @@ mod tests {
     /// Multiplying by a chirp is exact here because frequency is additive
     /// under complex multiplication: the discriminator recovers the sum of
     /// the two phase derivatives, not some mixture of them.
+    /// The suites' drift of per-symbol `samples`, each held across its bit,
+    /// with no preamble held: what the receivers do with a rebuilt
+    /// waveform, on the one reading a bit these tests build.
+    fn drift(bits: &[bool], samples: &[f32], phy: Phy) -> Option<Drift> {
+        use crate::signal::dsp::carrier::{by_bit, ten_bit_blocks};
+        let carrier = by_bit(bits, |x| samples[(x as usize).min(samples.len() - 1)]);
+        drift_from(None, &ten_bit_blocks(&carrier, 1, bits.len() - 1), phy)
+    }
+
     fn with_drift(
         iq: &[num_complex::Complex<f32>],
         sample_rate_hz: f64,
@@ -449,7 +478,7 @@ mod tests {
         let (_, samples) =
             crate::signal::ble::sync::slice(&inst, params.sps as f64, bits.len(), 0.0);
 
-        let d = drift(&samples, Phy::OneM).expect("plenty of samples at 3000 bits");
+        let d = drift(&bits, &samples, Phy::OneM).expect("plenty of samples at 3000 bits");
         assert!(
             (d.drift_rate_hz_per_us.value() - drift_rate_hz_per_us).abs()
                 < 4.0 * d.drift_rate_hz_per_us.sigma(),
@@ -489,7 +518,7 @@ mod tests {
         let (_, samples) =
             crate::signal::ble::sync::slice(&inst, params.sps as f64, bits.len(), 0.0);
 
-        let d = drift(&samples, Phy::OneM).unwrap();
+        let d = drift(&bits, &samples, Phy::OneM).unwrap();
         assert!(
             d.drift_rate_hz_per_us.value().abs() < 4.0 * d.drift_rate_hz_per_us.sigma(),
             "measured {} +/- {} with nothing injected",
@@ -502,7 +531,7 @@ mod tests {
     /// than inventing a drift from a handful of points.
     #[test]
     fn too_few_samples_refuses_rather_than_inventing_a_reading() {
-        assert!(drift(&[1.0, 2.0, 3.0], Phy::OneM).is_none());
+        assert!(drift(&[true, false, true], &[1.0, 2.0, 3.0], Phy::OneM).is_none());
     }
 
     /// Symbols and samples at LE 2M: 2 Mb/s, four samples a symbol, 8 Msps.
@@ -559,7 +588,7 @@ mod tests {
         let mut inst = Vec::new();
         discriminate(&drifted, rate, &mut inst);
         let (_, samples) = crate::signal::ble::sync::slice(&inst, sps as f64, bits.len(), 0.0);
-        let d = drift(&samples, Phy::TwoM).unwrap();
+        let d = drift(&bits, &samples, Phy::TwoM).unwrap();
         assert!(
             (d.drift_rate_hz_per_us.value() - injected).abs()
                 < 4.0 * d.drift_rate_hz_per_us.sigma(),

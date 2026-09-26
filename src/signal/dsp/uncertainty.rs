@@ -104,11 +104,11 @@ impl Uncertain {
     ///
     /// Exact, unlike [`Self::ratio`]: for independent `A` and `B`,
     /// `Var(A - B) = Var(A) + Var(B)` is not a linearisation of anything, it
-    /// is the definition of variance under a linear combination. B9 is the
-    /// reasoned first consumer - a packet's own frequency offset measured
-    /// early versus late, the two ends of a drift `signal::ble::measure`
-    /// reports as a single number and its own honest uncertainty rather
-    /// than two numbers a reader has to subtract by eye.
+    /// is the definition of variance under a linear combination. A packet's
+    /// drift is one (`signal::ble::measure::drift_from`): the carrier at
+    /// the block furthest from f0, less f0, reported as a single number
+    /// with its own uncertainty rather than two numbers a reader has to
+    /// subtract by eye.
     pub fn difference(&self, other: &Uncertain) -> Self {
         Self::from_variance(
             self.value - other.value,

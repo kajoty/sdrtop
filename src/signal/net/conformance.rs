@@ -783,6 +783,78 @@ mod tests {
         }
     }
 
+    /// **The suites' drift readings, from any traffic.** Ten-bit blocks of
+    /// random bits, each bit's own modulation taken out
+    /// (`dsp::carrier::by_bit`), give the carrier the reference transmitter
+    /// was given, offset and drift, read ideally and through the
+    /// measurement filter; the suites' plain block mean, right for their
+    /// `1010`, is tens of kHz off on traffic. And f0 is the suites' own.
+    ///
+    /// Measured worst block: 1.2 Hz (BR) and 1.9 Hz (LE) ideally, 206 and
+    /// 240 Hz through the filter, whose response reaches a little past a
+    /// bit's two neighbours; against drift limits of 25 to 50 kHz.
+    #[test]
+    fn traffic_gives_the_carrier_the_transmitter_had() {
+        use crate::signal::dsp::carrier::{by_bit, initial, ten_bit_blocks};
+        let rate = 32e6;
+        for deviation in [BR_DEVIATION_HZ, LE_DEVIATION_HZ] {
+            let (bits, from, len, tx) = traffic(deviation, 43);
+            let burst = Burst::new(tx, &bits);
+            let truth = |bit: f64| tx.cfo_hz + tx.drift_hz_per_s * bit * 1e-6;
+            let wide = Trace::from_iq(
+                &filter(&burst.iq(rate, burst.len_at(rate)), &wide_filter(rate)),
+                rate,
+                1e6,
+            );
+            let span = &bits[from..from + len];
+            let ideal = |x: f64| burst.frequency((from as f64 + x) * 1e-6) as f32;
+            let filtered = |x: f64| wide.at(from as f64 + x).unwrap_or(f64::NAN) as f32;
+            for (name, worst_hz, at) in [
+                ("ideal", 20.0, &ideal as &dyn Fn(f64) -> f32),
+                ("filtered", 300.0, &filtered),
+            ] {
+                let carrier = by_bit(span, at);
+                let blocks = ten_bit_blocks(&carrier, 1, len - 1);
+                assert!(blocks.len() > 140, "{name}: {}", blocks.len());
+                for (b, fk) in blocks.iter().enumerate() {
+                    let want = truth(from as f64 + 1.0 + 10.0 * b as f64 + 5.0);
+                    assert!(
+                        (fk - want).abs() < worst_hz,
+                        "{deviation} {name} block {b}: {fk} vs {want}"
+                    );
+                }
+            }
+            // The plain mean of the same blocks.
+            let plain_worst = (0..(len - 2) / 10)
+                .map(|b| {
+                    let k = 1 + 10 * b;
+                    let mean = (k..k + 10)
+                        .map(|j| {
+                            (0..32)
+                                .map(|i| ideal(j as f64 + (i as f64 + 0.5) / 32.0) as f64)
+                                .sum::<f64>()
+                                / 32.0
+                        })
+                        .sum::<f64>()
+                        / 10.0;
+                    (mean - truth(from as f64 + k as f64 + 5.0)).abs()
+                })
+                .fold(0.0, f64::max);
+            assert!(
+                plain_worst > 0.1 * deviation,
+                "{deviation}: plain {plain_worst}"
+            );
+
+            // f0 on a preamble: the suites' definition, the same number.
+            let (pre, at) = padded(&alternating(40, true));
+            let pre_burst = Burst::new(tx, &pre);
+            let trace = Trace::analytic(&pre_burst, 32);
+            let want = initial_carrier(&trace, at, 8).unwrap();
+            let got = initial(|x| pre_burst.frequency(x * 1e-6) as f32, at, 8);
+            assert!((got - want).abs() < 1.0, "{deviation}: f0 {got} vs {want}");
+        }
+    }
+
     /// The measurement filter against the suites' four points, measured.
     #[test]
     fn the_mask_filter_meets_the_recommendation() {
@@ -1088,16 +1160,20 @@ mod chain {
         found: usize,
         chain: [Vec<f64>; 3],
         cfo: Vec<f64>,
+        /// The chain's f0, drift and drift rate (`ble::measure::Drift`).
+        carrier: [Vec<f64>; 3],
         ideal: [Vec<f64>; 3],
         f0: Vec<f64>,
         load: f64,
     }
 
-    fn le_case(rate: f64, snr: f64, cfo: f64, packets: usize) -> LeCase {
+    fn le_case(rate: f64, snr: f64, cfo: f64, drift: f64, packets: usize) -> LeCase {
         use crate::signal::ble::measure::{modulation_from, ModulationQuality};
         use crate::signal::ble::Phy;
         use crate::signal::dsp::deviation::suite_readings;
-        let tx = Gfsk::new(1e6, LE_DEVIATION_HZ, 0.5).with_cfo(cfo);
+        let tx = Gfsk::new(1e6, LE_DEVIATION_HZ, 0.5)
+            .with_cfo(cfo)
+            .with_drift(drift);
         let built: Vec<_> = (0..packets)
             .map(|p| le_packet([0x10 + p as u8, 0x22, 0x33, 0x44, 0x55, 0xC6]))
             .collect();
@@ -1123,6 +1199,7 @@ mod chain {
             found: 0,
             chain: Default::default(),
             cfo: Vec::new(),
+            carrier: Default::default(),
             ideal: Default::default(),
             f0: Vec::new(),
             load,
@@ -1147,6 +1224,16 @@ mod chain {
             }
             if let Some(o) = p.freq_offset_hz {
                 case.cfo.push(o.value());
+            }
+            if let Some(d) = p.drift {
+                push(
+                    &mut case.carrier,
+                    [
+                        d.initial_hz.value(),
+                        d.drift_hz.value(),
+                        d.drift_rate_hz_per_us.value(),
+                    ],
+                );
             }
         }
         case
@@ -1226,14 +1313,14 @@ mod chain {
             ts_f2 / ts_f1
         );
         eprintln!(
-            "{:>5} {:>4} {:>6} {:>5} | {:>17} {:>8} | {:>17} {:>8} | {:>15} {:>6} | {:>17} {:>8} {:>5}",
+            "{:>5} {:>4} {:>6} {:>5} | {:>17} {:>8} | {:>17} {:>8} | {:>15} {:>6} | {:>17} {:>8} | {:>17} {:>8} {:>5}",
             "Msps", "SNR", "CFO", "found", "df1 chain", "ideal", "df2 chain", "ideal",
-            "ratio chain", "ideal", "CFO chain", "suites f0", "load"
+            "ratio chain", "ideal", "CFO chain", "suites f0", "f0 chain", "drift", "load"
         );
         for rate in RATES {
             for snr in SNRS_DB {
                 for cfo in CFOS_HZ {
-                    let c = le_case(rate, snr, cfo, PACKETS);
+                    let c = le_case(rate, snr, cfo, 0.0, PACKETS);
                     let or_dash = |v: &[f64], f: &dyn Fn((f64, f64)) -> String| {
                         if v.is_empty() {
                             format!("{:>17}", "-")
@@ -1243,7 +1330,7 @@ mod chain {
                     };
                     let ratio = |(m, s): (f64, f64)| format!("{m:7.4} +-{s:6.4}");
                     eprintln!(
-                        "{:>5} {:>4} {:>6} {:>2}/{:<2} | {} {} | {} {} | {} {:6.4} | {} {} {:5.2}",
+                        "{:>5} {:>4} {:>6} {:>2}/{:<2} | {} {} | {} {} | {} {:6.4} | {} {} | {} {} {:5.2}",
                         rate / 1e6,
                         snr,
                         cfo / 1e3,
@@ -1257,6 +1344,12 @@ mod chain {
                         spread(&c.ideal[2]).0,
                         or_dash(&c.cfo, &khz_pm),
                         khz(spread(&c.f0).0),
+                        or_dash(&c.carrier[0], &khz_pm),
+                        if c.carrier[1].is_empty() {
+                            format!("{:>8}", "-")
+                        } else {
+                            khz(spread(&c.carrier[1]).0)
+                        },
                         c.load,
                     );
                 }
@@ -1339,7 +1432,7 @@ mod chain {
     #[test]
     fn the_chain_reads_as_the_suites_define() {
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        let le = le_case(8e6, 40.0, 40_000.0, 4);
+        let le = le_case(8e6, 40.0, 40_000.0, 0.0, 4);
         assert_eq!(le.found, 4, "every LE packet found");
         assert_eq!(le.chain[0].len(), 4, "and measured");
         for (i, name) in ["df1", "df2", "df2/df1"].iter().enumerate() {
@@ -1351,6 +1444,33 @@ mod chain {
         }
         let cfo = mean(&le.cfo);
         assert!((cfo - 40_000.0).abs() < 500.0, "LE CFO {cfo}");
+        // f0 as the suites read the preamble, and no drift where none was
+        // sent: noise alone reads under 1 kHz at 40 dB.
+        let (f0, want) = (mean(&le.carrier[0]), mean(&le.f0));
+        assert!((f0 - want).abs() < 1_000.0, "LE f0 {f0}, suites {want}");
+        for d in &le.carrier[1] {
+            assert!(d.abs() < 3_000.0, "LE drift {d} with none sent");
+        }
+        // A drift of 20 Hz/us. The furthest block from f0 is the last before
+        // the CRC: f0 is centred 4.5 bits in, that block 5 bits into the
+        // last whole ten of the PDU's bits 1 to 312 (37 octets of PDU, the
+        // CRC after), so 40 + 1 + 300 + 5 - 4.5 = 341.5 us apart.
+        let drifting = le_case(8e6, 40.0, 0.0, 20e6, 4);
+        let drift = mean(&drifting.carrier[1]);
+        let want = 20.0 * 341.5;
+        assert!(
+            (drift - want).abs() < 1_500.0,
+            "LE drift {drift}, sent {want}"
+        );
+        // The suites' rate is a maximum over five-block steps, so it reads
+        // the drift plus the largest of the noise's own steps: 18 Hz/us of
+        // those at 40 dB with nothing drifting. Never under what was sent,
+        // and not past it by more than that.
+        let rate = mean(&drifting.carrier[2]);
+        assert!(
+            (15.0..50.0).contains(&rate),
+            "LE drift rate {rate} Hz/us, 20 sent"
+        );
 
         // One watched channel: the one the packets are on, and a debug
         // build's worth of work.
