@@ -237,10 +237,13 @@ const TIMING_STEPS: i32 = 64;
 /// bits' signs. A tester times a packet from its known start the same way
 /// (the suites' "position of bit p0"); a lane never enters it.
 fn timing(tester: &Tester, first: f64, bit: f64, known: &[bool]) -> f64 {
+    // Every step's readings into one buffer, reused: the same numbers, in
+    // the same order, without a fresh allocation for each of 129 steps.
+    let hz = std::cell::RefCell::new(Vec::with_capacity(known.len()));
     let score = |tau: f64| {
-        let hz: Vec<f64> = (0..known.len())
-            .map(|k| tester.at(first + (k as f64 + tau) * bit) as f64)
-            .collect();
+        let mut hz = hz.borrow_mut();
+        hz.clear();
+        hz.extend((0..known.len()).map(|k| tester.at(first + (k as f64 + tau) * bit) as f64));
         let mean = hz.iter().sum::<f64>() / hz.len() as f64;
         hz.iter()
             .zip(known)
@@ -403,14 +406,11 @@ pub fn classic(
         }
     };
     let at = |x: f64| aligned.at(x);
-    // Each bit's mean reading, as the suites read a bit.
-    let per_bit = |k: usize| {
-        let n = crate::signal::dsp::deviation::READINGS_PER_BIT;
-        (0..n)
-            .map(|j| at(k as f64 + (j as f64 + 0.5) / n as f64) as f64)
-            .sum::<f64>()
-            / n as f64
-    };
+    // Every bit read once, before any is decided: a reading does not depend
+    // on what the bit turns out to be, and the header's decisions, the
+    // modulation and the carrier all read the same ones.
+    let readings = BitReadings::read(known.len() + HEADER_AIR_BITS, at);
+    let per_bit = |k: usize| readings.mean(k);
     // The header: each triple decided by its three bits' means together
     // against the known bits' midpoint.
     let side = |one: bool| {
@@ -428,8 +428,6 @@ pub fn classic(
         header.extend([sum > 0.0; 3]);
     }
     let all: Vec<bool> = known.iter().chain(&header).copied().collect();
-    // Every bit read once, for the modulation and the carrier both.
-    let readings = BitReadings::read(all.len(), at);
     let deviation = suite_readings_from(&all[PREAMBLE..], &readings.tail_from(PREAMBLE))
         .map(|(settled, alternating)| Deviation::from_readings(&settled, &alternating))?;
     let f0 = initial(at, 0, PREAMBLE);
