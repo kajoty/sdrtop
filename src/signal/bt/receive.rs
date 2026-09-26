@@ -152,6 +152,18 @@ const PAYLOAD_CAPTURE_BITS: usize = 343 * 8;
 /// 54 air bits for [`header::HEADER_BITS`] host bits.
 const HEADER_CAPTURE_BITS: usize = header::TRAILER_BITS + header::HEADER_AIR_BITS;
 
+/// How close two hits of one LAP are, in working samples, to be one packet:
+/// four symbols. The lanes of one packet fire within a symbol of each
+/// other; the next packet of the same piconet comes at least a whole access
+/// code later.
+const SAME_PACKET_SAMPLES: u64 = 4 * PHASES as u64;
+
+/// Whether `lap` at working sample `at` is a packet `log` already holds.
+fn same_packet(log: &[(u32, u64)], lap: u32, at: u64) -> bool {
+    log.iter()
+        .any(|&(l, s)| l == lap && at.saturating_sub(s) <= SAME_PACKET_SAMPLES)
+}
+
 /// One lane's own header-plus-payload capture in progress: the bits
 /// collected so far after that lane's `Detector` last fired, and which
 /// LAP it was for.
@@ -176,6 +188,9 @@ struct PendingHeader {
     header_whitened: Option<[bool; header::HEADER_BITS]>,
     /// [`HeaderHit::sync_end_pair`].
     sync_end_pair: f64,
+    /// The working sample its access code was found at, counted as the
+    /// receiver counts them: which packet it is ([`SAME_PACKET_SAMPLES`]).
+    start_sample: u64,
     /// When the access code that started it ended ([`AccessHit::at_us`]).
     at_us: f64,
 }
@@ -240,6 +255,16 @@ const CHANNEL_SELECT_STOPBAND_DB: f64 = 25.0;
 /// fast next to how long any one access code needs to sit still for (64
 /// symbols) and slow next to a single symbol's own noise.
 const BIAS_ALPHA: f32 = 1.0 / 256.0;
+
+/// The tracker learns only from readings within this of zero, in Hz. A
+/// transmitter's own readings stay inside it: 175 kHz of deviation at most,
+/// 75 kHz of its carrier tolerance (Core 5.4 Vol 2 Part A 3.1.3) and some
+/// 50 kHz of our own oscillator's. The discriminator on noise between
+/// packets reads anywhere to the working rate's edge, and learning from
+/// that walked the threshold 35 kHz rms at 20 Msps, where packets arriving
+/// at 60 kHz or more were missed on every lane; clipped here, 24 kHz, and
+/// none missed (48 packets at 40 and 25 dB, 4, 8 and 20 Msps).
+const BIAS_CLIP_HZ: f32 = 400_000.0;
 
 /// Build the decimator from `raw_rate` to [`WORKING_RATE_HZ`], or say why it
 /// cannot be built - the same refusal shape
@@ -309,6 +334,11 @@ pub struct Receiver {
     anchor_us: f64,
     /// The stream position of this receiver's first raw sample.
     first_pair: u64,
+    /// The last few hits, as (LAP, working sample): what makes a lane's hit
+    /// the same packet as another's ([`SAME_PACKET_SAMPLES`]).
+    recent_hits: Vec<(u32, u64)>,
+    /// The same for headers, by the working sample their capture began at.
+    recent_headers: Vec<(u32, u64)>,
     /// One header capture in progress per lane, if any. A second hit on a
     /// lane that already has one pending does not restart it - finishing
     /// the older capture first is a small, honest simplification, not a
@@ -358,6 +388,8 @@ impl Receiver {
             anchor_symbols: (first_pair as f64 * SYMBOL_RATE_HZ / raw_rate).round() as u64,
             anchor_us: first_pair as f64 * 1e6 / raw_rate,
             first_pair,
+            recent_hits: Vec::new(),
+            recent_headers: Vec::new(),
             pending: std::array::from_fn(|_| None),
         })
     }
@@ -380,21 +412,19 @@ impl Receiver {
     /// Feed one block of raw device bytes. Returns every LAP found in it -
     /// almost always none.
     ///
-    /// **Deduplicated within the call, not per lane.** With no active timing
-    /// recovery, more than one of the [`PHASES`] lanes routinely lands close
-    /// enough to the true phase to decode the same real transmission
-    /// cleanly - measured directly: a single synthetic packet was found on
-    /// three of the four lanes at once. Reporting each lane's own hit
-    /// separately would count one real access code as three, which is
-    /// exactly the invented reading rule 2 refuses in the other direction -
-    /// a real event, over-counted. The trade-off, said plainly: two
-    /// genuinely different packets sharing the same LAP (the ordinary case
-    /// within one piconet) landing in the same block would also collapse to
-    /// one. A block is a few milliseconds at most and classic BT's own slot
-    /// timing is 625 microseconds, so it can happen; B15's own exit
-    /// condition is a scatter that makes a piconet's *rhythm* visible, not
-    /// an exact packet count, and a coarser count in exchange for not
-    /// tripling every real one is the trade worth making here.
+    /// **One hit a packet, by time, not one a lane or one a block.** With no
+    /// active timing recovery, more than one of the [`PHASES`] lanes
+    /// routinely lands close enough to the true phase to decode the same
+    /// real transmission cleanly - measured directly: a single synthetic
+    /// packet was found on three of the four lanes at once. The lanes of one
+    /// packet fire within a symbol of each other, and two packets of one
+    /// piconet are at least an access code apart, so a LAP found again
+    /// within [`SAME_PACKET_SAMPLES`] of its last hit is that packet, across
+    /// block boundaries too. This used to be one hit per LAP per block,
+    /// which counted a piconet sending every 625 us as one packet in each
+    /// block: at the harness's block of 65 536 pairs, 3 of 12 packets at
+    /// 4 Msps and 5 at 8, and the slot grid and the paging rhythm read from
+    /// what was left.
     ///
     /// **Header capture rides alongside the same loop, and now runs past
     /// the header itself into the raw payload region.** A lane with a
@@ -434,7 +464,7 @@ impl Receiver {
             let prev = self.last_sample.replace(sample);
             let Some(prev) = prev else { continue };
             let freq = instantaneous_freq_hz(prev, sample, WORKING_RATE_HZ);
-            self.bias += (freq - self.bias) * BIAS_ALPHA;
+            self.bias += (freq.clamp(-BIAS_CLIP_HZ, BIAS_CLIP_HZ) - self.bias) * BIAS_ALPHA;
             let bit = freq > self.bias;
 
             if let Some(pending) = self.pending[self.lane].as_mut() {
@@ -449,12 +479,14 @@ impl Receiver {
                     let whitened = pending.header_whitened.expect(
                         "reaching the total capture length implies the header already decoded",
                     );
-                    // Deduplicated by LAP within the call, the same
-                    // reasoning `found`'s own doc gives: more than one
-                    // lane routinely captures the same real header
-                    // cleanly, and reporting each separately would
-                    // over-count one real packet as several.
-                    if !headers.iter().any(|h: &HeaderHit| h.lap == pending.lap) {
+                    // One header a packet, by when its capture began, the
+                    // same way hits are counted: more than one lane
+                    // routinely captures the same real header cleanly.
+                    let start = pending.start_sample;
+                    self.recent_headers
+                        .retain(|&(_, s)| start.saturating_sub(s) <= SAME_PACKET_SAMPLES);
+                    if !same_packet(&self.recent_headers, pending.lap, start) {
+                        self.recent_headers.push((pending.lap, start));
                         headers.push(HeaderHit {
                             lap: pending.lap,
                             whitened,
@@ -479,7 +511,10 @@ impl Receiver {
                 let sync_end_pair = self.first_pair as f64
                     + self.decim.delay()
                     + (sample as f64 + 0.5) * self.decim.factor() as f64;
-                if !found.iter().any(|h: &AccessHit| h.lap == lap) {
+                self.recent_hits
+                    .retain(|&(_, s)| sample.saturating_sub(s) <= SAME_PACKET_SAMPLES);
+                if !same_packet(&self.recent_hits, lap, sample) {
+                    self.recent_hits.push((lap, sample));
                     found.push(AccessHit { lap, at_us });
                 }
                 if self.pending[self.lane].is_none() {
@@ -489,6 +524,7 @@ impl Receiver {
                         bits: Vec::with_capacity(TOTAL_CAPTURE_BITS),
                         header_whitened: None,
                         sync_end_pair,
+                        start_sample: sample,
                         at_us,
                     });
                 }
@@ -578,6 +614,64 @@ mod tests {
         let (found, _headers) = rx.push(&bytes, geometry);
         let found: Vec<u32> = found.iter().map(|h| h.lap).collect();
         assert_eq!(found, vec![lap], "{found:?}");
+    }
+
+    /// **Every packet is a hit, however many of one piconet's share a
+    /// block.** Two access codes of one LAP 700 us apart in a single block
+    /// are two hits, not one: a piconet sends every 625 us, and a radio's
+    /// block holds several milliseconds. And each is still one hit, not one
+    /// a lane, when the block is cut in the middle of the second's sync
+    /// word and the lanes finish it on either side of the cut.
+    #[test]
+    fn two_packets_of_one_piconet_in_one_block_are_two_hits() {
+        const RAW_RATE: f64 = 4_000_000.0;
+        const TUNED_CENTRE: f64 = 2_441_000_000.0;
+        let (ch, lap) = (39u8, 0x0055_aa11);
+        let geometry = eight_bit();
+        let one = place_on_channel(RAW_RATE, ch, TUNED_CENTRE, lap);
+        let mut iq = one.clone();
+        iq.extend(vec![Complex::new(0.0f32, 0.0); 700 * 4]);
+        let second = iq.len();
+        iq.extend(one.iter().copied());
+        let bytes = to_bytes(&iq, geometry);
+
+        let mut rx = Receiver::new(RAW_RATE, ch, TUNED_CENTRE, 0).unwrap();
+        let (found, _) = rx.push(&bytes, geometry);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let apart = found[1].at_us - found[0].at_us;
+        let expected = second as f64 / 4.0;
+        assert!((apart - expected).abs() < 1.0, "{apart} vs {expected}");
+
+        // Cut where the second access code's last bits are being sliced.
+        let cut = 2 * (second + (SETTLE_SYMBOLS + 63) * 4);
+        let mut rx = Receiver::new(RAW_RATE, ch, TUNED_CENTRE, 0).unwrap();
+        let (a, _) = rx.push(&bytes[..cut], geometry);
+        let (b, _) = rx.push(&bytes[cut..], geometry);
+        assert_eq!(a.len() + b.len(), 2, "{a:?} then {b:?}");
+    }
+
+    /// **Noise between packets does not walk the slicing threshold away.**
+    /// The bias tracker learns the carrier from the discriminator, and on
+    /// noise the discriminator reads anywhere to the working rate's edge; at
+    /// 20 Msps, where the channel filter folds five bands of its stopband
+    /// into the working band, that walked the threshold 35 kHz rms, and
+    /// packets arriving at 60 kHz or more were missed on every lane. Here:
+    /// 50 ms of noise alone, the threshold checked after every block.
+    #[test]
+    fn noise_between_packets_does_not_walk_the_threshold_away() {
+        const RAW_RATE: f64 = 20_000_000.0;
+        const TUNED_CENTRE: f64 = 2_441_000_000.0;
+        let geometry = eight_bit();
+        let mut rng = Rng::new(3);
+        let mut rx = Receiver::new(RAW_RATE, 39, TUNED_CENTRE, 0).unwrap();
+        let mut worst = 0.0f32;
+        for _ in 0..50 {
+            // Noise at the level a 20 dB packet would stand over, in 1 MHz.
+            let block = rng.noise(20_000, 0.25 / 100.0 * 20.0);
+            rx.push(&to_bytes(&block, geometry), geometry);
+            worst = worst.max(rx.bias.abs());
+        }
+        assert!(worst < 60_000.0, "the threshold walked to {worst} Hz");
     }
 
     /// **A hit is dated to a quarter symbol on the stream's clock** (6.5):

@@ -1489,6 +1489,12 @@ mod chain {
             "LE drift rate {rate} Hz/us, 20 sent"
         );
 
+        // Four packets of one piconet in a single block at 4 Msps, the
+        // chain's slowest rate: every one found. Counting one hit per LAP per
+        // block found one.
+        let slow = br_case(4e6, 40.0, 0.0, 4, 1);
+        assert_eq!(slow.heads, 4, "every BR header found at 4 Msps");
+
         // One watched channel: the one the packets are on, and a debug
         // build's worth of work.
         let br = br_case(20e6, 40.0, 40_000.0, 4, 1);
