@@ -333,37 +333,108 @@ fn align(
     }))
 }
 
-/// A classic header's modulation readings, as a tester reads them: `lap`'s
-/// sync word ended near stream position `sync_end_pair` on a channel
-/// `offset_hz` from the tuning, and `air` is the trailer and header that
-/// followed. `None` when the samples are no longer held or the rate cannot
-/// be decimated to [`MEASURE_RATE_HZ`]; a header that is not measured adds
-/// nothing, rather than a reading from the detection path.
+/// One classic header as the test suites define its readings: the
+/// modulation, and the carrier (f0 in Hz from the channel's nominal centre,
+/// and its drift) where there were enough blocks to read one.
+pub struct ClassicReading {
+    pub deviation: Deviation,
+    pub carrier: Option<(f64, Drift)>,
+}
+
+/// A classic header's readings: `lap`'s sync word ended near stream
+/// position `sync_end_pair` on a channel `offset_hz` from the tuning.
+///
+/// **Every bit it reads is known or re-read here, none taken from the
+/// detector.** The access code is known whole: the preamble alternates into
+/// the sync word (Core 5.4 Vol 2 Part B 6.3.2) and the trailer out of it
+/// (6.3.4), 72 bits that also time the burst. The header's 54 bits are
+/// decided again from this measurement's own readings: its rate 1/3 code
+/// sends every bit three times (7.4), so each triple is one decision, on
+/// the three bits' mean readings together against the midpoint the known
+/// bits give. The detector's own bits come from whichever lane fired,
+/// which can sit at a bit's edge: one wrong bit among them put a whole
+/// ten-bit block 32 kHz off, a drift of 25 kHz read where none was sent.
+/// Deciding on the reading at each bit's centre instead, three by
+/// majority, still lost a whole triple in about one header in four at
+/// 20 dB (one reading there scatters 100 kHz, a bit's mean 27): 96 kHz of
+/// false drift.
+///
+/// f0 is the preamble's four bits (RF.TS.p35 RF/TRM/CA/BV-08-C); the drift
+/// blocks run from the second bit after it to the end of the header: the
+/// access code and header, not the payload the suite reads, which is what
+/// a header hit holds.
+///
+/// `None` when the samples are no longer held or the rate cannot be
+/// decimated to [`MEASURE_RATE_HZ`]; a header that is not measured adds
+/// nothing, rather than a reading from the detection path. A busy neighbour
+/// gives a reading that says so and nothing else.
 pub fn classic(
     recent: &Recent,
     rate: f64,
     offset_hz: f64,
     lap: u32,
     sync_end_pair: f64,
-    air: &[bool],
-) -> Option<Deviation> {
+) -> Option<ClassicReading> {
+    use crate::signal::bt::header::{HEADER_AIR_BITS, TRAILER_BITS};
+    use crate::signal::dsp::carrier::{by_bit, initial, ten_bit_blocks};
+    const PREAMBLE: usize = 4;
     let sync = crate::signal::bt::access_code::access_code_bits(lap);
-    let first = sync_end_pair - (sync.len() - 1) as f64 * rate / 1e6;
+    let (s0, s63) = (sync[0], sync[63]);
+    let mut known = vec![s0, !s0, s0, !s0];
+    known.extend(sync);
+    known.extend([!s63, s63, !s63, s63]);
+    debug_assert_eq!(known.len(), PREAMBLE + 64 + TRAILER_BITS);
+    let first = sync_end_pair - (PREAMBLE + 63) as f64 * rate / 1e6;
     let aligned = match align(
         recent,
         rate,
         offset_hz,
-        &sync,
+        &known,
         first,
-        air.len(),
+        HEADER_AIR_BITS,
         Some(CLASSIC_SPACING_HZ),
     )? {
         Lined::Up(aligned) => aligned,
-        Lined::NeighbourBusy => return Some(Deviation::neighbour_busy()),
+        Lined::NeighbourBusy => {
+            return Some(ClassicReading {
+                deviation: Deviation::neighbour_busy(),
+                carrier: None,
+            })
+        }
     };
-    let all: Vec<bool> = sync.iter().chain(air).copied().collect();
-    let (settled, alternating) = suite_readings(&all, |x| aligned.at(x))?;
-    Some(Deviation::from_readings(&settled, &alternating))
+    let at = |x: f64| aligned.at(x);
+    // Each bit's mean reading, as the suites read a bit.
+    let per_bit = |k: usize| {
+        let n = crate::signal::dsp::deviation::READINGS_PER_BIT;
+        (0..n)
+            .map(|j| at(k as f64 + (j as f64 + 0.5) / n as f64) as f64)
+            .sum::<f64>()
+            / n as f64
+    };
+    // The header: each triple decided by its three bits' means together
+    // against the known bits' midpoint.
+    let side = |one: bool| {
+        let v: Vec<f64> = (0..known.len())
+            .filter(|&k| known[k] == one)
+            .map(per_bit)
+            .collect();
+        v.iter().sum::<f64>() / v.len().max(1) as f64
+    };
+    let threshold = (side(true) + side(false)) / 2.0;
+    let mut header = Vec::with_capacity(HEADER_AIR_BITS);
+    for triple in 0..HEADER_AIR_BITS / 3 {
+        let k = known.len() + 3 * triple;
+        let sum: f64 = (k..k + 3).map(|j| per_bit(j) - threshold).sum();
+        header.extend([sum > 0.0; 3]);
+    }
+    let all: Vec<bool> = known.iter().chain(&header).copied().collect();
+    let deviation = suite_readings(&all[PREAMBLE..], |x| at(x + PREAMBLE as f64))
+        .map(|(settled, alternating)| Deviation::from_readings(&settled, &alternating))?;
+    let f0 = initial(at, 0, PREAMBLE);
+    let blocks = ten_bit_blocks(&by_bit(&all, at), PREAMBLE + 1, all.len() - 1);
+    let carrier = crate::signal::dsp::carrier::drift_from(Some((f0, PREAMBLE)), &blocks, 1e6)
+        .map(|drift| (f0, drift));
+    Some(ClassicReading { deviation, carrier })
 }
 
 /// An LE 1M packet's modulation and carrier, as the test suites define
@@ -528,7 +599,9 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut bits: Vec<bool> = (0..40).map(|i| i % 2 == 0).collect();
         let sync_at = bits.len() + 4;
-        bits.extend([!sync[0], sync[0], !sync[0], sync[0]]);
+        // The preamble alternates into the sync word (Core 5.4 Vol 2 Part B
+        // 6.3.2), the trailer out of it (6.3.4).
+        bits.extend([sync[0], !sync[0], sync[0], !sync[0]]);
         bits.extend(sync);
         bits.extend([!sync[63], sync[63], !sync[63], sync[63]]);
         for _ in 0..18 {
@@ -537,7 +610,6 @@ mod tests {
         }
         bits.extend((0..40).map(|i| i % 2 == 0));
         let air_at = sync_at + 64;
-        let air = &bits[air_at..air_at + 58];
 
         // On the air at `offset` from the tuning, as the radio sees it.
         let tx = Gfsk::new(1e6, 160_000.0, 0.5).with_cfo(offset);
@@ -573,8 +645,14 @@ mod tests {
         let bit = rate / 1e6;
         let true_end = base as f64 + (sync_at as f64 + 63.5) * bit;
         for wrong in [-0.4, -0.15, 0.0, 0.2, 0.4] {
-            let got = classic(&recent, rate, offset, lap, true_end + wrong * bit, air)
+            let reading = classic(&recent, rate, offset, lap, true_end + wrong * bit)
                 .expect("the window is held");
+            // On the channel's own centre, with no drift: f0 and the drift
+            // read nothing, to a fraction of a kHz.
+            let (f0, drift) = reading.carrier.expect("blocks enough for a carrier");
+            assert!(f0.abs() < 1_000.0, "{wrong}: f0 {f0}");
+            assert!(drift.drift_hz.value().abs() < 3_000.0, "{wrong}: {drift:?}");
+            let got = reading.deviation;
             let (g1, w1) = (got.settled.mean().unwrap(), want.settled.mean().unwrap());
             assert!(
                 (g1.value() - w1.value()).abs() < 0.005 * w1.value(),
@@ -592,7 +670,7 @@ mod tests {
         }
         // Not held: refused, not read from somewhere else.
         let short = Recent::new([(base, &iq[..cut])]);
-        assert!(classic(&short, rate, offset, lap, true_end, air).is_none());
+        assert!(classic(&short, rate, offset, lap, true_end).is_none());
 
         // A neighbour a channel above, 15 dB down: counted, not read.
         let mut rng = Rng::new(10);
@@ -609,7 +687,9 @@ mod tests {
             .map(|(x, y)| x + Complex::new((y.re * a) as f32, (y.im * a) as f32))
             .collect();
         let held = Recent::new([(base, &loud[..])]);
-        let got = classic(&held, rate, offset, lap, true_end, air).expect("held");
+        let got = classic(&held, rate, offset, lap, true_end)
+            .expect("held")
+            .deviation;
         assert_eq!(got.neighbour_busy, 1);
         assert_eq!((got.settled.n, got.alternating.n), (0, 0));
     }

@@ -1245,6 +1245,7 @@ mod chain {
     struct BrCase {
         heads: u64,
         chain: crate::signal::bt::piconet::Deviation,
+        carrier: crate::signal::bt::piconet::Carrier,
         ideal: crate::signal::bt::piconet::Deviation,
         load: f64,
     }
@@ -1276,8 +1277,18 @@ mod chain {
         BrCase {
             heads: row.map(|p| p.headers.captured).unwrap_or(0),
             chain: row.map(|p| p.headers.deviation).unwrap_or_default(),
+            carrier: row.map(|p| p.headers.carrier).unwrap_or_default(),
             ideal,
             load,
+        }
+    }
+
+    /// A piconet's mean f0 in Hz, from its ppm and channels, as the panel
+    /// turns it back (no reference in these runs); NaN before two headers.
+    fn br_f0_hz(c: &crate::signal::bt::piconet::Carrier) -> f64 {
+        match (c.f0_ppm.mean(), c.channel_mhz.mean()) {
+            (Some(ppm), Some(mhz)) => ppm.value() * mhz.value(),
+            _ => f64::NAN,
         }
     }
 
@@ -1372,7 +1383,7 @@ mod chain {
             ts_f2 / ts_f1
         );
         eprintln!(
-            "{:>5} {:>4} {:>6} {:>5} | {:>17} {:>8} | {:>17} {:>8} | {:>7} {:>7} {:>5}",
+            "{:>5} {:>4} {:>6} {:>5} | {:>17} {:>8} | {:>17} {:>8} | {:>7} {:>7} | {:>8} {:>11} {:>5}",
             "Msps",
             "SNR",
             "CFO",
@@ -1383,6 +1394,8 @@ mod chain {
             "ideal",
             "ratio",
             "ideal",
+            "f0 chain",
+            "drift worst",
             "load"
         );
         let mean_of = |s: &crate::signal::dsp::deviation::Sums| {
@@ -1403,7 +1416,7 @@ mod chain {
                     };
                     let (i1, i2) = (mean_of(&c.ideal.settled), mean_of(&c.ideal.alternating));
                     eprintln!(
-                        "{:>5} {:>4} {:>6} {:>2}/{:<2} | {} {} | {} {} | {} {:7.4} {:5.2}",
+                        "{:>5} {:>4} {:>6} {:>2}/{:<2} | {} {} | {} {} | {} {:7.4} | {} {:>11} {:5.2}",
                         rate / 1e6,
                         snr,
                         cfo / 1e3,
@@ -1415,6 +1428,10 @@ mod chain {
                         khz(i2),
                         ratio,
                         i2 / i1,
+                        khz(br_f0_hz(&c.carrier)),
+                        c.carrier
+                            .worst_drift_hz
+                            .map_or("-".to_string(), |d| format!("{:.2} kHz", d.value() / 1e3)),
                         c.load,
                     );
                 }
@@ -1490,5 +1507,13 @@ mod chain {
                 "BR {name}: chain {chain}, ideal {ideal}"
             );
         }
+        // f0 on the 40 kHz sent, and no drift where none was.
+        let f0 = br_f0_hz(&br.carrier);
+        assert!((f0 - 40_000.0).abs() < 1_000.0, "BR f0 {f0}");
+        let drift = br.carrier.worst_drift_hz.expect("a drift read").value();
+        assert!(
+            drift.abs() < 3_000.0,
+            "BR worst drift {drift} with none sent"
+        );
     }
 }

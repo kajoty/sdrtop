@@ -80,7 +80,9 @@ impl Inquiry {
 }
 
 use super::header::Header;
+use crate::signal::dsp::carrier::Drift;
 use crate::signal::dsp::deviation::Sums;
+use crate::signal::dsp::uncertainty::Uncertain;
 
 /// A piconet's deviation readings (net-ux-polish-plan 6.4), gathered from
 /// the access code, trailer and header of every header captured on its
@@ -147,6 +149,56 @@ pub struct Headers {
     /// Deviation readings from every captured header's symbols, resolved
     /// or not: the modulation does not need the UAP.
     pub deviation: Deviation,
+    /// The carrier under every measured header, likewise.
+    pub carrier: Carrier,
+}
+
+/// A piconet's carrier as the test suites define it (`dsp::carrier`, read by
+/// `signal::net::measure`), from every header measured on its LAP:
+/// every member's, like its modulation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Carrier {
+    /// Each header's f0, in ppm of its channel's frequency: a piconet hops,
+    /// and only a fraction of the carrier compares across channels (the
+    /// census keeps BLE offsets the same way).
+    pub f0_ppm: Sums,
+    /// The channels those headers were on, in MHz, to turn the mean back
+    /// into kHz.
+    pub channel_mhz: Sums,
+    /// The header whose drift reached furthest from its f0, `fk - f0` in
+    /// Hz. The limit is on every packet, so the worst one is what is held
+    /// to it.
+    pub worst_drift_hz: Option<Uncertain>,
+    /// The header with the steepest five-block step, in Hz/us.
+    pub worst_rate_hz_per_us: Option<Uncertain>,
+}
+
+impl Carrier {
+    /// One header's: its f0 and drift figures, on channel `channel_hz`.
+    pub fn of(drift: &Drift, channel_hz: f64) -> Self {
+        Self {
+            f0_ppm: Sums::of(&[(drift.initial_hz.value() / channel_hz * 1e6) as f32]),
+            channel_mhz: Sums::of(&[(channel_hz / 1e6) as f32]),
+            worst_drift_hz: Some(drift.drift_hz),
+            worst_rate_hz_per_us: Some(drift.drift_rate_hz_per_us),
+        }
+    }
+
+    /// Pool `other` in: sums added, the worse of each worst kept.
+    pub fn add(&mut self, other: Carrier) {
+        self.f0_ppm.add(other.f0_ppm);
+        self.channel_mhz.add(other.channel_mhz);
+        let worse = |a: Option<Uncertain>, b: Option<Uncertain>| match (a, b) {
+            (Some(a), Some(b)) => Some(if b.value().abs() > a.value().abs() {
+                b
+            } else {
+                a
+            }),
+            (a, b) => a.or(b),
+        };
+        self.worst_drift_hz = worse(self.worst_drift_hz, other.worst_drift_hz);
+        self.worst_rate_hz_per_us = worse(self.worst_rate_hz_per_us, other.worst_rate_hz_per_us);
+    }
 }
 
 /// One header's outcome, as the worker hands it over.
@@ -288,6 +340,7 @@ pub fn observe_header(
     read: HeaderRead,
     hypotheses: u8,
     deviation: Deviation,
+    carrier: Carrier,
 ) {
     let Some(p) = roster.iter_mut().find(|p| p.lap == lap) else {
         return;
@@ -298,6 +351,7 @@ pub fn observe_header(
     h.deviation.settled.add(deviation.settled);
     h.deviation.alternating.add(deviation.alternating);
     h.deviation.neighbour_busy += deviation.neighbour_busy;
+    h.carrier.add(carrier);
     match read {
         HeaderRead::Unresolved => {}
         HeaderRead::Undecoded => h.undecoded += 1,
@@ -403,6 +457,7 @@ mod tests {
             HeaderRead::Unresolved,
             2,
             Default::default(),
+            Default::default(),
         );
         observe_header(
             &mut roster,
@@ -410,6 +465,7 @@ mod tests {
             HeaderRead::Decoded(poll),
             2,
             Default::default(),
+            Default::default(),
         );
         observe_header(
             &mut roster,
@@ -417,12 +473,14 @@ mod tests {
             HeaderRead::Undecoded,
             2,
             Default::default(),
+            Default::default(),
         );
         observe_header(
             &mut roster,
             0xabcdef,
             HeaderRead::Undecoded,
             2,
+            Default::default(),
             Default::default(),
         );
         let h = &roster[0].headers;

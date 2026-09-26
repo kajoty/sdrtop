@@ -765,23 +765,34 @@ impl NetWorker {
                         }
                         _ => crate::signal::bt::piconet::HeaderRead::Unresolved,
                     };
+                    // The header read again from the raw samples, as the
+                    // test suites define its readings (`measure::classic`).
+                    let channel_hz = crate::signal::bt::channel::centre_hz(hit.ch);
+                    let measured = channel_hz
+                        .and_then(|hz| {
+                            let r = super::measure::classic(
+                                &window,
+                                rate_hz,
+                                hz as f64 - centre_hz,
+                                hit.lap,
+                                hit.sync_end_pair,
+                            )?;
+                            let carrier = r
+                                .carrier
+                                .map(|(_, drift)| {
+                                    crate::signal::bt::piconet::Carrier::of(&drift, hz as f64)
+                                })
+                                .unwrap_or_default();
+                            Some((r.deviation, carrier))
+                        })
+                        .unwrap_or_default();
                     headers_read.push((
                         hit.lap,
                         hit.at_us,
                         read,
                         clock.hypotheses(),
-                        crate::signal::bt::channel::centre_hz(hit.ch)
-                            .and_then(|hz| {
-                                super::measure::classic(
-                                    &window,
-                                    rate_hz,
-                                    hz as f64 - centre_hz,
-                                    hit.lap,
-                                    hit.sync_end_pair,
-                                    &hit.air,
-                                )
-                            })
-                            .unwrap_or_default(),
+                        measured.0,
+                        measured.1,
                     ));
                     narrowed_by_lap.push((hit.lap, shown));
                 }
@@ -846,7 +857,7 @@ impl NetWorker {
                             p.pace = pace;
                         }
                     }
-                    for (lap, at_us, read, hypotheses, deviation) in headers_read {
+                    for (lap, at_us, read, hypotheses, deviation, carrier) in headers_read {
                         // Joined to its hit by LAP and time: the header's
                         // capture starts on the lane that found the access
                         // code, which may be a quarter-symbol lane off the
@@ -862,6 +873,7 @@ impl NetWorker {
                             read,
                             hypotheses,
                             deviation,
+                            carrier,
                         );
                     }
                 }

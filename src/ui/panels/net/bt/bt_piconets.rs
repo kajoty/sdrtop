@@ -334,6 +334,7 @@ fn detail_within(
     }
     let sections = [
         ("MODULATION", modulation_lines(p, iw, theme)),
+        ("CARRIER", carrier_lines(p, state, iw, theme)),
         ("TIMING", timing_lines(p, state, iw, theme)),
         ("HEADERS", header_lines(p, state, iw, theme)),
     ];
@@ -466,6 +467,123 @@ fn modulation_lines(p: &Piconet, iw: usize, theme: &crate::Theme) -> Vec<Line<'s
         )));
     }
     out.extend(busy);
+    out
+}
+
+/// The initial carrier's limit, **read from the Core Specification 5.4,
+/// Vol 2, Part A, 3.1.3**: "The transmitted initial center frequency shall
+/// be within ±75 kHz from Fc."
+const F0_LIMIT_KHZ: Limit = Limit::Band {
+    low: -75.0,
+    high: 75.0,
+};
+
+/// The drift's limit, **read from the same section's Table 3.3**: ±25 kHz
+/// for a one-slot packet, ±40 kHz for three and five slots. What is read
+/// here is the access code and header, which every packet type must keep
+/// within 40 of its f0; a one-slot packet's 25 is over its whole length,
+/// which a header cannot show. So 40 is what a reading is held to, and a
+/// reading over it is a packet over its limit whatever its type.
+const DRIFT_LIMIT_KHZ: Limit = Limit::Band {
+    low: -40.0,
+    high: 40.0,
+};
+
+/// **The same table**: "Maximum drift rate 400 Hz/µs", allowed "anywhere in
+/// a packet".
+const DRIFT_RATE_LIMIT: Limit = Limit::Band {
+    low: -400.0,
+    high: 400.0,
+};
+
+/// As the BLE rows' (`ble_detail`).
+const F0_RESOLUTION_KHZ: f64 = 10.0;
+const DRIFT_RESOLUTION_KHZ: f64 = 10.0;
+const DRIFT_RATE_RESOLUTION: f64 = 80.0;
+
+/// The CARRIER section: the piconet's initial carrier and drift as the test
+/// suites define them (`piconet::Carrier`, `signal::net::measure`), every
+/// member's headers pooled. f0 is the mean over headers, relative to our
+/// own oscillator until a reference makes it absolute, as the clock row
+/// is; the drift and its rate are the worst header's, because the limits
+/// are on every packet.
+fn carrier_lines(
+    p: &Piconet,
+    state: &SdrMetrics,
+    iw: usize,
+    theme: &crate::Theme,
+) -> Vec<Line<'static>> {
+    let c = p.headers.carrier;
+    let mut out = vec![crate::ui::chrome::section(
+        "carrier",
+        "BR limits: Core 5.4 Vol 2 A 3.1.3",
+        iw,
+        theme,
+    )];
+    let quiet = |text: &str| {
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(theme.stale),
+        ))
+    };
+    let (Some(f0), Some(mhz)) = (c.f0_ppm.mean(), c.channel_mhz.mean()) else {
+        out.push(quiet("not measured: two headers with enough blocks needed"));
+        return out;
+    };
+    let now = std::time::Instant::now();
+    let (ppm, provenance) = state.radio.corrected_ppm(f0, now);
+    let khz = ppm.scale(mhz.value() / 1e3);
+    let judged = provenance != crate::state::Provenance::Unreferenced;
+    let mut rows = Vec::new();
+    if judged {
+        rows.push(LimitRow::new(
+            "f0",
+            Reading::new(khz, "kHz", F0_RESOLUTION_KHZ),
+            F0_LIMIT_KHZ,
+        ));
+    }
+    if let Some(d) = c.worst_drift_hz {
+        rows.push(LimitRow::new(
+            "Drift worst",
+            Reading::new(d.scale(0.001), "kHz", DRIFT_RESOLUTION_KHZ),
+            DRIFT_LIMIT_KHZ,
+        ));
+    }
+    if let Some(r) = c.worst_rate_hz_per_us {
+        rows.push(LimitRow::new(
+            "Rate worst",
+            Reading::new(r, "Hz/us", DRIFT_RATE_RESOLUTION),
+            DRIFT_RATE_LIMIT,
+        ));
+    }
+    let w = RowWidths::fit_within(&rows, iw);
+    out.extend(rows.iter().map(|r| Line::from(r.spans(theme, w))));
+    if !judged {
+        out.push(Line::from(vec![
+            crate::ui::chrome::field("f0", LABEL_W, theme),
+            Span::styled(
+                Reading::new(khz, "kHz", F0_RESOLUTION_KHZ).text(),
+                Style::default().fg(theme.value),
+            ),
+            Span::styled(
+                "  relative to our own oscillator".to_string(),
+                Style::default().fg(theme.label),
+            ),
+        ]));
+    }
+    for chunk in crate::ui::chrome::wrap(
+        &format!(
+            "from {} headers' access code and header, as the test suite defines them",
+            c.f0_ppm.n
+        ),
+        iw.saturating_sub(1),
+        2,
+    ) {
+        out.push(Line::from(Span::styled(
+            format!(" {chunk}"),
+            Style::default().fg(theme.label),
+        )));
+    }
     out
 }
 
@@ -1240,6 +1358,7 @@ mod tests {
             HeaderRead::Unresolved,
             2,
             Default::default(),
+            Default::default(),
         );
         let out = draw(NetBtPiconetsPanel, 70, 30, &m).join("\n");
         assert!(
@@ -1269,6 +1388,7 @@ mod tests {
                 HeaderRead::Decoded(header(t, a)),
                 1,
                 Default::default(),
+                Default::default(),
             );
         }
         observe_header(
@@ -1276,6 +1396,7 @@ mod tests {
             0x5a3c71,
             HeaderRead::Undecoded,
             1,
+            Default::default(),
             Default::default(),
         );
         let out = draw(NetBtPiconetsPanel, 70, 30, &m).join("\n");
@@ -1315,12 +1436,21 @@ mod tests {
             alternating: Sums::of(&[149_000.0, 151_000.0]),
             neighbour_busy: 2,
         };
+        // Two headers' carrier: f0 +4 and +6 ppm on 2441 MHz (about
+        // +12 kHz), the worse drift 12 kHz, the steeper rate -60 Hz/us.
+        let carrier = crate::signal::bt::piconet::Carrier {
+            f0_ppm: Sums::of(&[4.0, 6.0]),
+            channel_mhz: Sums::of(&[2441.0, 2441.0]),
+            worst_drift_hz: Some(Uncertain::from_sigma(12_000.0, 800.0)),
+            worst_rate_hz_per_us: Some(Uncertain::from_sigma(-60.0, 10.0)),
+        };
         observe_header(
             &mut m.net.bt_piconets,
             0x5a3c71,
             HeaderRead::Unresolved,
             32,
             dev,
+            carrier,
         );
         let out = draw(NetBtPiconetsPanel, 80, 40, &m).join("\n");
         assert!(out.contains("Mod index"), "{out}");
@@ -1332,6 +1462,13 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("Core 5.4 Vol 2 A 3.1.1"), "{out}");
+        // The carrier: no reference, so f0 is a reading, not a verdict; the
+        // worst drift and rate against their limits.
+        assert!(out.contains("Core 5.4 Vol 2 A 3.1.3"), "{out}");
+        assert!(out.contains("relative to our own oscillator"), "{out}");
+        assert!(out.contains("Drift worst"), "{out}");
+        assert!(out.contains("12.0"), "{out}");
+        assert!(out.contains("Rate worst"), "{out}");
         assert!(
             out.contains("test suite defines them"),
             "said how it was read: {out}"

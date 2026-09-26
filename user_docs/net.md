@@ -471,6 +471,19 @@ The selected piconet's detail, in as many sections as the panel has room for
   much, and at 20 dB above the noise it also leans a percent or so, which
   the `±` does not cover. Stronger is better, as with most things in
   radio.
+- **Carrier**: the piconet's initial carrier (f0, from the four preamble
+  bits) and its drift, read as the test suite defines them from the access
+  code and header of every header measured. The drift and its rate are the
+  worst header's, since the limits are on every packet; f0 is the mean,
+  relative to our own oscillator like the clock below, and held against the
+  specification's ±75 kHz only once a reference makes it absolute. The
+  drift is held to the 40 kHz every packet type has to meet: a one-slot
+  packet's 25 kHz is over its whole length, which a header alone cannot
+  show. Every bit read here is either known (the whole access code) or
+  decided again from the measurement itself, never taken from the part
+  of the receiver that finds packets, because one wrong bit there looked
+  like 30 kHz of drift. Noise makes drift too, as it does on BLE: see the
+  Modulation note in the BLE view's detail.
 - **Timing**: how far each hit lands from the piconet's own 625 µs slot grid,
   fitted to its hits, against the specification's 1 µs, with the spread drawn
   under it. Below eight hits it is collecting; hits that do not line up on a

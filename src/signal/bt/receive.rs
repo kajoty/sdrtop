@@ -120,12 +120,6 @@ pub struct HeaderHit {
     /// worker`'s own `header::PiconetClock` computes. `payload::
     /// verify_crc`/`break_uap_tie`'s own `raw` parameter, unchanged.
     pub payload_raw: Vec<bool>,
-    /// The trailer and header's own air bits ([`HEADER_CAPTURE_BITS`]), as
-    /// sliced: the symbols a piconet's modulation is read at
-    /// (`signal::net::measure`). The header region only, since it is the one
-    /// part of a capture known to be this packet's: the payload region runs
-    /// to DH5's worst case whatever the packet's real length.
-    pub air: Vec<bool>,
     /// The channel it was heard on.
     pub ch: u8,
     /// Where on the stream the last sync-word bit was sliced, in raw sample
@@ -466,7 +460,6 @@ impl Receiver {
                             whitened,
                             tick: ticks_from_symbols(self.anchor_symbols + pending.start_symbol),
                             payload_raw: pending.bits[HEADER_CAPTURE_BITS..].to_vec(),
-                            air: pending.bits[..HEADER_CAPTURE_BITS].to_vec(),
                             ch: self.ch,
                             sync_end_pair: pending.sync_end_pair,
                             at_us: pending.at_us,

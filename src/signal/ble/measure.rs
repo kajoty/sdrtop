@@ -119,95 +119,13 @@ pub fn modulation_from(
     })
 }
 
-/// A packet's carrier as the test suites read it: where it started, where
-/// it ended, and the two drift figures the Core Specification limits, each
-/// with the noise it carries.
-///
-/// **The suites' maxima, with a `±` from the packet's own blocks.** The
-/// suites take the largest `|fn - f0|` and `|fn - fn-5|` over the payload's
-/// ten-bit blocks (RF-PHY.TS.4.2.1 TP/TRM-LE/CA/BV-06-C). On a cable that is
-/// the transmitter; over the air a maximum of noisy blocks also finds the
-/// noise, and with nothing drifting noise alone reads 0.9, 2.9 and 9.2 kHz
-/// at 40, 30 and 20 dB in 1 MHz (`signal::net::conformance`). Kept as the
-/// suites define it (Viktor, 2026-09-26), with a `±` from the blocks'
-/// scatter about a straight line, which the panels print it against: a
-/// reading whose `±` is past their resolution shows as a dash.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Drift {
-    /// f0, the preamble's mean frequency (TP/TRM-LE/CA/BV-06-C step 4), or
-    /// the first block's where the preamble is not held, in Hz.
-    pub initial_hz: Uncertain,
-    /// The last ten-bit block before the CRC, in Hz.
-    pub final_hz: Uncertain,
-    /// The block furthest from f0, as `fk - f0`, signed: the suites'
-    /// `|f0 - fn|`, which the Core's "frequency drift during any packet"
-    /// is held to.
-    pub drift_hz: Uncertain,
-    /// The largest change over five blocks, `fn - fn-5`, signed, over the
-    /// time five blocks span: the suites' drift rate, in Hz/us.
-    pub drift_rate_hz_per_us: Uncertain,
-}
+/// The carrier figures, which are GFSK's and so `dsp::carrier`'s: classic
+/// Bluetooth reads them too.
+pub use crate::signal::dsp::carrier::Drift;
 
-/// The ten-bit blocks' scatter about a straight line through them: the
-/// noise one block carries, with any curve in the drift counted in, which
-/// only makes it more cautious. `None` below three blocks.
-fn block_sigma(blocks: &[f64]) -> Option<f64> {
-    let n = blocks.len();
-    if n < 3 {
-        return None;
-    }
-    let nf = n as f64;
-    let (sx, sy) = (nf * (nf - 1.0) / 2.0, blocks.iter().sum::<f64>());
-    let sxx = (0..n).map(|i| (i * i) as f64).sum::<f64>();
-    let sxy = blocks
-        .iter()
-        .enumerate()
-        .map(|(i, y)| i as f64 * y)
-        .sum::<f64>();
-    let slope = (nf * sxy - sx * sy) / (nf * sxx - sx * sx);
-    let icept = (sy - slope * sx) / nf;
-    let ss = blocks
-        .iter()
-        .enumerate()
-        .map(|(i, y)| (y - icept - slope * i as f64).powi(2))
-        .sum::<f64>();
-    Some((ss / (nf - 2.0)).sqrt())
-}
-
-/// A packet's carrier from its f0 (the preamble's mean and how many bits it
-/// was read over, or `None` where the preamble is not held, and the first
-/// block stands in) and its ten-bit blocks (`dsp::carrier::ten_bit_blocks`),
-/// on `phy`'s clock. `None` under six blocks, where the suites' five-block
-/// rate cannot be read.
+/// [`crate::signal::dsp::carrier::drift_from`] on `phy`'s clock.
 pub fn drift_from(initial: Option<(f64, usize)>, blocks: &[f64], phy: Phy) -> Option<Drift> {
-    const SPAN: usize = 5;
-    if blocks.len() <= SPAN {
-        return None;
-    }
-    let sigma = block_sigma(blocks)?;
-    // f0 is read from the same per-bit noise over fewer bits.
-    let (f0, f0_sigma, from) = match initial {
-        Some((f0, bits)) => (f0, sigma * (10.0 / bits.max(1) as f64).sqrt(), 0),
-        None => (blocks[0], sigma, 1),
-    };
-    let furthest = *blocks[from..]
-        .iter()
-        .max_by(|a, b| (*a - f0).abs().total_cmp(&(*b - f0).abs()))?;
-    let initial_hz = Uncertain::from_sigma(f0, f0_sigma);
-    let steepest = blocks
-        .windows(SPAN + 1)
-        .map(|w| w[SPAN] - w[0])
-        .max_by(|a, b| a.abs().total_cmp(&b.abs()))?;
-    let span_us = (SPAN * 10) as f64 / phy.symbol_rate_hz() * 1e6;
-    Some(Drift {
-        initial_hz,
-        final_hz: Uncertain::from_sigma(*blocks.last()?, sigma),
-        drift_hz: Uncertain::from_sigma(furthest, sigma).difference(&initial_hz),
-        drift_rate_hz_per_us: Uncertain::from_sigma(
-            steepest / span_us,
-            sigma * std::f64::consts::SQRT_2 / span_us,
-        ),
-    })
+    crate::signal::dsp::carrier::drift_from(initial, blocks, phy.symbol_rate_hz())
 }
 
 #[cfg(test)]
