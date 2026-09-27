@@ -11,6 +11,7 @@ mod micro;
 mod net;
 mod observer;
 mod radio;
+mod record;
 mod selection;
 mod signal;
 mod spectrum;
@@ -42,6 +43,7 @@ pub use observer::ObserverState;
 pub use radio::{
     offset_ppm, FrequencyReference, OffsetBasis, Provenance, RadioState, REFERENCE_STALE_S,
 };
+pub use record::{RecordProgress, RecordState};
 pub use selection::Selection;
 pub use signal::{
     acpr_offset_hz, classify, Modulation, SignalState, ADC_COMFORT_DBFS, CLASSIFY_MIN_SNR_DB,
@@ -88,6 +90,8 @@ pub struct SdrMetrics {
     pub demod: DemodState,
     /// What the 2.4 GHz receiver is doing. See [`NetState`].
     pub net: NetState,
+    /// What the IQ recorder is doing. See [`RecordState`].
+    pub record: RecordState,
     /// Active device's capability descriptor - drives capability-aware UI
     /// rendering (gain model, BB filter / Friis applicability, ranges). Shared
     /// (Arc) so the per-frame `SdrMetrics` clone stays cheap.

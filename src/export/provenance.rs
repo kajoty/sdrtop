@@ -132,7 +132,7 @@ fn addresses_line(state: &SdrMetrics) -> String {
 }
 
 /// How the frequency reference is described, or why it is not.
-fn reference_line(state: &SdrMetrics, now: std::time::Instant) -> String {
+pub(crate) fn reference_line(state: &SdrMetrics, now: std::time::Instant) -> String {
     let Some(r) = state.radio.reference.as_ref() else {
         return "unreferenced, no reference established".to_string();
     };

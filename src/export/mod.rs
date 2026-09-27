@@ -19,6 +19,7 @@ pub mod bt;
 pub mod census;
 pub mod destination;
 pub mod fer;
+pub mod iq;
 pub mod occupancy;
 pub mod provenance;
 

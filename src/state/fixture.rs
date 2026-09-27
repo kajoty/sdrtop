@@ -114,6 +114,7 @@ impl SdrMetrics {
             lab: LabState::default(),
             demod: DemodState::default(),
             net: crate::state::NetState::default(),
+            record: crate::state::RecordState::default(),
             caps,
             device_options: Arc::new(Vec::new()),
             acc: Accumulators::default(),

@@ -221,6 +221,7 @@ mod tests {
                 full_scale: 128.0,
             },
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
+            record: Default::default(),
         };
         (state, Arc::new(ctx), sample_rx, demod_rx, net_rx)
     }

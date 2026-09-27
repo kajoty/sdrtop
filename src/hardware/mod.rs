@@ -8,8 +8,9 @@
 //! [`discovery`] is the only module that sees all three groups.
 //!
 //! The rest is shared and backend-neutral: [`traits`] is the vocabulary,
-//! [`process`] the per-sample decode all three feed, [`gain`] the placement
-//! policy, [`sysfs`] the read-only USB scan behind observer mode.
+//! [`process`] the per-sample decode all three feed, [`record_tap`] the
+//! recorder's feed out of it, [`gain`] the placement policy, [`sysfs`] the
+//! read-only USB scan behind observer mode.
 //!
 //! **What this file re-exports is what the rest of the app may know about the
 //! hardware**, so nothing backend-specific belongs in the list below. A fact
@@ -21,12 +22,14 @@ pub mod discovery;
 pub mod gain;
 pub mod native;
 pub mod process;
+pub mod record_tap;
 pub mod soapy;
 pub mod sysfs;
 pub mod tinysa;
 mod traits;
 
 pub use discovery::{list_all_devices, open_device, DeviceKind, DeviceListing};
+pub use record_tap::RecordTap;
 #[cfg(test)]
 pub(crate) use traits::RateSet;
 pub use traits::{

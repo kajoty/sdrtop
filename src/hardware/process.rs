@@ -113,7 +113,12 @@ pub fn process_block(
     // is not a reason to copy every block off the USB callback.
     // The tuning is read in the same lock: it travels with the block, so a
     // worker that processes it later still knows where it was captured.
-    let (cal, demod_enabled, net_enabled, centre_hz, rate_hz) = {
+    // The recorder's gate is its own atomic, read before the lock so an idle
+    // recorder adds nothing inside it; a running one takes the gain with the
+    // tuning, from the same lock, so the file's gain and frequency are the
+    // settings of one moment.
+    let recording = ctx.record.armed();
+    let (cal, demod_enabled, net_enabled, centre_hz, rate_hz, gain) = {
         let m = ctx.metrics.lock().unwrap_or_else(|e| e.into_inner());
         (
             m.iq.cal,
@@ -121,6 +126,7 @@ pub fn process_block(
             m.ui.is_net_section(),
             m.radio.frequency,
             m.radio.config_sample_rate,
+            recording.then(|| (m.radio.gains.clone(), m.radio.amp_enabled)),
         )
     };
     // Where this block sits in the stream. The pairs the driver lost come
@@ -130,6 +136,23 @@ pub fn process_block(
         dropped_pairs + pairs as u64,
         std::sync::atomic::Ordering::Relaxed,
     ) + dropped_pairs;
+    // The recorder takes the raw bytes, whatever the correction: a correction
+    // can be applied to a recording afterwards and never taken out of one.
+    if let Some((gains, boost)) = gain {
+        ctx.record.offer(
+            super::record_tap::BlockAt {
+                first_pair,
+                pairs: pairs as u64,
+                driver_dropped: dropped_pairs,
+                centre_hz,
+                rate_hz,
+            },
+            buf,
+            gains,
+            boost,
+        );
+    }
+
     let correcting = cal.correcting();
     acc.correcting = correcting;
     acc.cal = cal;
@@ -527,8 +550,52 @@ mod tests {
             power_tx,
             geometry: eight_bit(),
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
+            record: Default::default(),
         };
         (Arc::new(ctx), sample_rx, demod_rx, net_rx)
+    }
+
+    /// **The recorder gets the raw bytes**, even while the other feeds carry
+    /// a DC-blocked stream, stamped with the block's place in the stream and
+    /// the gain set when it arrived. Idle, it gets nothing.
+    #[test]
+    fn the_recorder_gets_the_raw_block_with_its_place_and_gain() {
+        use crate::hardware::record_tap::RecordMsg;
+        let (ctx, sample_rx, _demod_rx, _net_rx) = rx_ctx();
+        {
+            let mut m = ctx.metrics.lock().unwrap();
+            m.iq.cal.dc_block_on = true;
+            m.iq.cal.dc_i_raw = 10.0;
+            m.radio.gains = vec![24.0, 30.0];
+            m.radio.amp_enabled = true;
+        }
+        let block: Vec<u8> = (0..64u8).collect();
+        super::process_block(&block, eight_bit(), 0, &ctx, Instant::now());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.record.arm(tx);
+        super::process_block(&block, eight_bit(), 7, &ctx, Instant::now());
+        match rx.try_recv().unwrap() {
+            RecordMsg::Block {
+                at,
+                bytes,
+                gains,
+                boost,
+            } => {
+                assert_eq!(bytes, block, "the raw bytes, not the corrected ones");
+                assert_eq!(
+                    (at.first_pair, at.pairs, at.driver_dropped),
+                    (32 + 7, 32, 7)
+                );
+                assert_eq!((gains, boost), (vec![24.0, 30.0], true));
+            }
+            RecordMsg::Refused { .. } => panic!("an empty queue refused a block"),
+        }
+        assert!(rx.try_recv().is_err(), "the idle block was not recorded");
+        let forwarded = sample_rx.try_iter().last().unwrap();
+        assert_ne!(
+            forwarded, block,
+            "the FFT feed still sees the corrected stream"
+        );
     }
 
     /// The block the FFT feed could not take is counted.

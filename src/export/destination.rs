@@ -37,10 +37,42 @@ pub fn default_dir() -> PathBuf {
 /// in the name because two exports a minute apart must not collide, and a
 /// collision is refused rather than resolved - see [`create`].
 pub fn file_name(stem: &str, unix_secs: i64) -> String {
+    format!("{}.csv", base_name(stem, unix_secs))
+}
+
+/// `iq-20260927-101500`: the name without its extension, for an export that
+/// is more than one file (an IQ recording's data and its metadata).
+pub fn base_name(stem: &str, unix_secs: i64) -> String {
     let t = super::provenance::iso8601(unix_secs);
     let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
     let (date, time) = digits.split_at(8.min(digits.len()));
-    format!("{stem}-{date}-{time}.csv")
+    format!("{stem}-{date}-{time}")
+}
+
+/// Bytes an unprivileged writer can still put in `dir`.
+///
+/// Asked before an IQ recording starts, because a limit the disk cannot hold
+/// is better refused at the first byte than discovered at the last one.
+pub fn free_bytes(dir: &Path) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| format!("{} is not a path the system can open", dir.display()))?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `c` is a valid NUL-terminated path and `st` is sized for the
+    // struct statvfs writes; it is read only after the call reports success.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(format!(
+            "cannot ask how much room {} has: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: statvfs returned 0, so it filled the struct.
+    let st = unsafe { st.assume_init() };
+    // Both are 32 bits wide on 32-bit Raspberry Pi OS and 64 elsewhere.
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
 /// Create the file, refusing to overwrite anything already there.
@@ -108,6 +140,16 @@ mod tests {
         let header = super::super::provenance::iso8601(1_788_632_561);
         assert!(header.starts_with("2026-09-05"));
         assert!(file_name("x", 1_788_632_561).contains("20260905"));
+    }
+
+    /// A directory that exists has some room, and one that does not is named.
+    #[test]
+    fn free_space_is_asked_of_the_directory_itself() {
+        let dir = scratch("free");
+        assert!(free_bytes(&dir).unwrap() > 0);
+        let gone = dir.join("nope");
+        assert!(free_bytes(&gone).unwrap_err().contains("nope"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

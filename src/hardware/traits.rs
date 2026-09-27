@@ -974,6 +974,10 @@ pub struct RxContext {
     /// not. Reset by [`RxContext::begin_stream`], so a restarted stream starts
     /// again from zero rather than appearing to continue across the pause.
     pub stream_pairs: AtomicU64,
+    /// Fourth feed, to the IQ recorder: raw blocks while a recording runs,
+    /// nothing otherwise. Shared, because the recorder that arms it outlives
+    /// no stream and the stream outlives no recorder.
+    pub record: Arc<super::RecordTap>,
 }
 
 impl RxContext {

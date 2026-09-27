@@ -343,6 +343,7 @@ mod power_control_tests {
             power_tx,
             geometry: SampleGeometry::default(),
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
+            record: Default::default(),
         })
     }
 
