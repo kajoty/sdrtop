@@ -57,7 +57,7 @@ fn const_stride(pairs: usize) -> usize {
 ///
 /// Integer arithmetic against the device's own full scale, so an 8-bit radio
 /// lands on exactly the `(v + 128) / 8` this used to hardcode.
-#[inline]
+#[cfg(test)]
 fn signed_bin(g: &SampleGeometry, v: i64) -> usize {
     let fs = g.full_scale as i64;
     ((v + fs) / bin_width(fs)).clamp(0, 31) as usize
@@ -78,6 +78,95 @@ fn bin_width(full_scale: i64) -> i64 {
 #[inline]
 fn amp_bin_width(full_scale: i64) -> u64 {
     (full_scale as u64 / 32).max(1)
+}
+
+/// Where a sample lands in the two histograms, decided once per block.
+///
+/// **A shift where a bucket is a power of two wide**, which it is on every
+/// 8-bit and 16-bit converter, and the division otherwise. The two agree
+/// exactly: for a numerator that is not negative, a shift by `k` is a division
+/// by `2^k`, and a negative one (a sample past minus full scale) clamps to
+/// bucket 0 either way. The divisions this replaces were the largest single
+/// cost of the per-sample fold, measured: four a pair, on the thread that must
+/// keep up with the radio.
+#[derive(Clone, Copy, Default)]
+struct Bins {
+    fs: i64,
+    signed_width: i64,
+    signed_shift: Option<u32>,
+    amp_width: u64,
+    amp_shift: Option<u32>,
+}
+
+/// Everything the fold needs to know about one centered sample.
+///
+/// Worked out per sample on a 16-bit radio, and looked up on an 8-bit one,
+/// where a byte has only 256 values: [`Bins::table`].
+#[derive(Clone, Copy, Default)]
+struct Sample {
+    v: i64,
+    rail: bool,
+    signed_bucket: u8,
+    /// `|v|`, and its amplitude bucket. The pair's Chebyshev amplitude is the
+    /// larger of its two, and so is its bucket, because the bucketing never
+    /// puts a larger amplitude in a lower bucket.
+    abs: u32,
+    amp_bucket: u8,
+}
+
+impl Bins {
+    /// One decoded sample, with its buckets.
+    #[inline(always)]
+    fn sample(&self, (v, rail): (i64, bool)) -> Sample {
+        let abs = v.unsigned_abs();
+        Sample {
+            v,
+            rail,
+            signed_bucket: self.signed(v) as u8,
+            abs: abs as u32,
+            amp_bucket: self.amp(abs) as u8,
+        }
+    }
+
+    /// Every byte of an 8-bit format, decoded and bucketed once.
+    fn table(&self, format: SampleFormat) -> [Sample; 256] {
+        std::array::from_fn(|b| self.sample(decode(format, self.fs, b as u8)))
+    }
+
+    fn new(g: &SampleGeometry) -> Self {
+        let fs = g.full_scale as i64;
+        let signed_width = bin_width(fs);
+        let amp_width = amp_bin_width(fs);
+        let shift = |w: u64| w.is_power_of_two().then(|| w.trailing_zeros());
+        Self {
+            fs,
+            signed_width,
+            signed_shift: shift(signed_width as u64),
+            amp_width,
+            amp_shift: shift(amp_width),
+        }
+    }
+
+    /// The signed ADC histogram's bucket for a centered sample.
+    #[inline]
+    fn signed(&self, v: i64) -> usize {
+        let n = v + self.fs;
+        let bucket = match self.signed_shift {
+            Some(k) => n >> k,
+            None => n / self.signed_width,
+        };
+        bucket.clamp(0, 31) as usize
+    }
+
+    /// The amplitude histogram's bucket for a Chebyshev amplitude.
+    #[inline]
+    fn amp(&self, amp: u64) -> usize {
+        let bucket = match self.amp_shift {
+            Some(k) => amp >> k,
+            None => amp / self.amp_width,
+        };
+        (bucket as usize).min(31)
+    }
 }
 
 /// Both halves at once, on the caller's thread: [`arrive`] then [`digest`].
@@ -200,6 +289,49 @@ pub fn arrive(
     }
 }
 
+/// Every per-sample figure of one block, with no lock and no state: the part
+/// of [`digest`] that runs once for every pair.
+fn accumulate(buf: &[u8], geometry: SampleGeometry, cal: crate::state::IqCalState) -> Accumulators {
+    let format = geometry.format;
+    let fs_counts = geometry.full_scale as i64;
+    let pairs = buf.len() / geometry.bytes_per_pair();
+    let correcting = cal.correcting();
+    let mut acc = Accumulators {
+        geometry,
+        bins: Bins::new(&geometry),
+        full_scale: geometry.full_scale,
+        const_stride: const_stride(pairs),
+        correcting,
+        cal,
+        ..Accumulators::default()
+    };
+    if correcting {
+        acc.out.reserve(buf.len());
+    }
+
+    // The width branch is taken **once per block**, not once per sample. Both
+    // arms call the same `fold`, so there is one copy of the accumulation and
+    // two ways of getting a pair out of the bytes.
+    match format {
+        SampleFormat::Int8 | SampleFormat::Uint8 => {
+            let table = acc.bins.table(format);
+            for c in buf.as_chunks::<2>().0 {
+                acc.fold(&table[c[0] as usize], &table[c[1] as usize]);
+            }
+        }
+        SampleFormat::Int16 => {
+            let bins = acc.bins;
+            for c in buf.as_chunks::<4>().0 {
+                acc.fold(
+                    &bins.sample(decode_i16(fs_counts, [c[0], c[1]])),
+                    &bins.sample(decode_i16(fs_counts, [c[2], c[3]])),
+                );
+            }
+        }
+    }
+    acc
+}
+
 /// The half that does the work: every accumulator, and the hand-off to the
 /// FFT, demod and NET feeds.
 ///
@@ -225,49 +357,9 @@ pub fn digest(
         now,
     } = *arrival;
     let dropped_pairs = dropped_pairs + lost_before;
-    let format = geometry.format;
-    let full_scale = geometry.full_scale;
-    let fs_counts = full_scale as i64;
-    let amp_width = amp_bin_width(fs_counts);
     let pairs = buf.len() / geometry.bytes_per_pair();
-    // Per-sample math runs entirely without the mutex.
-    let mut acc = Accumulators {
-        geometry,
-        amp_width,
-        full_scale,
-        const_stride: const_stride(pairs),
-        ..Accumulators::default()
-    };
     let correcting = cal.correcting();
-    acc.correcting = correcting;
-    acc.cal = cal;
-    if correcting {
-        acc.out.reserve(buf.len());
-    }
-
-    // The width branch is taken **once per block**, not once per sample. Both
-    // arms call the same `fold`, so there is one copy of the accumulation and
-    // two ways of getting a pair out of the bytes.
-    match format {
-        SampleFormat::Int8 | SampleFormat::Uint8 => {
-            for (idx, c) in buf.as_chunks::<2>().0.iter().enumerate() {
-                acc.fold(
-                    idx,
-                    decode(format, fs_counts, c[0]),
-                    decode(format, fs_counts, c[1]),
-                );
-            }
-        }
-        SampleFormat::Int16 => {
-            for (idx, c) in buf.as_chunks::<4>().0.iter().enumerate() {
-                acc.fold(
-                    idx,
-                    decode_i16(fs_counts, [c[0], c[1]]),
-                    decode_i16(fs_counts, [c[2], c[3]]),
-                );
-            }
-        }
-    }
+    let acc = accumulate(buf, geometry, cal);
 
     let Accumulators {
         saturated,
@@ -407,10 +499,13 @@ pub fn digest(
 #[derive(Default)]
 struct Accumulators {
     geometry: SampleGeometry,
-    /// Counts per bucket of the amplitude histogram, precomputed once.
-    amp_width: u64,
+    /// The histograms' bucketing, precomputed once.
+    bins: Bins,
     /// Pairs between constellation samples, from this block's own length.
     const_stride: usize,
+    /// Pairs until the next constellation sample: a countdown rather than a
+    /// remainder, because a remainder is a division every pair.
+    until_const: usize,
     full_scale: f32,
     cal: crate::state::IqCalState,
     correcting: bool,
@@ -433,31 +528,29 @@ struct Accumulators {
 }
 
 impl Accumulators {
-    /// Fold one decoded I/Q pair in. `idx` is the pair's position in the block,
-    /// which only the constellation decimation cares about.
-    #[inline]
-    fn fold(&mut self, idx: usize, (i, i_sat): (i64, bool), (q, q_sat): (i64, bool)) {
+    /// Fold one decoded I/Q pair in, in the order the block holds them: the
+    /// constellation countdown relies on it.
+    ///
+    /// `always`, because the hint alone left it a call per pair, measured:
+    /// every running sum went back to memory between two samples.
+    #[inline(always)]
+    fn fold(&mut self, si: &Sample, sq: &Sample) {
+        let (i, q) = (si.v, sq.v);
         self.i_sum += i;
         self.q_sum += q;
         self.i_sq += i * i;
         self.q_sq += q * q;
         self.iq_cross += i * q;
-        if i_sat {
-            self.saturated += 1;
-        }
-        if q_sat {
-            self.saturated += 1;
-        }
+        self.saturated += u64::from(si.rail) + u64::from(sq.rail);
         // Chebyshev distance over 32 bins. `unsigned_abs` of the centered value
-        // can reach full scale itself (the -FS extreme); `.min(31)` clamps that
-        // to the last bin instead of indexing [32] and panicking inside the RX
-        // callback.
-        let amp = i.unsigned_abs().max(q.unsigned_abs());
-        self.hist[((amp / self.amp_width) as usize).min(31)] += 1;
+        // can reach full scale itself (the -FS extreme); the bucket is clamped
+        // to the last bin (`Bins::amp`) instead of indexing [32] and panicking
+        // inside the RX callback.
+        self.hist[si.amp_bucket.max(sq.amp_bucket) as usize] += 1;
         // Both on the RAW samples: the physical ADC's-eye view.
-        self.peak = self.peak.max(amp as u32);
-        self.signed[signed_bin(&self.geometry, i)] += 1;
-        self.signed[signed_bin(&self.geometry, q)] += 1;
+        self.peak = self.peak.max(si.abs.max(sq.abs));
+        self.signed[si.signed_bucket as usize] += 1;
+        self.signed[sq.signed_bucket as usize] += 1;
 
         // Display path: corrected samples feed the FFT (re-encoded bytes) and the
         // constellation. When no correction is active these equal the raw samples.
@@ -473,10 +566,14 @@ impl Accumulators {
         // the stride is chosen so the budget lands evenly across the whole
         // block rather than running out inside it. Frozen ([F]) → stop
         // collecting so the cloud holds its last shape.
-        if !self.cal.frozen && idx.is_multiple_of(self.const_stride) {
-            self.consts
-                .push((ci / self.full_scale, cq / self.full_scale));
+        if self.until_const == 0 {
+            if !self.cal.frozen {
+                self.consts
+                    .push((ci / self.full_scale, cq / self.full_scale));
+            }
+            self.until_const = self.const_stride;
         }
+        self.until_const -= 1;
     }
 }
 
@@ -682,6 +779,146 @@ pub(crate) mod tests {
         );
     }
 
+    /// The per-sample fold as it was before the bins became shifts and the
+    /// constellation stride a countdown: four divisions a pair. Kept as the
+    /// reference the fast one is held to, field by field.
+    fn reference_accumulate(
+        buf: &[u8],
+        geometry: SampleGeometry,
+        cal: crate::state::IqCalState,
+    ) -> super::Accumulators {
+        let format = geometry.format;
+        let fs = geometry.full_scale as i64;
+        let pairs = buf.len() / geometry.bytes_per_pair();
+        let stride = super::const_stride(pairs);
+        let amp_width = super::amp_bin_width(fs);
+        let mut a = super::Accumulators {
+            geometry,
+            full_scale: geometry.full_scale,
+            const_stride: stride,
+            correcting: cal.correcting(),
+            cal,
+            ..super::Accumulators::default()
+        };
+        let pair_at = |k: usize| match format {
+            SampleFormat::Int16 => {
+                let c = &buf[k * 4..k * 4 + 4];
+                (
+                    super::decode_i16(fs, [c[0], c[1]]),
+                    super::decode_i16(fs, [c[2], c[3]]),
+                )
+            }
+            _ => (
+                super::decode(format, fs, buf[k * 2]),
+                super::decode(format, fs, buf[k * 2 + 1]),
+            ),
+        };
+        for idx in 0..pairs {
+            let ((i, i_sat), (q, q_sat)) = pair_at(idx);
+            a.i_sum += i;
+            a.q_sum += q;
+            a.i_sq += i * i;
+            a.q_sq += q * q;
+            a.iq_cross += i * q;
+            a.saturated += u64::from(i_sat) + u64::from(q_sat);
+            let amp = i.unsigned_abs().max(q.unsigned_abs());
+            a.hist[((amp / amp_width) as usize).min(31)] += 1;
+            a.peak = a.peak.max(amp as u32);
+            a.signed[super::signed_bin(&geometry, i)] += 1;
+            a.signed[super::signed_bin(&geometry, q)] += 1;
+            let (ci, cq) = if a.correcting {
+                cal.apply(i as f32, q as f32)
+            } else {
+                (i as f32, q as f32)
+            };
+            if a.correcting {
+                super::encode_into(&mut a.out, ci, cq, &geometry);
+            }
+            if !cal.frozen && idx.is_multiple_of(stride) {
+                a.consts.push((ci / a.full_scale, cq / a.full_scale));
+            }
+        }
+        a
+    }
+
+    fn assert_same(what: &str, fast: &super::Accumulators, reference: &super::Accumulators) {
+        assert_eq!(
+            (
+                fast.saturated,
+                fast.i_sum,
+                fast.q_sum,
+                fast.i_sq,
+                fast.q_sq,
+                fast.iq_cross
+            ),
+            (
+                reference.saturated,
+                reference.i_sum,
+                reference.q_sum,
+                reference.i_sq,
+                reference.q_sq,
+                reference.iq_cross
+            ),
+            "{what}: sums"
+        );
+        assert_eq!(fast.hist, reference.hist, "{what}: amplitude histogram");
+        assert_eq!(fast.signed, reference.signed, "{what}: signed histogram");
+        assert_eq!(fast.peak, reference.peak, "{what}: peak");
+        assert_eq!(fast.consts, reference.consts, "{what}: constellation");
+        assert_eq!(fast.out, reference.out, "{what}: corrected stream");
+    }
+
+    /// **Bit for bit what the divisions gave**, on every input that matters:
+    /// every one of the 65 536 byte pairs in both 8-bit formats, 16-bit
+    /// blocks at a power-of-two full scale and at one that is not (the
+    /// division path), samples past both rails, a live correction, a frozen
+    /// constellation, and block lengths that do and do not divide by the
+    /// stride.
+    #[test]
+    fn the_fast_fold_is_the_reference_fold_bit_for_bit() {
+        let every_pair: Vec<u8> = (0..=255u8)
+            .flat_map(|a| (0..=255u8).flat_map(move |b| [a, b]))
+            .collect();
+        let mut rng = crate::signal::dsp::testkit::Rng::new(11);
+        let wide: Vec<u8> = (0..40_001)
+            .flat_map(|_| {
+                let v = ((rng.unit() * 2.0 - 1.0) * 40_000.0) as i16;
+                v.to_le_bytes()
+            })
+            .collect();
+        let correcting = crate::state::IqCalState {
+            dc_block_on: true,
+            dc_i_raw: 3.5,
+            dc_q_raw: -1.25,
+            ..Default::default()
+        };
+        let frozen = crate::state::IqCalState {
+            frozen: true,
+            ..Default::default()
+        };
+        let cases = [
+            ("int8", SampleFormat::Int8, 128.0, &every_pair),
+            ("uint8", SampleFormat::Uint8, 128.0, &every_pair),
+            ("int16 at 2048", SampleFormat::Int16, 2048.0, &wide),
+            ("int16 at 1000", SampleFormat::Int16, 1000.0, &wide),
+            ("int16 at 32768", SampleFormat::Int16, 32768.0, &wide),
+        ];
+        for (name, format, full_scale, buf) in cases {
+            let g = SampleGeometry { format, full_scale };
+            for cal in [crate::state::IqCalState::default(), correcting, frozen] {
+                for len in [buf.len(), buf.len() / 3 * 2] {
+                    let len = len - len % g.bytes_per_pair();
+                    let block = &buf[..len];
+                    assert_same(
+                        name,
+                        &super::accumulate(block, g, cal),
+                        &reference_accumulate(block, g, cal),
+                    );
+                }
+            }
+        }
+    }
+
     /// **What one HackRF block costs to process, measured.** Not a check:
     /// run it by hand, in release, on the machine the question is about
     /// (`cargo test --release what_a_block_costs -- --ignored --nocapture`).
@@ -700,18 +937,29 @@ pub(crate) mod tests {
             .iter()
             .flat_map(|z| [(z.re * 128.0) as i8 as u8, (z.im * 128.0) as i8 as u8])
             .collect();
-        for _ in 0..20 {
+        let cal = crate::state::IqCalState::default();
+        let (mut old, mut new, mut whole) = (0.0, 0.0, 0.0);
+        const ROUNDS: usize = 200;
+        // Interleaved, so a machine that is busier for a moment is busier
+        // for all three.
+        for _ in 0..ROUNDS {
+            let t = Instant::now();
+            std::hint::black_box(reference_accumulate(&block, eight_bit(), cal));
+            old += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            std::hint::black_box(super::accumulate(&block, eight_bit(), cal));
+            new += t.elapsed().as_secs_f64();
+            let t = Instant::now();
             super::process_block(&block, eight_bit(), 0, &ctx, Instant::now());
+            whole += t.elapsed().as_secs_f64();
             while sample_rx.try_recv().is_ok() {}
         }
-        let t = Instant::now();
-        for _ in 0..300 {
-            super::process_block(&block, eight_bit(), 0, &ctx, Instant::now());
-            while sample_rx.try_recv().is_ok() {}
-        }
+        let us = |s: f64| s / ROUNDS as f64 * 1e6;
         eprintln!(
-            "process_block: {:.0} us per 131072-pair block",
-            t.elapsed().as_secs_f64() / 300.0 * 1e6
+            "per 131072-pair block: fold as it was {:.0} us, fold now {:.0} us, process_block now {:.0} us (a block lasts 6554 us at 20 Msps)",
+            us(old),
+            us(new),
+            us(whole)
         );
     }
 
