@@ -448,8 +448,13 @@ One row per LAP: when it was heard, hits, channels, and its **UAP**, the next
 8 bits of the master's address. The UAP is not sent. Bluetooth keeps it to
 itself, and it has to be worked out from the headers that follow the access
 code, a little like a crossword where every clue has two answers: a first header leaves 32 candidates,
-more headers bring it down to two, and a DH1, DH3 or DH5 payload's own CRC
-settles it to one. The column shows `32 left`, `2 left` or the value.
+more headers bring it down to two, and a data packet's own payload CRC
+settles it to one: DH1, DH3 and DH5 as sent, DM1, DM3 and DM5 through their
+error-correcting code first. The same payload also settles which of the
+piconet's possible clocks the header was sent at, and from then on its
+headers are read at that clock and no other. A header that could still be
+read two ways is left unread rather than read the likelier way. The column
+shows `32 left`, `2 left` or the value.
 
 The selected piconet's detail, in as many sections as the panel has room for
 (the rest are named on the last line):

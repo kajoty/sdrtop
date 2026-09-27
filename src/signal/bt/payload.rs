@@ -9,12 +9,19 @@
 //! algebra no longer leaves a twin standing. [`break_uap_tie`] is this
 //! module's own version of that.
 //!
-//! **Scope, decided rather than assumed: FEC-off packet types only.**
-//! DH1/DH3/DH5 carry their payload with no 2/3-rate FEC, so decoding one is
-//! whitening plus a CRC-16 - the same shape of work [`super::header`]
-//! already did for the header. DM1/DM3/DM5 (2/3-rate FEC on the payload)
-//! and the voice-carrying/control types (FHS, HV1-3, DV, EV4-5) are a
-//! separate scope, deliberately left for a later checkpoint.
+//! **Scope: the six ACL data types.** DH1/DH3/DH5 carry their payload with
+//! no FEC, so decoding one is whitening plus a CRC-16 - the same shape of
+//! work [`super::header`] already did for the header. DM1/DM3/DM5 carry it
+//! under the rate 2/3 FEC, a (15,10) shortened Hamming code: [`unfec23`]
+//! first, on the whitened stream, then the same dewhitening and CRC, since
+//! a transmitter whitens before it encodes. The voice-carrying and control
+//! types (FHS, HV1-3, DV, EV4-5) stay out of scope.
+//!
+//! **The FEC's table is worked out, not typed.** [`FEC23_COLUMNS`] is
+//! derived from the generator polynomial, g(D) = (D+1)(D^4+D+1), and a test
+//! holds the result to `libbtbb`'s own hand-written `fec23_gen_matrix`: the
+//! polynomial as the secondary literature on the baseband gives it, the
+//! table as the port's source has it, and a test standing between them.
 //!
 //! **Not read from the Bluetooth Core Specification itself this session** -
 //! the same standing every fact in [`super::header`] has. Ported instead
@@ -58,11 +65,106 @@ pub struct PayloadHeader {
 /// meaning to). `None` for every packet type this module does not decode -
 /// this session's own scope decision, not a limit of the algorithm itself.
 pub fn payload_header_bits(packet_type: header::PacketType) -> Option<usize> {
+    use header::PacketType::*;
     match packet_type {
-        header::PacketType::Dh1 => Some(8),
-        header::PacketType::Dh3 | header::PacketType::Dh5 => Some(16),
+        Dh1 | Dm1 => Some(8),
+        Dh3 | Dh5 | Dm3 | Dm5 => Some(16),
         _ => None,
     }
+}
+
+/// Whether a type's payload travels under the rate 2/3 FEC.
+pub fn fec23_protected(packet_type: header::PacketType) -> bool {
+    use header::PacketType::*;
+    matches!(packet_type, Dm1 | Dm3 | Dm5)
+}
+
+/// Raw air bits that carry `data_bits` of payload: the same number without
+/// FEC, and 15 for every 10 (the last codeword padded) with it.
+pub fn raw_bits_for(packet_type: header::PacketType, data_bits: usize) -> usize {
+    if fec23_protected(packet_type) {
+        data_bits.div_ceil(10) * 15
+    } else {
+        data_bits
+    }
+}
+
+/// The (15,10) code's generator polynomial, D^5 + D^4 + D^2 + 1, which is
+/// (D+1)(D^4+D+1): bit `k` the coefficient of D^k.
+const FEC23_G: u32 = 0b11_0101;
+
+/// The five parity bits each data bit contributes on its own, bit `j` the
+/// `j`-th parity bit on the air. A codeword's parity is the XOR of the
+/// columns of its set data bits, and a single flipped data bit shows up as
+/// its own column in the syndrome.
+///
+/// The first data bit on the air is the highest-degree coefficient, as a
+/// shift-register encoder sends it: parity = D^5 d(D) mod g(D), its
+/// coefficients sent from D^4 down. Every column has odd weight (the
+/// factor D+1), so a double error's syndrome is even and matches no column
+/// and no single parity bit: it is caught, never "corrected" into other
+/// data.
+pub(crate) const FEC23_COLUMNS: [u8; 10] = fec23_columns();
+
+const fn fec23_columns() -> [u8; 10] {
+    let mut columns = [0u8; 10];
+    let mut i = 0;
+    while i < 10 {
+        // D^(9-i) shifted up by the five parity places, reduced mod g.
+        let mut poly: u32 = 1 << (9 - i + 5);
+        let mut degree = 14;
+        while degree >= 5 {
+            if poly & (1 << degree) != 0 {
+                poly ^= FEC23_G << (degree - 5);
+            }
+            degree -= 1;
+        }
+        // Coefficient of D^4 goes on the air first.
+        let mut parity = 0u8;
+        let mut j = 0;
+        while j < 5 {
+            if poly & (1 << (4 - j)) != 0 {
+                parity |= 1 << j;
+            }
+            j += 1;
+        }
+        columns[i] = parity;
+        i += 1;
+    }
+    columns
+}
+
+/// Undo the rate 2/3 FEC: `data_bits` of data out of the codewords that
+/// carry them, one data error per codeword corrected. `None` when a
+/// codeword holds an error the code cannot place (two or more), or when
+/// `raw` is shorter than the codewords needed.
+///
+/// `libbtbb`'s own `unfec23`, the table derived instead of typed.
+pub(crate) fn unfec23(raw: &[bool], data_bits: usize) -> Option<Vec<bool>> {
+    let codewords = data_bits.div_ceil(10);
+    if raw.len() < codewords * 15 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(codewords * 10);
+    for word in raw.as_chunks::<15>().0.iter().take(codewords) {
+        let mut data = [false; 10];
+        data.copy_from_slice(&word[..10]);
+        let received = header::pack_bits(&word[10..15]) as u8;
+        let expected = data
+            .iter()
+            .zip(FEC23_COLUMNS)
+            .filter(|(bit, _)| **bit)
+            .fold(0u8, |p, (_, column)| p ^ column);
+        let syndrome = received ^ expected;
+        // One bit set: a parity bit took the error and the data is whole.
+        if syndrome.count_ones() > 1 {
+            let at = FEC23_COLUMNS.iter().position(|&c| c == syndrome)?;
+            data[at] = !data[at];
+        }
+        out.extend(data);
+    }
+    out.truncate(data_bits);
+    Some(out)
 }
 
 /// The largest legal total payload length (header + body + CRC, in bytes)
@@ -70,10 +172,14 @@ pub fn payload_header_bits(packet_type: header::PacketType) -> Option<usize> {
 /// against a corrupted LENGTH field claiming an impossible size rather than
 /// trusting it outright.
 pub fn max_payload_length(packet_type: header::PacketType) -> Option<usize> {
+    use header::PacketType::*;
     match packet_type {
-        header::PacketType::Dh1 => Some(30),
-        header::PacketType::Dh3 => Some(187),
-        header::PacketType::Dh5 => Some(343),
+        Dh1 => Some(30),
+        Dh3 => Some(187),
+        Dh5 => Some(343),
+        Dm1 => Some(20),
+        Dm3 => Some(125),
+        Dm5 => Some(228),
         _ => None,
     }
 }
@@ -126,8 +232,9 @@ pub(crate) fn crcgen(bits: &[bool], uap: u8) -> u16 {
 /// payload header itself says the packet actually is.
 ///
 /// Returns `None` when nothing here can render a verdict at all: an
-/// unsupported packet type, or a `raw` shorter than the length the
-/// payload's own header claims (not enough was captured yet to check).
+/// unsupported packet type, a `raw` shorter than the length the payload's
+/// own header claims (not enough was captured yet to check), or a codeword
+/// the rate 2/3 FEC cannot correct (the capture is damaged).
 /// `Some(true)`/`Some(false)` is the actual CRC verdict once one is
 /// possible - never invented when the data to compute it is simply
 /// missing, `POLICY.md` rule 2's own "what cannot be asked is refused, not
@@ -140,17 +247,28 @@ pub fn verify_crc(
 ) -> Option<bool> {
     let header_bits_len = payload_header_bits(packet_type)?;
     let max_len = max_payload_length(packet_type)?;
-    if raw.len() < header_bits_len {
-        return None;
-    }
-    let dewhitened_header = header::unwhiten_at(&raw[..header_bits_len], clk6, HEADER_BITS);
+    // Data bits out of the raw capture: as they are, or through the FEC.
+    // A codeword the FEC cannot place is no verdict, not a failed CRC: it
+    // says the capture is damaged, whichever UAP is being tried.
+    let data = |bits: usize| -> Option<Vec<bool>> {
+        let raw_bits = raw_bits_for(packet_type, bits);
+        if raw.len() < raw_bits {
+            return None;
+        }
+        if fec23_protected(packet_type) {
+            unfec23(&raw[..raw_bits], bits)
+        } else {
+            Some(raw[..bits].to_vec())
+        }
+    };
+    let dewhitened_header = header::unwhiten_at(&data(header_bits_len)?, clk6, HEADER_BITS);
     let payload_header = decode_payload_header(&dewhitened_header)?;
     let payload_length = payload_header.payload_length.min(max_len);
     let total_bits = payload_length * 8;
-    if total_bits < 16 || raw.len() < total_bits {
+    if total_bits < 16 {
         return None;
     }
-    let dewhitened = header::unwhiten_at(&raw[..total_bits], clk6, HEADER_BITS);
+    let dewhitened = header::unwhiten_at(&data(total_bits)?, clk6, HEADER_BITS);
     let received = header::pack_bits(&dewhitened[total_bits - 16..total_bits]);
     let computed = crcgen(&dewhitened[..total_bits - 16], uap);
     Some(received == computed)
@@ -159,32 +277,31 @@ pub fn verify_crc(
 /// Break [`super::header::PiconetClock`]'s own measured two-candidate
 /// floor, using one packet's payload rather than another header.
 ///
-/// For each candidate UAP, finds the CLK1-6 that reproduces this same
-/// packet's header under it ([`header::decode_with_uap`]'s own search,
-/// which also names the resulting packet type), then checks whether that
-/// clock's own dewhitening of the payload also carries a correct CRC.
-/// Exactly one candidate should pass on a genuine packet; returns it.
+/// `candidates` are `(UAP, CLK1-6)` pairs: each UAP still standing, at each
+/// clock the piconet's own clock gives it for this header
+/// ([`header::PiconetClock::clocks_for`]). **The clock is not searched
+/// for.** About one header in five has a second clock giving the same UAP,
+/// under which it reads as another packet type; taking the first clock
+/// that fitted read those headers wrong and checked their payloads against
+/// the wrong whitening. Each pair's header is read at its clock, and its
+/// payload checked at the same clock.
 ///
-/// `None` when no candidate's own header decodes at all, none of the ones
-/// that do name a packet type this module reads, or (vanishingly likely
-/// with only two real candidates surviving `PiconetClock` in the first
-/// place) neither one's own payload actually checks out - every one of
-/// those is "still tied, honestly", never a guessed answer.
+/// Returns the one `(UAP, CLK1-6)` whose payload checks out: the UAP, and
+/// the clock this header was sent at, which is what lets its piconet's
+/// clock be pinned to one hypothesis. `None` when none does (an unsupported
+/// type, a damaged or short capture), and `None` too when more than one
+/// does: that is still a tie, never a pick.
 pub fn break_uap_tie(
-    candidates: &[u8],
+    candidates: &[(u8, u8)],
     header_whitened: &[bool; HEADER_BITS],
     payload_raw: &[bool],
-) -> Option<u8> {
-    let mut winner = None;
-    for &uap in candidates {
-        let Some(decoded) = header::decode_with_uap(header_whitened, uap) else {
-            continue;
-        };
-        if verify_crc(payload_raw, decoded.clk6, decoded.packet_type, uap) == Some(true) {
-            winner = Some(uap);
-        }
-    }
-    winner
+) -> Option<(u8, u8)> {
+    let mut passed = candidates.iter().filter(|&&(uap, clk6)| {
+        header::decode_at(header_whitened, uap, clk6)
+            .is_some_and(|h| verify_crc(payload_raw, clk6, h.packet_type, uap) == Some(true))
+    });
+    let first = *passed.next()?;
+    passed.next().is_none().then_some(first)
 }
 
 #[cfg(test)]
@@ -214,12 +331,11 @@ mod tests {
         uap: u8,
         body: &[u8],
     ) -> ([bool; HEADER_BITS], Vec<bool>) {
-        let type_bits = match packet_type {
-            PacketType::Dh1 => 4u8,
-            PacketType::Dh3 => 11,
-            PacketType::Dh5 => 15,
-            _ => panic!("test helper only knows DH1/DH3/DH5"),
-        };
+        assert!(
+            payload_header_bits(packet_type).is_some(),
+            "test helper only knows the ACL data types"
+        );
+        let type_bits = packet_type.code();
         let lt_addr = 0b011u8;
         let flags = 0b101u8;
         let data10 = (lt_addr as u16) | ((type_bits as u16) << 3) | ((flags as u16) << 7);
@@ -259,7 +375,139 @@ mod tests {
         host.extend(bits_of_u16(crc, 16));
 
         let payload_whitened = header::unwhiten_at(&host, clk6, HEADER_BITS);
-        (header_whitened, payload_whitened)
+        // A transmitter whitens, then encodes.
+        let payload_raw = if fec23_protected(packet_type) {
+            fec23_encode(&payload_whitened)
+        } else {
+            payload_whitened
+        };
+        (header_whitened, payload_raw)
+    }
+
+    /// The rate 2/3 encoder, for fixtures: each 10 data bits followed by
+    /// their five parity bits, the last word padded with zeros.
+    fn fec23_encode(data: &[bool]) -> Vec<bool> {
+        let mut out = Vec::new();
+        for chunk in data.chunks(10) {
+            let mut word = [false; 10];
+            word[..chunk.len()].copy_from_slice(chunk);
+            let parity = word
+                .iter()
+                .zip(FEC23_COLUMNS)
+                .filter(|(bit, _)| **bit)
+                .fold(0u8, |p, (_, column)| p ^ column);
+            out.extend(word);
+            out.extend((0..5).map(|j| (parity >> j) & 1 != 0));
+        }
+        out
+    }
+
+    /// **The table worked out from g(D) is `libbtbb`'s table.** Its
+    /// `fec23_gen_matrix`, parity part (`>> 10`), as the port's source has it.
+    #[test]
+    fn the_fec_table_from_the_polynomial_is_the_ported_table() {
+        const LIBBTBB_GEN_MATRIX: [u16; 10] = [
+            0x2c01, 0x5802, 0x1c04, 0x3808, 0x7010, 0x4c20, 0x3440, 0x6880, 0x7d00, 0x5600,
+        ];
+        let from_libbtbb = LIBBTBB_GEN_MATRIX.map(|row| (row >> 10) as u8);
+        assert_eq!(FEC23_COLUMNS, from_libbtbb);
+        assert!(FEC23_COLUMNS.iter().all(|c| c.count_ones() % 2 == 1));
+    }
+
+    /// Every single error in a codeword is corrected, in the data or in the
+    /// parity; every double error is caught and refused, never corrected
+    /// into other data.
+    #[test]
+    fn one_error_a_codeword_is_corrected_and_two_are_refused() {
+        let data: Vec<bool> = (0..30).map(|i| (i * 7) % 3 == 0).collect();
+        let clean = fec23_encode(&data);
+        assert_eq!(unfec23(&clean, 30).as_deref(), Some(&data[..]));
+        for word in 0..3 {
+            for a in 0..15 {
+                let mut one = clean.clone();
+                one[word * 15 + a] = !one[word * 15 + a];
+                assert_eq!(
+                    unfec23(&one, 30).as_deref(),
+                    Some(&data[..]),
+                    "one error at {a}"
+                );
+                for b in a + 1..15 {
+                    let mut two = one.clone();
+                    two[word * 15 + b] = !two[word * 15 + b];
+                    assert_eq!(unfec23(&two, 30), None, "two errors at {a} and {b}");
+                }
+            }
+        }
+        assert_eq!(
+            unfec23(&clean[..44], 30),
+            None,
+            "one bit short of three codewords"
+        );
+    }
+
+    /// DM1, DM3 and DM5 verify through the FEC like their DH twins do bare,
+    /// fail on the wrong UAP, and survive one error in every codeword.
+    #[test]
+    fn dm_payloads_verify_through_the_fec() {
+        for (pt, len) in [
+            (PacketType::Dm1, 17),
+            (PacketType::Dm3, 121),
+            (PacketType::Dm5, 224),
+        ] {
+            let body: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let (_, payload) = synthetic_packet(pt, 29, 0x6d, &body);
+            assert_eq!(verify_crc(&payload, 29, pt, 0x6d), Some(true), "{pt:?}");
+            assert_eq!(
+                verify_crc(&payload, 29, pt, 0x6e),
+                Some(false),
+                "{pt:?} wrong UAP"
+            );
+            let mut hit = payload.clone();
+            for word in 0..hit.len() / 15 {
+                let at = word * 15 + word % 15;
+                hit[at] = !hit[at];
+            }
+            assert_eq!(
+                verify_crc(&hit, 29, pt, 0x6d),
+                Some(true),
+                "{pt:?} one error a word"
+            );
+        }
+    }
+
+    /// A damaged codeword is no verdict, and so is a capture that has not
+    /// reached the CRC's codewords yet.
+    #[test]
+    fn a_dm_payload_the_fec_cannot_mend_or_has_not_reached_is_refused() {
+        let (_, payload) = synthetic_packet(PacketType::Dm3, 5, 0x21, &[0x42; 40]);
+        let mut two = payload.clone();
+        two[31] = !two[31];
+        two[33] = !two[33];
+        assert_eq!(verify_crc(&two, 5, PacketType::Dm3, 0x21), None);
+        let short = &payload[..payload.len() - 1];
+        assert_eq!(verify_crc(short, 5, PacketType::Dm3, 0x21), None);
+    }
+
+    /// The tie breaks on a DM packet as it does on a DH one.
+    #[test]
+    fn break_uap_tie_reads_a_dm_payload_too() {
+        let true_uap = 0x3au8;
+        let (header_whitened, payload) =
+            synthetic_packet(PacketType::Dm3, 44, true_uap, &[0x5a; 50]);
+        let decoy = header::candidate_uaps(&header_whitened)
+            .iter()
+            .copied()
+            .find(|&u| u != true_uap)
+            .unwrap();
+        assert_eq!(
+            break_uap_tie(
+                &header::pairs_for(&header_whitened, &[decoy, true_uap]),
+                &header_whitened,
+                &payload
+            ),
+            Some((true_uap, 44)),
+            "the UAP, and the clock it was sent at, not the other clock that fits"
+        );
     }
 
     #[test]
@@ -320,8 +568,9 @@ mod tests {
             .find(|&u| u != true_uap)
             .expect("64 candidates for one header must include more than one distinct value");
 
-        let winner = break_uap_tie(&[true_uap, decoy_uap], &header_whitened, &payload);
-        assert_eq!(winner, Some(true_uap));
+        let tries = header::pairs_for(&header_whitened, &[true_uap, decoy_uap]);
+        let winner = break_uap_tie(&tries, &header_whitened, &payload);
+        assert_eq!(winner, Some((true_uap, clk6)));
     }
 
     #[test]

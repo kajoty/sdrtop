@@ -807,33 +807,50 @@ impl NetWorker {
                 for hit in &header_hits {
                     let clock = piconet_clocks.entry(hit.lap).or_default();
                     clock.observe(hit.tick, &hit.whitened);
-                    let shown = if let Some(&uap) = resolved_bt_uap.get(&hit.lap) {
-                        vec![uap]
-                    } else {
-                        let narrowed = clock.narrowed();
-                        if narrowed.len() > 1 {
-                            match payload::break_uap_tie(&narrowed, &hit.whitened, &hit.payload_raw)
-                            {
-                                Some(uap) => {
+                    // The UAPs still standing, each at the clocks the
+                    // piconet's own clock gives it for this header: never the
+                    // first clock that happens to fit, which about one
+                    // header in five reads as another packet type.
+                    let standing = match resolved_bt_uap.get(&hit.lap) {
+                        Some(&uap) => vec![uap],
+                        None => clock.narrowed(),
+                    };
+                    let pairs: Vec<(u8, u8)> = standing
+                        .iter()
+                        .flat_map(|&uap| {
+                            clock
+                                .clocks_for(uap, hit.tick)
+                                .into_iter()
+                                .map(move |clk6| (uap, clk6))
+                        })
+                        .collect();
+                    // One pair: the header is read there. More: this hit's
+                    // own payload gets one attempt at choosing, UAP and
+                    // clock together; the clock it checks out at pins the
+                    // piconet's clock, so the headers after it have one.
+                    let (shown, read_at) = match pairs.as_slice() {
+                        [pair] => (vec![pair.0], Some(*pair)),
+                        _ => {
+                            match payload::break_uap_tie(&pairs, &hit.whitened, &hit.payload_raw) {
+                                Some((uap, clk6)) => {
                                     resolved_bt_uap.insert(hit.lap, uap);
-                                    vec![uap]
+                                    clock.pin(hit.tick, clk6);
+                                    (vec![uap], Some((uap, clk6)))
                                 }
-                                None => narrowed,
+                                None => (standing, None),
                             }
-                        } else {
-                            narrowed
                         }
                     };
-                    // 6.3: a header is read once its piconet's UAP is one
-                    // value, and only then; the decode tries all 64 clocks,
-                    // so it too stays out of the lock.
-                    let read = match shown.as_slice() {
-                        [uap] => {
-                            match crate::signal::bt::header::decode_with_uap(&hit.whitened, *uap) {
+                    let read = match (shown.as_slice(), read_at) {
+                        (_, Some((uap, clk6))) => {
+                            match crate::signal::bt::header::decode_at(&hit.whitened, uap, clk6) {
                                 Some(h) => crate::signal::bt::piconet::HeaderRead::Decoded(h),
                                 None => crate::signal::bt::piconet::HeaderRead::Undecoded,
                             }
                         }
+                        // One UAP, two clocks and no payload to choose: two
+                        // different headers, so neither is claimed.
+                        ([_], None) => crate::signal::bt::piconet::HeaderRead::Undecoded,
                         _ => crate::signal::bt::piconet::HeaderRead::Unresolved,
                     };
                     // The header read again from the raw samples, as the

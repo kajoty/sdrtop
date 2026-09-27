@@ -316,29 +316,44 @@ pub struct Header {
     pub clk6: u8,
 }
 
-/// Try every CLK1-6 against a confirmed UAP, and decode the header fully
-/// under whichever one reproduces it - `None` if none does, which on a
-/// clean capture and a genuinely confirmed UAP should not happen, and is
-/// treated as one more honest "not this time" rather than a panic.
+/// Every `(UAP, CLK1-6)` a lone header allows for the given UAPs: what a
+/// [`PiconetClock`] seeded by it would hand the tie-break. For tests.
+#[cfg(test)]
+pub(crate) fn pairs_for(whitened: &[bool; HEADER_BITS], uaps: &[u8]) -> Vec<(u8, u8)> {
+    candidate_uaps(whitened)
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| uaps.contains(u))
+        .map(|(clk6, &u)| (u, clk6 as u8))
+        .collect()
+}
+
+/// Decode a header at a known CLK1-6 under a known UAP: `None` when the two
+/// do not agree, the HEC naming another UAP at that clock.
+pub fn decode_at(whitened: &[bool; HEADER_BITS], uap: u8, clk6: u8) -> Option<Header> {
+    let bits = unwhiten_header(whitened, clk6);
+    let data = pack_bits(&bits[0..10]);
+    let hec = pack_bits(&bits[10..18]) as u8;
+    (uap_from_hec(data, hec) == uap).then(|| Header {
+        lt_addr: pack_bits(&bits[0..3]) as u8,
+        packet_type: PacketType::from_bits(pack_bits(&bits[3..7]) as u8),
+        flags: pack_bits(&bits[7..10]) as u8,
+        hec,
+        clk6,
+    })
+}
+
+/// The first CLK1-6 that reproduces a header under a UAP, and the header
+/// read at it.
+///
+/// **Not how a live header is read**: about one header in five has a
+/// second clock that gives the same UAP, under which it reads as another
+/// packet type and LT_ADDR. Only the piconet's own clock knows which one
+/// is right ([`PiconetClock::clocks_for`]); this remains for tests that
+/// build a header whose clock is the only one.
+#[cfg(test)]
 pub fn decode_with_uap(whitened: &[bool; HEADER_BITS], uap: u8) -> Option<Header> {
-    for clk6 in 0u8..64 {
-        let bits = unwhiten_header(whitened, clk6);
-        let data = pack_bits(&bits[0..10]);
-        let hec = pack_bits(&bits[10..18]) as u8;
-        if uap_from_hec(data, hec) == uap {
-            let lt_addr = pack_bits(&bits[0..3]) as u8;
-            let packet_type = PacketType::from_bits(pack_bits(&bits[3..7]) as u8);
-            let flags = pack_bits(&bits[7..10]) as u8;
-            return Some(Header {
-                lt_addr,
-                packet_type,
-                flags,
-                hec,
-                clk6,
-            });
-        }
-    }
-    None
+    (0u8..64).find_map(|clk6| decode_at(whitened, uap, clk6))
 }
 
 /// How many times a second CLK1-6 itself advances: 3200 Hz, half the
@@ -402,7 +417,7 @@ pub const CLOCK_HZ: f64 = 3200.0;
 /// **Wired live since B16**: `signal::bt::receive` captures each header and
 /// its stream tick, and `signal::net::worker` folds them in per LAP. Once a
 /// LAP's UAP is one value the worker reads its headers with
-/// [`decode_with_uap`] (net-ux-polish-plan 6.3), and the hypotheses still
+/// [`decode_at`] at the clock [`Self::clocks_for`] gives, and the hypotheses still
 /// standing ([`Self::hypotheses`]) are shown beside what they say.
 #[allow(dead_code)]
 pub struct PiconetClock {
@@ -440,6 +455,42 @@ impl PiconetClock {
     /// elapsed time rules them out, `0` before any header at all.
     pub fn hypotheses(&self) -> u8 {
         self.candidates.iter().flatten().count() as u8
+    }
+
+    /// The CLK1-6 at `tick` of every hypothesis still standing that names
+    /// `uap`: the clocks a header arriving then can be read at under it.
+    /// Usually one; two when two hypotheses with the same UAP survive, and
+    /// then a header cannot be read with certainty.
+    pub fn clocks_for(&self, uap: u8, tick: i64) -> Vec<u8> {
+        let Some(first) = self.first_tick else {
+            return Vec::new();
+        };
+        let elapsed = tick.wrapping_sub(first).rem_euclid(64) as usize;
+        let mut clocks: Vec<u8> = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == Some(uap))
+            .map(|(count, _)| ((count + elapsed) % 64) as u8)
+            .collect();
+        clocks.sort_unstable();
+        clocks.dedup();
+        clocks
+    }
+
+    /// Keep only the hypothesis whose clock at `tick` is `clk6`: a payload
+    /// that checked out at that clock has shown it is the piconet's own,
+    /// so every header after it has one clock to be read at.
+    pub fn pin(&mut self, tick: i64, clk6: u8) {
+        let Some(first) = self.first_tick else {
+            return;
+        };
+        let elapsed = tick.wrapping_sub(first).rem_euclid(64) as usize;
+        for (count, slot) in self.candidates.iter_mut().enumerate() {
+            if (count + elapsed) % 64 != clk6 as usize {
+                *slot = None;
+            }
+        }
     }
 
     pub fn narrowed(&self) -> Vec<u8> {
@@ -655,6 +706,51 @@ mod tests {
         assert_eq!(decoded.flags, flags);
         assert_eq!(decoded.hec, hec);
         assert_eq!(decoded.clk6, clk6);
+    }
+
+    /// **Why a header is read at the piconet's clock and not the first that
+    /// fits.** This DM3 header, sent at CLK1-6 44, has a second clock, 19,
+    /// that gives the same UAP, and under it the header reads as a DH3. The
+    /// first clock that fits is 19. The piconet's clock, seeded by an
+    /// earlier header 25 ticks before, gives 44 alone once the other
+    /// hypothesis has fallen.
+    #[test]
+    fn a_header_is_read_at_the_piconets_clock_not_the_first_that_fits() {
+        let uap = 0x3au8;
+        let data10 = 0b011u16 | ((PacketType::Dm3.code() as u16) << 3) | (0b101 << 7);
+        let hec = hec_for(data10, uap);
+        let (whitened, _) = synthetic_header(data10, hec, 44);
+        let fits: Vec<u8> = (0..64)
+            .filter(|&c| decode_at(&whitened, uap, c).is_some())
+            .collect();
+        assert_eq!(fits, vec![19, 44], "two clocks, one UAP");
+        assert_eq!(
+            decode_at(&whitened, uap, 19).unwrap().packet_type,
+            PacketType::Dh3
+        );
+        assert_eq!(
+            decode_at(&whitened, uap, 44).unwrap().packet_type,
+            PacketType::Dm3
+        );
+
+        // The same piconet 25 ticks earlier, at clock 19, then this header.
+        let (earlier, _) = synthetic_header(0b010 | (4 << 3), hec_for(0b010 | (4 << 3), uap), 19);
+        let mut clock = PiconetClock::new();
+        clock.observe(100, &earlier);
+        clock.observe(125, &whitened);
+        assert!(
+            clock.clocks_for(uap, 125).contains(&44),
+            "{:?}",
+            clock.clocks_for(uap, 125)
+        );
+        assert!(!clock.clocks_for(uap, 125).contains(&19));
+
+        // A payload that checked out at 44 pins the clock: from then on one
+        // hypothesis, one clock, one UAP.
+        clock.pin(125, 44);
+        assert_eq!(clock.clocks_for(uap, 125), vec![44]);
+        assert_eq!(clock.clocks_for(uap, 131), vec![50], "and it runs on");
+        assert_eq!(clock.narrowed(), vec![uap]);
     }
 
     /// The wrong UAP finds no CLK1-6 that reproduces it - vanishingly

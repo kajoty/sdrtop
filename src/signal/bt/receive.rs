@@ -135,17 +135,17 @@ pub struct HeaderHit {
 }
 
 /// How many raw, still-whitened bits after a header this receiver keeps
-/// capturing alongside it. `343 * 8` is DH5's own worst-case total
-/// payload length in bits - `payload::max_payload_length`'s largest
-/// answer among the three packet types B17 supports -
-/// `payload_capture_covers_every_supported_types_own_worst_case` (below)
-/// holds this number to that function directly rather than trusting the
-/// two figures to stay in step by hand. A real payload shorter than this
+/// capturing alongside it: DM5's worst case, 228 bytes of payload under the
+/// rate 2/3 FEC, 183 codewords of 15 bits, one bit more than DH5's 343
+/// bytes sent bare. `payload_capture_covers_every_supported_types_own_
+/// worst_case` (below) holds this number to `payload::max_payload_length`
+/// and `payload::raw_bits_for` for every type they read, rather than
+/// trusting the figures to stay in step by hand. A real payload shorter than this
 /// (DH1's own 30-byte ceiling, most of the time) simply leaves this
 /// capture's own tail sitting past the payload's real end, which `verify_
 /// crc` never reads: it trusts the payload header's own LENGTH field, not
 /// how much this receiver happened to buffer.
-const PAYLOAD_CAPTURE_BITS: usize = 343 * 8;
+const PAYLOAD_CAPTURE_BITS: usize = 183 * 15;
 
 /// How many raw air bits a header itself occupies after the access
 /// code - the 4-bit trailer this arc never reads, plus FEC(1/3)'s own
@@ -820,18 +820,23 @@ mod tests {
     /// arc is held to.
     #[test]
     fn payload_capture_covers_every_supported_types_own_worst_case() {
-        for pt in [
-            header::PacketType::Dh1,
-            header::PacketType::Dh3,
-            header::PacketType::Dh5,
-        ] {
-            let max_bytes = payload::max_payload_length(pt).unwrap();
+        let mut largest = 0;
+        for code in 0..16 {
+            let pt = header::PacketType::from_code(code);
+            let Some(max_bytes) = payload::max_payload_length(pt) else {
+                continue;
+            };
+            let needed = payload::raw_bits_for(pt, max_bytes * 8);
+            largest = largest.max(needed);
             assert!(
-                max_bytes * 8 <= PAYLOAD_CAPTURE_BITS,
-                "{pt:?}: {max_bytes} bytes needs {} bits, capture only holds {PAYLOAD_CAPTURE_BITS}",
-                max_bytes * 8
+                needed <= PAYLOAD_CAPTURE_BITS,
+                "{pt:?}: {max_bytes} bytes needs {needed} raw bits, capture only holds {PAYLOAD_CAPTURE_BITS}"
             );
         }
+        assert_eq!(
+            largest, PAYLOAD_CAPTURE_BITS,
+            "no bigger than the largest need"
+        );
     }
 
     /// The reason this wiring exists, proven end to end through the real
@@ -934,9 +939,9 @@ mod tests {
             .find(|&u| u != true_uap)
             .expect("64 candidates for one header must include more than one distinct value");
 
-        let winner =
-            payload::break_uap_tie(&[true_uap, decoy_uap], &hit.whitened, &hit.payload_raw);
-        assert_eq!(winner, Some(true_uap));
+        let tries = header::pairs_for(&hit.whitened, &[true_uap, decoy_uap]);
+        let winner = payload::break_uap_tie(&tries, &hit.whitened, &hit.payload_raw);
+        assert_eq!(winner.map(|(uap, _)| uap), Some(true_uap));
     }
 
     /// `push`'s own exit condition: a single real access code, found on more
