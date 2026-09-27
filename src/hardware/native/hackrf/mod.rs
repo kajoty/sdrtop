@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::state::{DEFAULT_FREQUENCY, DEFAULT_SAMPLE_RATE};
 
-use crate::hardware::process::process_block;
 use crate::hardware::{
     Boost, DeliveryModel, DeviceCapabilities, DeviceInfo, DeviceKind, DeviceListing, GainModel,
     RxContext, SampleFormat, SampleGeometry, SdrDevice, StageSpec,
@@ -86,7 +85,7 @@ fn rx_callback_safe(transfer: *mut hackrf_transfer) -> c_int {
             0
         };
 
-        process_block(buf, ctx.geometry, dropped_pairs, ctx, now);
+        crate::hardware::intake::deliver(ctx, buf, dropped_pairs, now);
     }
     0
 }

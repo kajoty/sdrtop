@@ -978,6 +978,8 @@ pub struct RxContext {
     /// nothing otherwise. Shared, because the recorder that arms it outlives
     /// no stream and the stream outlives no recorder.
     pub record: Arc<super::RecordTap>,
+    /// Between the driver's thread and the work. See [`super::intake`].
+    pub intake: super::intake::Intake,
 }
 
 impl RxContext {

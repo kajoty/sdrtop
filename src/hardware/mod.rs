@@ -8,7 +8,8 @@
 //! [`discovery`] is the only module that sees all three groups.
 //!
 //! The rest is shared and backend-neutral: [`traits`] is the vocabulary,
-//! [`process`] the per-sample decode all three feed, [`record_tap`] the
+//! [`process`] the per-sample decode all three feed, [`intake`] the queue that
+//! keeps it off the driver's thread, [`record_tap`] the
 //! recorder's feed out of it, [`gain`] the placement policy, [`sysfs`] the
 //! read-only USB scan behind observer mode.
 //!
@@ -20,6 +21,7 @@
 
 pub mod discovery;
 pub mod gain;
+pub mod intake;
 pub mod native;
 pub mod process;
 pub mod record_tap;

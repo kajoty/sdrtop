@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 MusiThang <viktor.laszlo92@protonmail.com>
 
-//! Device-agnostic per-block sample accumulation. Both backends funnel their
-//! raw USB byte blocks through [`process_block`]: HackRF from its `extern "C"`
-//! callback, RTL-SDR from its owned read thread. Only the byte→sample decode
+//! Device-agnostic per-block sample accumulation. Every IQ backend funnels its
+//! raw byte blocks through here: HackRF from its `extern "C"` callback,
+//! RTL-SDR from its owned read thread, SoapySDR from its read loop.
+//!
+//! **In two halves, on two threads**, and the split is the point. [`arrive`]
+//! runs on the driver's thread and does only what must happen the moment a
+//! block arrives: stamp its place in the stream, read the settings it was
+//! captured under, hand it to the recorder. [`digest`] does everything else,
+//! on the intake thread (`super::intake`), so the driver is never kept waiting
+//! by the work. A HackRF whose transfer thread was kept waiting lost a third of
+//! its samples at 20 Msps without a word: the radio's own buffer overflowed
+//! while the callback was still folding the previous block. Only the byte→sample decode
 //! branches on [`SampleFormat`]; the saturation test, every accumulator, the
 //! histogram, drops, jitter, and the hand-off to the FFT worker are identical.
 //! The rail a sample is tested against is the *declared full scale*, which is
@@ -14,13 +23,6 @@ use std::time::Instant;
 
 use super::traits::{RxContext, SampleFormat, SampleGeometry};
 
-/// Fold one raw byte block into the shared metrics accumulators and forward it
-/// to the FFT worker.
-///
-/// `dropped_pairs` is the backend's short-transfer count (HackRF computes it
-/// from `buffer_length − valid_length`; RTL-SDR has no equivalent and passes 0).
-/// `now` is captured by the *caller* so jitter measures the true inter-callback
-/// interval, not callback-entry-plus-processing time.
 /// Closest two constellation samples may be taken, in I/Q pairs.
 ///
 /// A floor, not the stride: see [`const_stride`]. Adjacent samples of a band-
@@ -78,6 +80,14 @@ fn amp_bin_width(full_scale: i64) -> u64 {
     (full_scale as u64 / 32).max(1)
 }
 
+/// Both halves at once, on the caller's thread: [`arrive`] then [`digest`].
+///
+/// What the tests drive; a backend goes through `super::intake::deliver`.
+/// `dropped_pairs` is the backend's short-transfer count (HackRF computes it
+/// from `buffer_length − valid_length`; RTL-SDR has no equivalent and passes
+/// 0). `now` is captured by the *caller* so jitter measures the true
+/// inter-callback interval, not callback-entry-plus-processing time.
+#[cfg(test)]
 pub fn process_block(
     buf: &[u8],
     geometry: SampleGeometry,
@@ -85,19 +95,37 @@ pub fn process_block(
     ctx: &RxContext,
     now: Instant,
 ) {
-    let format = geometry.format;
-    let full_scale = geometry.full_scale;
-    let fs_counts = full_scale as i64;
-    let amp_width = amp_bin_width(fs_counts);
+    let arrival = arrive(buf, geometry, dropped_pairs, ctx, now);
+    digest(buf, geometry, &arrival, 0, ctx);
+}
+
+/// What was true when a block arrived, taken on the driver's thread and
+/// carried with the block to wherever it is digested.
+#[derive(Clone, Copy)]
+pub struct Arrival {
+    cal: crate::state::IqCalState,
+    demod_enabled: bool,
+    net_enabled: bool,
+    centre_hz: u64,
+    rate_hz: f64,
+    /// The block's place in the stream, after the pairs the driver lost.
+    pub first_pair: u64,
+    pub dropped_pairs: u64,
+    now: Instant,
+}
+
+/// The half that runs on the driver's thread: stamp, snapshot, record.
+///
+/// One short lock, one atomic add, and while a recording runs one copy.
+/// Nothing here grows with the work the block will cause.
+pub fn arrive(
+    buf: &[u8],
+    geometry: SampleGeometry,
+    dropped_pairs: u64,
+    ctx: &RxContext,
+    now: Instant,
+) -> Arrival {
     let pairs = buf.len() / geometry.bytes_per_pair();
-    // Per-sample math runs entirely without the mutex.
-    let mut acc = Accumulators {
-        geometry,
-        amp_width,
-        full_scale,
-        const_stride: const_stride(pairs),
-        ..Accumulators::default()
-    };
 
     // Snapshot the live correction state once (cheap Copy). The accumulators below
     // stay on the RAW samples, because a correction has to be built from what the
@@ -119,7 +147,10 @@ pub fn process_block(
     // settings of one moment.
     let recording = ctx.record.armed();
     let (cal, demod_enabled, net_enabled, centre_hz, rate_hz, gain) = {
-        let m = ctx.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = ctx.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        // What the radio delivered, counted where it arrives: a block the
+        // intake later has no room for still crossed the USB link.
+        m.radio.bytes_since_last_poll += buf.len() as u64;
         (
             m.iq.cal,
             m.demod.enabled,
@@ -157,6 +188,56 @@ pub fn process_block(
         );
     }
 
+    Arrival {
+        cal,
+        demod_enabled,
+        net_enabled,
+        centre_hz,
+        rate_hz,
+        first_pair,
+        dropped_pairs,
+        now,
+    }
+}
+
+/// The half that does the work: every accumulator, and the hand-off to the
+/// FFT, demod and NET feeds.
+///
+/// `lost_before` is how many pairs never reached this function between the
+/// previous block and this one besides the ones the driver reported: blocks
+/// the intake queue had no room for. They are drops like any other, and the
+/// feeds downstream are told a gap came before this block.
+pub fn digest(
+    buf: &[u8],
+    geometry: SampleGeometry,
+    arrival: &Arrival,
+    lost_before: u64,
+    ctx: &RxContext,
+) {
+    let Arrival {
+        cal,
+        demod_enabled,
+        net_enabled,
+        centre_hz,
+        rate_hz,
+        first_pair,
+        dropped_pairs,
+        now,
+    } = *arrival;
+    let dropped_pairs = dropped_pairs + lost_before;
+    let format = geometry.format;
+    let full_scale = geometry.full_scale;
+    let fs_counts = full_scale as i64;
+    let amp_width = amp_bin_width(fs_counts);
+    let pairs = buf.len() / geometry.bytes_per_pair();
+    // Per-sample math runs entirely without the mutex.
+    let mut acc = Accumulators {
+        geometry,
+        amp_width,
+        full_scale,
+        const_stride: const_stride(pairs),
+        ..Accumulators::default()
+    };
     let correcting = cal.correcting();
     acc.correcting = correcting;
     acc.cal = cal;
@@ -212,8 +293,6 @@ pub fn process_block(
             ctx.fft_feed.record(ctx.sample_tx.len(), taken);
             return;
         };
-
-        m.radio.bytes_since_last_poll += buf.len() as u64;
 
         if dropped_pairs > 0 {
             m.acc.drops += dropped_pairs;
@@ -495,7 +574,7 @@ fn decode_i16(full_scale: i64, bytes: [u8; 2]) -> (i64, bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -516,7 +595,7 @@ mod tests {
     /// Both receivers come back so the caller holds them: a dropped receiver
     /// disconnects its channel and every `try_send` after that silently fails,
     /// which is the same shape as the bug being tested for.
-    fn rx_ctx() -> (
+    pub(crate) fn rx_ctx() -> (
         Arc<RxContext>,
         crossbeam_channel::Receiver<Vec<u8>>,
         crossbeam_channel::Receiver<StreamBlock>,
@@ -555,6 +634,7 @@ mod tests {
             geometry: eight_bit(),
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
             record: Default::default(),
+            intake: Default::default(),
         };
         (Arc::new(ctx), sample_rx, demod_rx, net_rx)
     }
@@ -599,6 +679,39 @@ mod tests {
         assert_ne!(
             forwarded, block,
             "the FFT feed still sees the corrected stream"
+        );
+    }
+
+    /// **What one HackRF block costs to process, measured.** Not a check:
+    /// run it by hand, in release, on the machine the question is about
+    /// (`cargo test --release what_a_block_costs -- --ignored --nocapture`).
+    /// A 131 072-pair block of noise through `process_block` alone, the Lab
+    /// feeds only; at 20 Msps the block lasts 6.55 ms, and the callback that
+    /// cannot keep inside that loses samples.
+    #[test]
+    #[ignore]
+    fn what_a_block_costs() {
+        let (ctx, sample_rx, _d, _n) = rx_ctx();
+        ctx.metrics.lock().unwrap().demod.enabled = false;
+        ctx.metrics.lock().unwrap().ui.section = "lab".to_string();
+        let mut rng = crate::signal::dsp::testkit::Rng::new(3);
+        let block: Vec<u8> = rng
+            .noise(131_072, 0.02)
+            .iter()
+            .flat_map(|z| [(z.re * 128.0) as i8 as u8, (z.im * 128.0) as i8 as u8])
+            .collect();
+        for _ in 0..20 {
+            super::process_block(&block, eight_bit(), 0, &ctx, Instant::now());
+            while sample_rx.try_recv().is_ok() {}
+        }
+        let t = Instant::now();
+        for _ in 0..300 {
+            super::process_block(&block, eight_bit(), 0, &ctx, Instant::now());
+            while sample_rx.try_recv().is_ok() {}
+        }
+        eprintln!(
+            "process_block: {:.0} us per 131072-pair block",
+            t.elapsed().as_secs_f64() / 300.0 * 1e6
         );
     }
 
@@ -914,7 +1027,7 @@ mod tests {
     }
 
     /// An 8-bit geometry, which is what both shipped radios report.
-    fn eight_bit() -> SampleGeometry {
+    pub(crate) fn eight_bit() -> SampleGeometry {
         SampleGeometry {
             format: SampleFormat::Int8,
             full_scale: 128.0,

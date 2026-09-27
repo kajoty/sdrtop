@@ -181,6 +181,7 @@ impl App {
             geometry,
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
             record: Default::default(),
+            intake: Default::default(),
         });
 
         let app = Self::assemble(
@@ -194,6 +195,9 @@ impl App {
 
         match caps.acquisition {
             hardware::AcquisitionKind::IqSamples => {
+                // Before any stream can start: from the first block, the
+                // driver's thread only stamps and hands over.
+                hardware::intake::spawn(&rx_ctx);
                 let fft_state = Arc::clone(&state);
                 spawn_worker("fft-worker", move || {
                     FftWorker::new(sample_rx, fft_state, geometry).run()

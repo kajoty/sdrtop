@@ -30,7 +30,6 @@ use std::time::Instant;
 
 use super::api::{self, SoapyApi, SoapySDRDevice, SoapySDRStream};
 use super::caps::READ_PAIRS;
-use crate::hardware::process::process_block;
 use crate::hardware::RxContext;
 
 /// How long one `readStream` waits before giving up on this round.
@@ -332,7 +331,7 @@ fn run(
             Outcome::Pairs(pairs) => {
                 quiet_reads = 0;
                 let len = byte_len(pairs, bytes_per_pair).min(buf.len());
-                process_block(&buf[..len], ctx.geometry, 0, ctx, now);
+                crate::hardware::intake::deliver(ctx, &buf[..len], 0, now);
             }
             Outcome::Timeout => {
                 quiet_reads += 1;
@@ -353,7 +352,7 @@ fn run(
                 // link healthy. `pairs_per_read` rather than `READ_PAIRS`,
                 // because on a driver whose MTU clamped us the two differ and
                 // only the first one is a read.
-                process_block(&[], ctx.geometry, pairs_per_read as u64, ctx, now);
+                crate::hardware::intake::deliver(ctx, &[], pairs_per_read as u64, now);
             }
             Outcome::Error(code) => {
                 log(

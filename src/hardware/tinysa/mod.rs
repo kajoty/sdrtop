@@ -1908,6 +1908,7 @@ mod tests {
             geometry: capabilities(Model::Basic, BasicInput::Low).sample_geometry,
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
             record: Default::default(),
+            intake: Default::default(),
         });
 
         let (start_tx, start_rx) = bounded(1);
@@ -3048,6 +3049,7 @@ mod tests {
                 geometry: device.capabilities().sample_geometry,
                 stream_pairs: std::sync::atomic::AtomicU64::new(0),
                 record: Default::default(),
+                intake: Default::default(),
             });
 
             device.start_rx(context).unwrap();

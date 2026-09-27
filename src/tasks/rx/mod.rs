@@ -344,6 +344,7 @@ mod power_control_tests {
             geometry: SampleGeometry::default(),
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
             record: Default::default(),
+            intake: Default::default(),
         })
     }
 

@@ -72,9 +72,14 @@ pub enum TimingCause {
 ///
 /// These are chosen rather than derived, like [`DEADLINE_BUDGET_FRAC`] is on the
 /// push side, and the calibration point is a measurement: a HackRF through
-/// `SoapyHackRF` at 10 Msps CS8 sits at **0.65** in a release build, with the
-/// accounting closing exactly against wall time. That is a healthy stream with
-/// about a third of the loop spare, so it must grade as excellent.
+/// `SoapyHackRF` at 10 Msps CS8 sat at **0.65** in a release build, with the
+/// accounting closing exactly against wall time, while the per-sample work
+/// still ran inside the loop. That was a healthy stream with about a third of
+/// the loop spare, so it must grade as excellent. Since the work moved to the
+/// intake thread (`hardware::intake`) the same stream sits at about **0.01**:
+/// the loop only reads and hands over, and the bands keep their meaning,
+/// because what they grade is whether the loop still gets back to the driver
+/// in time.
 ///
 /// At 1.0 the loop never blocks, which does not mean it is busy: it means it is
 /// behind, and the driver's buffer is filling up behind it. That is the

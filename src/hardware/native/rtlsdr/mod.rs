@@ -16,7 +16,6 @@ use std::thread::JoinHandle;
 
 use libc::{c_int, c_void};
 
-use crate::hardware::process::process_block;
 use crate::hardware::{
     Boost, DeliveryModel, DeviceCapabilities, DeviceInfo, DeviceKind, DeviceListing, GainModel,
     RxContext, SampleFormat, SampleGeometry, SdrDevice, StageSpec,
@@ -103,7 +102,7 @@ extern "C" fn rtl_rx_callback(buf: *mut libc::c_uchar, len: u32, ctx: *mut c_voi
         // the whole `rtlsdr_read_async` call (see `start_rx`).
         let rx = unsafe { &*(ctx as *const RxContext) };
         let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
-        process_block(slice, rx.geometry, 0, rx, now);
+        crate::hardware::intake::deliver(rx, slice, 0, now);
     }));
 }
 

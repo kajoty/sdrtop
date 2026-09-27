@@ -222,6 +222,7 @@ mod tests {
             },
             stream_pairs: std::sync::atomic::AtomicU64::new(0),
             record: Default::default(),
+            intake: Default::default(),
         };
         (state, Arc::new(ctx), sample_rx, demod_rx, net_rx)
     }
