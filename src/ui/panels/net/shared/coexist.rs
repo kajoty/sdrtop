@@ -135,13 +135,27 @@ fn marks(state: &SdrMetrics, moments: usize, width: usize) -> Vec<(usize, usize,
     bt.chain(ble).filter(|(s, _, _)| *s < moments).collect()
 }
 
+/// The classic key: how many hits are drawn, and, on the survey, when its
+/// load keeps the classic receiver to fewer channels than it sees, on how
+/// many, or that it is not running at all. A survey too busy to decode
+/// classic would otherwise show `BT 0`, which reads as a band with no
+/// classic in it.
+fn bt_key(state: &SdrMetrics, hits: usize) -> String {
+    let watched = state.net.bt_channels_watched.len();
+    match (state.net.bt_load_limited, watched) {
+        (true, 0) => "BT: not running, load".to_string(),
+        (true, k) => format!("BT {hits} on {k} ch"),
+        (false, _) => format!("BT {hits}"),
+    }
+}
+
 /// `2400 MHz   now at the top, 12 s down   ● BLE 14  ■ BT 3   2483 MHz`: the
 /// band's edges, how far back the bottom reaches, and what the marks are, each
 /// part only when it fits whole between the edges.
 fn footer(
     width: usize,
     (top_s, bottom_s): (f64, f64),
-    counts: (usize, usize),
+    keys: [(Proto, String); 2],
     scale: f64,
     theme: &crate::Theme,
 ) -> Line<'static> {
@@ -167,8 +181,7 @@ fn footer(
         middle.push(Span::raw("   "));
         middle.push(Span::styled(scale_text, dim));
     }
-    for (proto, name, n) in [(Proto::Ble, "BLE", counts.0), (Proto::Bt, "BT", counts.1)] {
-        let text = format!("{name} {n}");
+    for (proto, text) in keys {
         let need = 3 + proto.glyph().chars().count() + 1 + text.len();
         if used + need > room {
             break;
@@ -396,7 +409,11 @@ fn draw(f: &mut Frame, inner: Rect, state: &SdrMetrics, theme: &crate::Theme, ru
     if ruler {
         lines.push(Line::from(Span::styled(band_axis::ruler(width), dim)));
     }
-    lines.push(footer(width, span_s, counts, scale, theme));
+    let keys = [
+        (Proto::Ble, format!("BLE {}", counts.0)),
+        (Proto::Bt, bt_key(state, counts.1)),
+    ];
+    lines.push(footer(width, span_s, keys, scale, theme));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -439,6 +456,19 @@ mod tests {
     /// cell in a room whose busiest is 8 % is drawn at the top of the ramp,
     /// where on a fixed 100 % it sat in the darkest tenth, and the footer says
     /// what the colour's top means.
+    /// On a survey whose load leaves no room, the classic key says so rather
+    /// than `BT 0`; on fewer channels than it sees, on how many.
+    #[test]
+    fn the_classic_key_says_when_load_limits_it() {
+        let mut m = SdrMetrics::fixture().streaming();
+        m.net.bt_load_limited = true;
+        assert_eq!(bt_key(&m, 0), "BT: not running, load");
+        m.net.bt_channels_watched = vec![39];
+        assert_eq!(bt_key(&m, 3), "BT 3 on 1 ch");
+        m.net.bt_load_limited = false;
+        assert_eq!(bt_key(&m, 3), "BT 3");
+    }
+
     #[test]
     fn the_heatmap_is_coloured_on_the_band_scale_and_says_it() {
         let theme = crate::Theme::sdr();

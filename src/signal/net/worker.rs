@@ -74,6 +74,34 @@ use super::scan::Scan;
 /// tests hold this string and the preset file's name to agreeing).
 const NET_BT_PRESET: &str = "net_bt";
 
+/// The survey's preset, where the classic receiver runs on as many channels
+/// as the measured load leaves room for ([`SURVEY_LOAD_HIGH`]).
+const NET_SURVEY_PRESET: &str = "net_survey";
+
+/// The survey watches one classic channel fewer once its measured load
+/// passes this, and one more once it falls under [`SURVEY_LOAD_LOW`], up to
+/// the Classic view's own cap. The survey is there to measure the band: a
+/// classic receiver that pushed it past real time would cost it blocks, and
+/// every duty cycle on screen with them. Measured on the i3 before this was
+/// built: the survey alone 0.61x at 8 Msps and 1.00x at 20, a classic
+/// channel about 0.18x and 0.28x more, so room for about one channel at 8
+/// and none at 20; a faster machine gets more.
+const SURVEY_LOAD_HIGH: f64 = 0.8;
+const SURVEY_LOAD_LOW: f64 = 0.7;
+
+/// The survey's classic channel count after a load `reading`: one fewer
+/// over [`SURVEY_LOAD_HIGH`], one more under [`SURVEY_LOAD_LOW`] up to `cap`,
+/// unchanged between them, so it settles rather than hunting.
+fn survey_budget(now: usize, reading: f64, cap: usize) -> usize {
+    if reading > SURVEY_LOAD_HIGH {
+        now.saturating_sub(1)
+    } else if reading < SURVEY_LOAD_LOW {
+        (now + 1).min(cap)
+    } else {
+        now
+    }
+}
+
 /// `bytes` as samples, decoded into `slot` the first time a receiver asks
 /// and handed out as they are after that.
 fn decoded_block<'a>(
@@ -162,6 +190,11 @@ fn push_all(
     let Some(rx) = ble else {
         return (None, push_fleet(fleet, iq));
     };
+    // Nothing to run beside it: a thread started and joined for one decoder
+    // is a cost with no second decoder to pay for it.
+    if fleet.is_empty() {
+        return (Some(rx.push_iq_at(iq, first_pair)), Vec::new());
+    }
     std::thread::scope(|scope| {
         let packets = scope.spawn(move || rx.push_iq_at(iq, first_pair));
         let answers = push_fleet(fleet, iq);
@@ -172,7 +205,7 @@ fn push_all(
     })
 }
 
-/// Above this many simultaneous classic BT channels/// Above this many simultaneous classic BT channels, `NetWorker::new` logs a
+/// Above this many simultaneous classic BT channels, `NetWorker::new` logs a
 /// warning naming the cost rather than staying quiet about it -
 /// `signal::bt::receive`'s own doc has the measured tap counts this is
 /// guarding against. Matches `config::default_bt_channels`, so a default
@@ -208,6 +241,10 @@ pub struct NetWorker {
     /// (`signal::bt::slots`): the rate search is real work, and a jitter
     /// figure does not need refreshing faster. A test sets it to zero.
     pub slot_fit_every: std::time::Duration,
+    /// How many classic channels the survey starts with, before its first
+    /// load reading: none, because room for a receiver is measured, not
+    /// assumed. A test sets it, since the reading follows the clock.
+    pub survey_bt_start: usize,
 }
 
 /// What the worker carries from one block to the next.
@@ -405,6 +442,7 @@ impl NetWorker {
         }
         Self {
             slot_fit_every: std::time::Duration::from_secs(1),
+            survey_bt_start: 0,
             sample_rx,
             state,
             geometry,
@@ -444,6 +482,14 @@ impl NetWorker {
         // that falls silent still has its last hits in its figure.
         let mut unfitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut load = Load::default();
+        // How many classic channels the survey watches: grown and shrunk by
+        // the measured load (`SURVEY_LOAD_HIGH`).
+        let mut survey_bt = self.survey_bt_start;
+        // Whether the classic account was last published load-limited; `None`
+        // until it has been published at all. The fleet alone cannot say:
+        // a survey with no room starts empty and stays empty, and an empty
+        // fleet that never changed would otherwise never say why.
+        let mut bt_said: Option<bool> = None;
         // Where the next block must start for the stream to be unbroken. `None`
         // until a block has been seen, and again after the section closes.
         let mut next_pair: Option<u64> = None;
@@ -522,7 +568,7 @@ impl NetWorker {
             // block rather than the state: see `StreamBlock::centre_hz`.
             let centre_hz = centre_hz as f64;
 
-            let (still_open, span_hz, is_net_bt, phy, locked) = {
+            let (still_open, span_hz, is_net_bt, is_survey, phy, locked) = {
                 let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 let h = &mut m.net.health;
                 h.blocks_in = h.blocks_in.saturating_add(1);
@@ -548,6 +594,7 @@ impl NetWorker {
                     m.ui.is_net_section(),
                     span.min(rate_hz),
                     m.ui.active_preset == NET_BT_PRESET,
+                    m.ui.active_preset == NET_SURVEY_PRESET,
                     m.net.ble_phy,
                     m.net.mode == crate::state::NetMode::Lock,
                 )
@@ -653,32 +700,41 @@ impl NetWorker {
             }
 
             // Decoded once, before either decoder runs, so both read it at once.
-            if ble_on.is_some() || (is_net_bt && still_open) {
+            let classic_here = still_open && (is_net_bt || is_survey);
+            if ble_on.is_some() || classic_here {
                 decoded_block(&mut iq, &bytes, self.geometry);
             }
             let block: &[num_complex::Complex<f32>] = iq.as_deref().unwrap_or(&[]);
             let mut ble_packets: Option<Vec<crate::signal::ble::pdu::Packet>> = None;
 
-            // `net_bt`: B15's own live receiver, one per channel the current
-            // tuning and `self.bt_channels` together let it watch. Not
-            // gated on `still_open` the way BLE's block above is guarded
-            // twice over (once by `channel_of` returning `None`, once by
-            // this preset's own name) - classic BT has no fixed channel set
-            // to fall back on, so the preset name is the only gate there is.
-            if is_net_bt && still_open {
+            // The classic receiver, one per channel the current tuning and
+            // the cap together let it watch: `self.bt_channels` on the
+            // Classic view, and on the survey only as many as its measured
+            // load leaves room for (`SURVEY_LOAD_HIGH`), so the coexistence
+            // history can mark classic hits without starving the band
+            // measurement the survey is for. Classic BT has no fixed channel
+            // set to gate on, so the preset's name is the gate.
+            if classic_here {
                 let mut wanted = crate::signal::bt::channel::channels_in_span(centre_hz, span_hz);
                 wanted.sort_by_key(|&ch| {
                     let f = crate::signal::bt::channel::centre_hz(ch).unwrap_or(0) as f64;
                     (f - centre_hz).abs() as u64
                 });
-                wanted.truncate(self.bt_channels);
+                let could = wanted.len().min(self.bt_channels);
+                let cap = if is_net_bt {
+                    self.bt_channels
+                } else {
+                    survey_bt.min(self.bt_channels)
+                };
+                let load_limited = cap < could;
+                wanted.truncate(cap);
                 wanted.sort_unstable();
 
                 let current: Vec<u8> = bt.iter().map(|r| r.channel()).collect();
                 let stale_tuning = bt
                     .first()
                     .is_some_and(|r| !r.matches(r.channel(), rate_hz, centre_hz));
-                if current != wanted || stale_tuning {
+                if current != wanted || stale_tuning || bt_said != Some(load_limited) {
                     let mut fleet = Vec::with_capacity(wanted.len());
                     let mut refusal = None;
                     for &ch in &wanted {
@@ -690,8 +746,12 @@ impl NetWorker {
                         }
                     }
                     bt = fleet;
+                    bt_said = Some(load_limited);
                     let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    m.net.bt_refused = if wanted.is_empty() {
+                    m.net.bt_load_limited = load_limited;
+                    m.net.bt_refused = if wanted.is_empty() && load_limited {
+                        Some("not running: the survey's load leaves no room".to_string())
+                    } else if wanted.is_empty() {
                         Some(format!(
                             "no classic Bluetooth channel fits inside the current {:.1} MHz view",
                             span_hz / 1e6
@@ -893,9 +953,11 @@ impl NetWorker {
                 // watched-channel list from a previous visit must not linger
                 // onto a screen that never claimed to be this one.
                 bt.clear();
+                bt_said = None;
                 let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 m.net.bt_refused = None;
                 m.net.bt_channels_watched.clear();
+                m.net.bt_load_limited = false;
             }
 
             // The BLE receiver alone, when no classic fleet ran beside it,
@@ -1005,10 +1067,13 @@ impl NetWorker {
                 ble = None;
                 bt.clear();
                 load = Load::default();
+                survey_bt = self.survey_bt_start;
+                bt_said = None;
                 next_pair = None;
                 let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 m.net.bt_refused = None;
                 m.net.bt_channels_watched.clear();
+                m.net.bt_load_limited = false;
                 m.net.ble_channel = None;
                 // Nothing is being decoded, so there is no load to report -
                 // and a figure from before the section closed must not be
@@ -1019,6 +1084,11 @@ impl NetWorker {
                 // the lock; only the finished figure goes in.
                 let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 m.net.health.decode_load = Some(reading);
+                // The survey's classic channels follow the load it measured:
+                // one fewer over the high mark, one more under the low one.
+                if is_survey {
+                    survey_bt = survey_budget(survey_bt, reading, self.bt_channels);
+                }
             }
         }
     }
@@ -1028,6 +1098,43 @@ impl NetWorker {
 mod tests {
     use super::*;
     use crate::hardware::SampleFormat;
+
+    /// The survey's classic budget moves one channel at a time, down over
+    /// the high mark, up under the low one to the cap, and holds between.
+    #[test]
+    fn the_survey_budget_follows_the_load_it_measured() {
+        assert_eq!(survey_budget(0, 0.5, 8), 1);
+        assert_eq!(survey_budget(8, 0.5, 8), 8, "capped");
+        assert_eq!(survey_budget(3, 0.95, 8), 2);
+        assert_eq!(survey_budget(0, 0.95, 8), 0);
+        assert_eq!(survey_budget(3, 0.75, 8), 3, "held between the marks");
+    }
+
+    /// The survey starts with no classic channel, and says it is the load:
+    /// its first reading has not come yet, and a receiver it has not measured
+    /// room for is not run on the band measurement's time.
+    #[test]
+    fn the_survey_runs_no_classic_channel_until_its_load_leaves_room() {
+        let mut m = SdrMetrics::fixture().streaming();
+        m.ui.section = crate::signal::net::SECTION.to_string();
+        m.ui.active_preset = NET_SURVEY_PRESET.to_string();
+        m.radio.frequency = 2_441_000_000;
+        m.radio.config_sample_rate = 8e6;
+        m.radio.bb_filter_hz = 0;
+        let state = Arc::new(Mutex::new(m));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(stamped(&state, 1, false, vec![0u8; 2 * 4096]))
+            .unwrap();
+        drop(tx);
+        NetWorker::new(rx, Arc::clone(&state), eight_bit(), SAFE_BT_CHANNELS).run();
+        let m = state.lock().unwrap();
+        assert!(m.net.bt_channels_watched.is_empty());
+        assert!(m.net.bt_load_limited);
+        assert_eq!(
+            m.net.bt_refused.as_deref(),
+            Some("not running: the survey's load leaves no room")
+        );
+    }
 
     /// A block as `hardware::process::process_block` would stamp it: its
     /// position is the `seq`-th block of this size, so a jump in `seq` is a
@@ -2069,6 +2176,59 @@ mod tests {
         let hop = &m.net.bt_hops[0];
         assert_eq!(hop.channel, ch);
         assert_eq!(hop.lap, lap);
+    }
+
+    /// The same access code on the survey, once its load has left room for
+    /// one channel: the nearest classic channel runs, its hit reaches
+    /// `net.bt_hops` for the coexistence history, and the account says the
+    /// load holds it to that one.
+    #[test]
+    fn the_survey_marks_classic_hits_once_its_load_leaves_room() {
+        use crate::signal::ble::gfsk::modulate;
+        use crate::signal::bt::access_code::access_code_bits;
+        use crate::signal::dsp::testkit::{at_snr, Rng};
+        use num_complex::Complex;
+
+        const RAW_RATE: f64 = 20_000_000.0;
+        let ch = 45u8;
+        let channel_hz = crate::signal::bt::channel::centre_hz(ch).unwrap();
+        let lap = 0x0044_5566;
+        let mut bits: Vec<bool> = (0..40).map(|i| i % 2 == 0).collect();
+        bits.extend(access_code_bits(lap));
+        bits.extend((0..40).map(|i| i % 2 == 1));
+        let sps = (RAW_RATE / 1_000_000.0) as usize;
+        let clean = modulate(&bits, sps, 160_000.0, RAW_RATE, 0.5);
+        let placed = at_snr(&clean, 40.0, &mut Rng::new(7));
+        let geometry = eight_bit();
+        let bytes: Vec<u8> = placed
+            .iter()
+            .flat_map(|s: &Complex<f32>| {
+                let re = (s.re * geometry.full_scale).clamp(-127.0, 127.0) as i8;
+                let im = (s.im * geometry.full_scale).clamp(-127.0, 127.0) as i8;
+                [re as u8, im as u8]
+            })
+            .collect();
+
+        let mut m = SdrMetrics::fixture().streaming();
+        m.ui.section = crate::signal::net::SECTION.to_string();
+        m.ui.active_preset = NET_SURVEY_PRESET.to_string();
+        m.radio.frequency = channel_hz;
+        m.radio.config_sample_rate = RAW_RATE;
+        m.radio.bb_filter_hz = 0;
+        let state = Arc::new(Mutex::new(m));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(stamped(&state, 1, false, bytes)).unwrap();
+        drop(tx);
+        let mut worker = NetWorker::new(rx, Arc::clone(&state), geometry, SAFE_BT_CHANNELS);
+        worker.survey_bt_start = 1;
+        worker.run();
+
+        let m = state.lock().unwrap();
+        assert!(m.net.bt_refused.is_none(), "{:?}", m.net.bt_refused);
+        assert_eq!(m.net.bt_channels_watched, vec![ch]);
+        assert!(m.net.bt_load_limited);
+        assert_eq!(m.net.bt_hops.len(), 1, "{:?}", m.net.bt_hops);
+        assert_eq!(m.net.bt_hops[0].lap, lap);
     }
 
     /// A classic packet on channel 45 of a 20 Msps capture tuned to it:

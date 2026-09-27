@@ -248,6 +248,15 @@ the darkest tenth of a 0–100 % ramp, which made the whole history one
 tasteful shade of navy. `↓` steps back in time and the profile above shows that
 moment; `↑` forward; `N` back to now.
 
+In SURVEY the classic receiver runs beside the band measurement on as many
+channels as the measured decode load leaves room for: one more while the load
+stays under 70 %, one fewer once it passes 80 %, starting from none. So the
+key says what it is counting from. `■ BT 12` is every channel in view,
+`■ BT 12 on 1 ch` is one channel because the load allows no more, and
+`■ BT: not running, load` means the survey has the machine to itself, which
+is not the same as a quiet band. On an old i3 that is about one channel at
+8 Msps and none at 20; the Classic view (`NET 5`) always runs its full set.
+
 ### Decode health
 
 The account of the feed and the decoders: blocks in, blocks lost, gaps, and

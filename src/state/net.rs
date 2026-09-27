@@ -436,6 +436,11 @@ pub struct NetState {
     /// the classic view moves by a constant block: the watched list itself
     /// is shorter at the band's edges. `0` before the worker has run.
     pub bt_capacity: usize,
+    /// The survey is watching fewer classic channels than its view holds,
+    /// because its measured load leaves no room for more
+    /// (`signal::net::worker`'s survey budget): what the coexistence key
+    /// says rather than showing a count that looks like a quiet band.
+    pub bt_load_limited: bool,
     /// Per-LAP UAP narrowing, B16's own live state, refined by B17's own
     /// payload tie-break: the distinct UAP values `signal::bt::header::
     /// PiconetClock` still cannot rule out for that piconet, from every
