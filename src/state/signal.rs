@@ -144,10 +144,33 @@ pub fn classify(snr_db: f32, occupied_bw_hz: u64) -> Modulation {
     }
 }
 
+/// What the radio itself says about samples it dropped before any reached
+/// the host. See `hardware::SdrDevice::radio_drops`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum RadioDropAccount {
+    /// This radio keeps no such count. Nothing to show.
+    #[default]
+    NotKept,
+    /// It keeps one, and it could not be read, for this reason.
+    Unreadable(String),
+    /// The count, since the stream started.
+    Counted {
+        /// Drops since the stream started.
+        stream: u32,
+        /// Drops in the last poll window.
+        window: u32,
+        /// The longest, in bytes of the radio's sample format.
+        longest_bytes: u32,
+    },
+}
+
 #[derive(Clone)]
 pub struct SignalState {
     pub drops_per_sec: u64,
     pub total_drops_session: u64,
+    /// The radio's own count of what it dropped: drops that leave no hole in
+    /// the stream positions, so `drops_per_sec` can never see them.
+    pub radio_drops: RadioDropAccount,
     pub drop_history: VecDeque<u64>,
     pub adc_saturation_pct: f32,
     pub adc_saturation_peak: f32,
@@ -224,6 +247,7 @@ impl Default for SignalState {
         Self {
             drops_per_sec: 0,
             total_drops_session: 0,
+            radio_drops: RadioDropAccount::NotKept,
             drop_history: VecDeque::new(),
             adc_saturation_pct: 0.0,
             adc_saturation_peak: 0.0,
@@ -275,6 +299,7 @@ mod tests {
         let mut s = SignalState {
             drops_per_sec: 0,
             total_drops_session: 0,
+            radio_drops: RadioDropAccount::NotKept,
             drop_history: VecDeque::new(),
             adc_saturation_pct: 0.0,
             adc_saturation_peak: 0.0,

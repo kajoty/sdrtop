@@ -36,6 +36,16 @@ pub(super) unsafe fn symbol<T: Copy>(lib: &Library, name: &'static [u8]) -> Resu
         })
 }
 
+/// A symbol a feature needs and the backend does not: `None` when the library
+/// lacks it, so that feature can say why it is missing while everything else
+/// still works.
+///
+/// # Safety
+/// The caller must use the symbol's C ABI type.
+pub(super) unsafe fn optional_symbol<T: Copy>(lib: &Library, name: &'static [u8]) -> Option<T> {
+    unsafe { lib.get::<T>(name) }.ok().map(|symbol| *symbol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

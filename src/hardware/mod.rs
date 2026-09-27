@@ -36,8 +36,8 @@ pub use record_tap::RecordTap;
 pub(crate) use traits::RateSet;
 pub use traits::{
     AcquisitionKind, Boost, DeliveryModel, DeviceCapabilities, DeviceInfo, DeviceOption,
-    DirectSweepConfig, FeedHealth, GainModel, LevelUnit, PowerTrace, PowerTraceTarget, RxContext,
-    SampleFormat, SampleGeometry, SdrDevice, SoftwareStack, StageSpec, StreamBlock,
+    DirectSweepConfig, FeedHealth, GainModel, LevelUnit, PowerTrace, PowerTraceTarget, RadioDrops,
+    RxContext, SampleFormat, SampleGeometry, SdrDevice, SoftwareStack, StageSpec, StreamBlock,
     IQ_TRACE_STALE_MS,
 };
 

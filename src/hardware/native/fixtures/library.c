@@ -78,6 +78,23 @@ CONTROL(hackrf_set_lna_gain, (void *device, uint32_t value))
 CONTROL(hackrf_set_vga_gain, (void *device, uint32_t value))
 CONTROL(hackrf_start_rx, (void *device, int (*callback)(void *), void *ctx))
 int hackrf_is_streaming(void *device) { return 0; }
+
+// hackrf_m0_state in hackrf.h, field for field.
+struct hackrf_m0_state {
+    uint16_t requested_mode, request_flag;
+    uint32_t active_mode, m0_count, m4_count, num_shortfalls, longest_shortfall,
+        shortfall_limit, threshold, next_mode, error;
+};
+#ifndef OMIT_M0_STATE
+int hackrf_get_m0_state(void *device, struct hackrf_m0_state *state) {
+    if (mode == 7) return -1000;
+    state->num_shortfalls = 3;
+    state->longest_shortfall = 4096;
+    return 0;
+}
+#endif
+size_t hackrf_get_transfer_buffer_size(void *device) { return 262144; }
+uint32_t hackrf_get_transfer_queue_depth(void *device) { return 4; }
 int hackrf_stop_rx(void *device) { calls[4]++; return 0; }
 
 uint32_t rtlsdr_get_device_count(void) { return 1; }

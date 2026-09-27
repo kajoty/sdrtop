@@ -36,6 +36,22 @@ pub struct HackRfDevice {
 unsafe impl Send for HackRfDevice {}
 unsafe impl Sync for HackRfDevice {}
 
+/// The firmware USB API the M0 state needs (hackrf.h, `hackrf_get_m0_state`).
+const M0_STATE_USB_API: u16 = 0x0106;
+
+/// The radio's own sample buffer, as a bound: the stock firmware's is 32 kB
+/// (`USB_BULK_BUFFER_SIZE` 0x8000) and a published experiment doubled it
+/// (greatscottgadgets/hackrf issue 991). The radio does not report its own, so
+/// the larger is used where only an upper bound is wanted. Reasoned from the
+/// firmware source, not asked of this radio.
+const RADIO_BUFFER_BYTES: u64 = 0x10000;
+
+unsafe fn error_name(api: &HackrfApi, code: c_int) -> String {
+    unsafe { CStr::from_ptr((api.hackrf_error_name)(code)) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 // ── RX callback (libhackrf's thread) ───────────────────────────────────────
 
 extern "C" fn rx_callback(transfer: *mut hackrf_transfer) -> c_int {
@@ -125,6 +141,44 @@ impl SdrDevice for HackRfDevice {
 
     fn is_streaming(&self) -> bool {
         unsafe { (self.api.hackrf_is_streaming)(self.ptr) == 1 }
+    }
+
+    /// The M0 core's shortfall count: each time the radio's buffer was full
+    /// because the host had not taken the last transfer, and the samples that
+    /// arrived meanwhile were dropped in the radio.
+    fn radio_drops(&self) -> Result<Option<crate::hardware::RadioDrops>, String> {
+        let Some(get) = self.api.hackrf_get_m0_state else {
+            return Err("this libhackrf cannot report the radio's own drops".to_string());
+        };
+        if let Some(version) = self.info.usb_api_version.filter(|&v| v < M0_STATE_USB_API) {
+            return Err(format!(
+                "firmware USB API {version:#06x} predates the radio's own drop count ({M0_STATE_USB_API:#06x})"
+            ));
+        }
+        let (Some(size), Some(depth)) = (
+            self.api.hackrf_get_transfer_buffer_size,
+            self.api.hackrf_get_transfer_queue_depth,
+        ) else {
+            return Err(
+                "this libhackrf cannot say how much is in flight, so a drop could not be placed"
+                    .to_string(),
+            );
+        };
+        let mut state = HackrfM0State::default();
+        let rc = unsafe { get(self.ptr, &mut state) };
+        if rc != 0 {
+            return Err(format!(
+                "reading the radio's drop count failed: {}",
+                unsafe { error_name(self.api, rc) }
+            ));
+        }
+        let in_flight = unsafe { size(self.ptr) } as u64 * u64::from(unsafe { depth(self.ptr) })
+            + RADIO_BUFFER_BYTES;
+        Ok(Some(crate::hardware::RadioDrops {
+            events: state.num_shortfalls,
+            longest_bytes: state.longest_shortfall,
+            in_flight_bytes: in_flight,
+        }))
     }
 
     fn set_frequency(&self, hz: u64) -> anyhow::Result<()> {
@@ -569,6 +623,33 @@ mod tests {
         drop(device);
         assert_eq!(fixture.calls(3), 1);
         assert_eq!(fixture.calls(1), 1);
+    }
+
+    /// The radio's own drop count: read through the library, refused with a
+    /// reason when the read fails or the library cannot make it, and bounded
+    /// by the library's own transfer queue plus the radio's buffer.
+    #[test]
+    fn the_radio_reports_its_own_drops_or_says_why_not() {
+        let fixture = TestLibrary::new(false);
+        let api = Box::leak(Box::new(ffi::resolve(fixture.library()).unwrap()));
+        let device = HackRfDevice::open_with_api(api, 0).unwrap();
+        assert_eq!(
+            device.radio_drops(),
+            Ok(Some(crate::hardware::RadioDrops {
+                events: 3,
+                longest_bytes: 4096,
+                in_flight_bytes: 262_144 * 4 + RADIO_BUFFER_BYTES,
+            }))
+        );
+        fixture.mode(7);
+        let err = device.radio_drops().unwrap_err();
+        assert!(err.contains("fixture error"), "{err}");
+
+        let older = TestLibrary::built(&["-DOMIT_M0_STATE"]);
+        let api = Box::leak(Box::new(ffi::resolve(older.library()).unwrap()));
+        let device = HackRfDevice::open_with_api(api, 0).unwrap();
+        let err = device.radio_drops().unwrap_err();
+        assert!(err.contains("cannot report"), "{err}");
     }
 
     #[test]

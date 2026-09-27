@@ -11,6 +11,15 @@ pub(super) struct TestLibrary {
 
 impl TestLibrary {
     pub fn new(omit_symbol: bool) -> Self {
+        Self::built(if omit_symbol {
+            &["-DOMIT_LAST_SYMBOL"]
+        } else {
+            &[]
+        })
+    }
+
+    /// The fixture compiled with these `-D` flags.
+    pub fn built(defines: &[&str]) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "sdrtop-native-test-{}-{}",
@@ -21,9 +30,7 @@ impl TestLibrary {
         let path = dir.join("libfixture.so");
         let mut cc = Command::new("cc");
         cc.args(["-shared", "-fPIC", "-std=c11", "-Wall", "-Werror"]);
-        if omit_symbol {
-            cc.arg("-DOMIT_LAST_SYMBOL");
-        }
+        cc.args(defines);
         let output = cc
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),

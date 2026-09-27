@@ -8,9 +8,9 @@
 //! the front end being over-driven. Side by side because a reader is deciding
 //! which of the two it is.
 
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
-use crate::state::SdrMetrics;
+use crate::state::{RadioDropAccount, SdrMetrics};
 use crate::ui::widgets::micro_common::{drop_color, sat_color};
 
 use super::rows::Rows;
@@ -28,6 +28,41 @@ pub(super) fn lines(state: &SdrMetrics, r: &Rows) -> Vec<Line<'static>> {
         ),
         drops.drop_history.iter().map(|&v| v as f64).collect(),
     ));
+    // What the radio dropped before anything reached the host: no hole in
+    // the stream shows these, so the count above cannot.
+    match &drops.radio_drops {
+        RadioDropAccount::NotKept => {}
+        RadioDropAccount::Unreadable(why) => out.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("In the radio ", r.lbl()),
+            Span::styled(format!("not counted: {why}"), r.dim()),
+        ])),
+        RadioDropAccount::Counted {
+            stream,
+            longest_bytes,
+            ..
+        } => {
+            let geometry = state.caps.sample_geometry;
+            let rate = state.radio.config_sample_rate.max(1.0);
+            let longest_ms = *longest_bytes as f64 / geometry.bytes_per_pair() as f64 / rate * 1e3;
+            let tail = if *stream > 0 {
+                format!("   this stream, the longest {longest_ms:.1} ms")
+            } else {
+                "   this stream".to_string()
+            };
+            let color = if *stream > 0 {
+                r.theme.status_crit
+            } else {
+                r.theme.status_ok
+            };
+            out.push(Line::from(r.heading(
+                "In the radio ",
+                stream.to_string(),
+                color,
+                tail,
+            )));
+        }
+    }
     out.push(Line::raw(""));
 
     out.extend(r.trend(

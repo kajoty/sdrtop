@@ -73,6 +73,9 @@ pub(super) struct Computed {
     pub measured_rate: Option<u32>,
     /// Read-loop occupancy for a pull backend, over this poll window.
     pub read_occupancy: Option<f32>,
+    /// The radio's own drop count over this window: `Ok(None)` from a radio
+    /// that keeps none, `None` when there was no stream to ask about.
+    pub radio_drops: Option<Result<Option<super::metrics::DropWindow>, String>>,
 }
 
 /// Write the results, sample the trend histories, rebuild the timing snapshot,
@@ -87,6 +90,25 @@ pub(super) fn write_back(
     last_snr_push: &mut Instant,
 ) -> bool {
     let mut m = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    // The radio's own drop count. Between streams the last account stands,
+    // dated like every other reading by the panel that shows it.
+    let mut radio_window = 0;
+    match &c.radio_drops {
+        None => {}
+        Some(Ok(None)) => m.signal.radio_drops = crate::state::RadioDropAccount::NotKept,
+        Some(Err(why)) => {
+            m.signal.radio_drops = crate::state::RadioDropAccount::Unreadable(why.clone())
+        }
+        Some(Ok(Some(w))) => {
+            radio_window = u64::from(w.events);
+            m.signal.radio_drops = crate::state::RadioDropAccount::Counted {
+                stream: w.reading.events,
+                window: w.events,
+                longest_bytes: w.reading.longest_bytes,
+            };
+        }
+    }
 
     // The delivered sample rate, measured over tens of seconds rather than over
     // this one window. `None` means the baseline is not long enough yet, and the
@@ -177,7 +199,9 @@ pub(super) fn write_back(
         &gaps_snapshot,
         m.iq.cb_jitter_us,
         m.radio.actual_sample_rate,
-        m.signal.drops_per_sec,
+        // The radio's own drops are samples lost as surely as the driver's,
+        // and the verdict's first question is only whether any were.
+        m.signal.drops_per_sec + radio_window,
         tp_mean,
         tp_std,
         device.capabilities().delivery,

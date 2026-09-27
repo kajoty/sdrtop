@@ -149,6 +149,30 @@ mod tests {
     }
 
     /// The verdict follows the timing quality, and the three bands are reachable.
+    /// The radio's own count sits under the drop trend: absent on a radio
+    /// that keeps none, the reason on one that could not be asked, and the
+    /// count with its longest drop in time otherwise.
+    #[test]
+    fn what_the_radio_dropped_is_shown_under_the_drops() {
+        let quiet = draw(TimingVitalsPanel, W, H, &live()).join("\n");
+        assert!(!quiet.contains("In the radio"), "{quiet}");
+
+        let mut m = live();
+        m.signal.radio_drops = crate::state::RadioDropAccount::Unreadable("old firmware".into());
+        let out = draw(TimingVitalsPanel, W, H, &m).join("\n");
+        assert!(out.contains("not counted: old firmware"), "{out}");
+
+        m.radio.config_sample_rate = 20e6;
+        m.signal.radio_drops = crate::state::RadioDropAccount::Counted {
+            stream: 12,
+            window: 2,
+            longest_bytes: 435_000,
+        };
+        let out = draw(TimingVitalsPanel, W, H, &m).join("\n");
+        assert!(out.contains("In the radio 12"), "{out}");
+        assert!(out.contains("the longest 10.9 ms"), "{out}");
+    }
+
     #[test]
     fn the_verdict_follows_the_timing_quality() {
         let good = draw(TimingVitalsPanel, W, H, &live()).join("\n");

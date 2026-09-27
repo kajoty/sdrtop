@@ -337,6 +337,49 @@ impl RateBaseline {
     }
 }
 
+/// One poll window of the radio's own drop count.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DropWindow {
+    /// Drops since the last reading.
+    pub events: u32,
+    /// The reading itself.
+    pub reading: crate::hardware::RadioDrops,
+    /// Where in the stream the window's drops can be: after the position at
+    /// the last reading, and no later than this reading's position plus what
+    /// was still in flight between the radio and the callback. A drop in the
+    /// radio leaves no mark in the positions, so this bracket is as close as
+    /// the stream can place it.
+    pub from_pair: u64,
+    pub to_pair: u64,
+}
+
+/// Turn a cumulative reading into a window, against the previous one.
+///
+/// `seen` is `(count, stream position)` at the last reading of this stream,
+/// or `None`. The count restarts with each stream, and so do the positions,
+/// so a count or a position that went backwards is a new stream: everything
+/// it holds is new, from the start of the stream.
+pub(super) fn drop_window(
+    seen: &mut Option<(u32, u64)>,
+    reading: crate::hardware::RadioDrops,
+    position: u64,
+    bytes_per_pair: u64,
+) -> DropWindow {
+    let (events, from_pair) = match *seen {
+        Some((count, at)) if reading.events >= count && position >= at => {
+            (reading.events - count, at)
+        }
+        _ => (reading.events, 0),
+    };
+    *seen = Some((reading.events, position));
+    DropWindow {
+        events,
+        reading,
+        from_pair,
+        to_pair: position + reading.in_flight_bytes / bytes_per_pair.max(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +704,48 @@ mod tests {
             iq_metrics(mo, no_cal(), EIGHT_BIT).adc_peak_dbfs > 40.0,
             "and the same counts on an 8-bit device are far above its rail"
         );
+    }
+
+    // ── The radio's own drops ───────────────────────────────────────────────
+
+    fn drops(events: u32) -> crate::hardware::RadioDrops {
+        crate::hardware::RadioDrops {
+            events,
+            longest_bytes: 4096,
+            in_flight_bytes: 1_000,
+        }
+    }
+
+    /// The first reading of a stream holds everything since it started; the
+    /// next only what is new, bracketed from the last reading's position to
+    /// this one's plus what was still in flight.
+    #[test]
+    fn a_drop_window_is_what_is_new_and_where_it_can_be() {
+        let mut seen = None;
+        let first = drop_window(&mut seen, drops(2), 50_000, 2);
+        assert_eq!(
+            (first.events, first.from_pair, first.to_pair),
+            (2, 0, 50_500)
+        );
+        let quiet = drop_window(&mut seen, drops(2), 90_000, 2);
+        assert_eq!(quiet.events, 0);
+        let more = drop_window(&mut seen, drops(5), 130_000, 2);
+        assert_eq!(
+            (more.events, more.from_pair, more.to_pair),
+            (3, 90_000, 130_500)
+        );
+    }
+
+    /// A count or a position that went backwards is a new stream, and all of
+    /// its count is new.
+    #[test]
+    fn a_new_stream_starts_its_count_again() {
+        let mut seen = Some((40, 900_000));
+        let w = drop_window(&mut seen, drops(1), 10_000, 2);
+        assert_eq!((w.events, w.from_pair), (1, 0));
+        let mut seen = Some((0, 900_000));
+        let w = drop_window(&mut seen, drops(4), 10_000, 2);
+        assert_eq!((w.events, w.from_pair), (4, 0), "fewer pairs: a restart");
     }
 
     // ── Read-loop occupancy ─────────────────────────────────────────────────

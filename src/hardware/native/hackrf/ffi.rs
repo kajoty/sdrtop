@@ -4,7 +4,7 @@
 use libc::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
-use super::super::loader::{load, symbol};
+use super::super::loader::{load, optional_symbol, symbol};
 
 #[repr(C)]
 pub struct hackrf_transfer {
@@ -25,6 +25,24 @@ pub struct HackrfDeviceList {
     pub devicecount: c_int,
     pub usb_devices: *mut *mut c_void,
     pub usb_devicecount: c_int,
+}
+
+/// `hackrf_m0_state` in hackrf.h: the SGPIO loop on the radio's M0 core,
+/// field for field.
+#[repr(C)]
+#[derive(Default)]
+pub struct HackrfM0State {
+    pub requested_mode: u16,
+    pub request_flag: u16,
+    pub active_mode: u32,
+    pub m0_count: u32,
+    pub m4_count: u32,
+    pub num_shortfalls: u32,
+    pub longest_shortfall: u32,
+    pub shortfall_limit: u32,
+    pub threshold: u32,
+    pub next_mode: u32,
+    pub error: u32,
 }
 
 #[repr(C)]
@@ -63,6 +81,11 @@ pub struct HackrfApi {
     pub hackrf_error_name: unsafe extern "C" fn(c_int) -> *const c_char,
     pub hackrf_board_rev_read: unsafe extern "C" fn(*mut c_void, *mut u8) -> c_int,
     pub hackrf_usb_api_version_read: unsafe extern "C" fn(*mut c_void, *mut u16) -> c_int,
+    // Optional: only the radio's own drop count needs these, so a library
+    // without them loses that count and nothing else.
+    pub hackrf_get_m0_state: Option<unsafe extern "C" fn(*mut c_void, *mut HackrfM0State) -> c_int>,
+    pub hackrf_get_transfer_buffer_size: Option<unsafe extern "C" fn(*mut c_void) -> usize>,
+    pub hackrf_get_transfer_queue_depth: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
 }
 
 const CANDIDATES: &[&str] = &["libhackrf.so.0", "libhackrf.so"];
@@ -108,6 +131,13 @@ pub(super) fn resolve(lib: libloading::Library) -> Result<HackrfApi, String> {
         hackrf_error_name: sym!(hackrf_error_name),
         hackrf_board_rev_read: sym!(hackrf_board_rev_read),
         hackrf_usb_api_version_read: sym!(hackrf_usb_api_version_read),
+        hackrf_get_m0_state: unsafe { optional_symbol(&lib, b"hackrf_get_m0_state\0") },
+        hackrf_get_transfer_buffer_size: unsafe {
+            optional_symbol(&lib, b"hackrf_get_transfer_buffer_size\0")
+        },
+        hackrf_get_transfer_queue_depth: unsafe {
+            optional_symbol(&lib, b"hackrf_get_transfer_queue_depth\0")
+        },
         _lib: lib,
     })
 }

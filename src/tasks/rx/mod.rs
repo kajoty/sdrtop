@@ -70,6 +70,8 @@ pub fn spawn_rx_task(
         // nothing, and it means there is no separate first-time branch to get
         // wrong.
         let mut baseline_rate = f64::NAN;
+        // The radio's drop count and stream position at the last reading.
+        let mut drops_seen: Option<(u32, u64)> = None;
 
         loop {
             // Single is_streaming() call per iteration - the result is used for
@@ -105,6 +107,24 @@ pub fn spawn_rx_task(
                 ),
                 measured_rate: rate.rate(device.capabilities().sample_geometry.bytes_per_pair()),
                 read_occupancy: window_occupancy(device.read_loop_us(), &mut last_loop_us),
+                // Asked only of a running stream: the count is the stream's.
+                radio_drops: if hw_streaming && hw_rx_active {
+                    Some(device.radio_drops().map(|kept| {
+                        kept.map(|reading| {
+                            metrics::drop_window(
+                                &mut drops_seen,
+                                reading,
+                                rx_ctx
+                                    .stream_pairs
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                device.capabilities().sample_geometry.bytes_per_pair() as u64,
+                            )
+                        })
+                    }))
+                } else {
+                    drops_seen = None;
+                    None
+                },
             };
 
             let rx_enabled = publish::write_back(

@@ -924,6 +924,20 @@ pub struct DeviceInfo {
     pub stack: Option<SoftwareStack>,
 }
 
+/// The radio's own account of what it dropped, cumulative since its stream
+/// started. See [`SdrDevice::radio_drops`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RadioDrops {
+    /// Times the radio's buffer had nowhere to go and samples were lost.
+    pub events: u32,
+    /// The longest of them, in bytes of the radio's own sample format.
+    pub longest_bytes: u32,
+    /// The most bytes that can be between the radio and the callback at
+    /// once: how far past the stream position at a reading a drop the reading
+    /// already counts can still surface.
+    pub in_flight_bytes: u64,
+}
+
 /// Shared RX plumbing handed to a backend's streaming start. The per-sample
 /// accumulators write into `metrics`; raw byte blocks go out via `sample_tx` to
 /// the FFT worker. `geometry` tells [`crate::hardware::process::process_block`]
@@ -1226,6 +1240,20 @@ pub trait SdrDevice: Send + Sync {
     /// that stops and restarts does not step the counters backwards.
     fn read_loop_us(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// What the radio says about samples it dropped itself, before any of
+    /// them reached the host.
+    ///
+    /// Three answers, kept apart. `Ok(None)`: this radio keeps no such count,
+    /// and there is nothing to show. `Err(why)`: it does, and it could not be
+    /// asked, which is itself worth showing. `Ok(Some(..))`: the count.
+    ///
+    /// A drop inside the radio leaves no hole in the stream positions: the
+    /// driver hands over whole buffers either side of it. This count is the
+    /// only way sdrtop learns it happened.
+    fn radio_drops(&self) -> Result<Option<RadioDrops>, String> {
+        Ok(None)
     }
 
     /// IQ pairs in one delivery, feeding the expected callback period in
