@@ -32,7 +32,39 @@ in time.
 
 ---
 
-## 🔍 Checkpoint 23: A second look *(you are here)*
+## 📏 Checkpoint 24: Measured like a tester *(you are here)*
+
+**0.6.2.** 0.6.1 made the NET figures honest. Honest is not the same as
+right, so this time I went and read how the Bluetooth SIG's own test suites
+measure a transmitter, and made sdrtop do exactly that. Then I built a
+reference transmitter and a reference tester out of those same documents,
+so that the receive chain could be held to them by the test suite rather
+than by my optimism.
+
+It was humbling. The reference showed the classic modulation index reading
+0.28 to 0.54 for a transmitter sending 0.88, a BLE df2 that sat 8.7 % low,
+and classic Bluetooth counting, live, about one packet in five. All fixed. Every
+modulation, carrier and drift figure is now read the way the test suites
+define it, from ordinary traffic, and a classic piconet gets a **carrier**
+section of its own: f0, drift and drift rate, against limits read in the
+Core Specification. A reading taken while the next channel was shouting is
+refused rather than quietly bent.
+
+Then came speed, under one rule: a speed-up stays only if the reference
+prints the same figures to the last digit. Two did not, and were reverted.
+What was left runs the Classic view two and a half to three and a half
+times faster, and at
+4 Msps it now keeps up with the radio on the old i3. The Survey got a little
+room out of it too, and uses it to mark classic hits on the coexistence
+history, on as many channels as its measured load allows.
+
+These figures are held to a reference built from the specification, which
+is not the same as a real tester on a real transmitter. That comparison is
+next. The full list is in the [changelog](../CHANGELOG.md).
+
+---
+
+## 🔍 Checkpoint 23: A second look
 
 **0.6.1.** The day after a release is a good day to sit in front of it and
 simply watch. So I did, live, on the old i3, with a HackRF and a notepad,

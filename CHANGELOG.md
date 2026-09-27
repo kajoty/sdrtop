@@ -16,6 +16,82 @@ checkpoint instead of by version.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-27
+
+**NET, measured the way the test suites measure.**
+
+0.6.1 made the NET figures honest about what they were. This release makes
+them the figures a Bluetooth tester would give: every modulation, carrier and
+drift reading now follows the SIG's own test suites (RF-PHY.TS for LE, RF.TS
+for BR), and a reference transmitter and tester built from those suites holds
+the receive chain to them in the test suite. It also runs faster, and every
+speed-up had to print the same reference figures to the last digit before it
+was kept.
+
+### Changed
+
+- **df1 and df2 are read as the test suites define them, from ordinary
+  traffic.** A GFSK bit is shaped by its two neighbours alone, so a bit whose
+  neighbours both equal it is read as the suites read `00001111`, and one
+  whose neighbours both differ as they read `10101010`. Against the
+  reference, a transmitter at df2/df1 0.8807 reads 0.877 to 0.890. The old
+  run-end readings are gone.
+- **LE 1M packets and classic headers are measured a second time** from the
+  raw samples, through a measurement filter flat to 1.25 MHz, rebuilt 8x
+  finer as the band-limited signal they are, and timed to bits that are
+  known (preamble, sync word, trailer) or re-read. LE 2M keeps the
+  receiver's own reading, and the detail panel says which it is.
+- **LE drift is the suites' maxima** (the ten-bit block furthest from f0,
+  and the steepest five-block step) with a sigma from the blocks' scatter.
+  The half-against-half drift is gone.
+- The export columns are unchanged; the figures in them are read by the new
+  definitions.
+
+### Added
+
+- **A classic piconet's carrier**: f0 over the preamble, and the worst
+  header's drift and drift rate, against ±75 kHz, ±40 kHz and 400 Hz/µs
+  (Core 5.4 Vol 2 Part A 3.1.3). f0 is relative until a reference makes it
+  absolute.
+- **A busy neighbour refuses a classic reading.** When the next channel is
+  more than 20 dB above the far side's, the header is counted as not read,
+  and the piconet panel says how many.
+- **Classic hits on the Survey's coexistence history**, on as many channels
+  as the measured decode load leaves room for. The key says so:
+  `BT 12 on 1 ch`, or `BT: not running, load` when there is no room.
+- **`T` lets a trusted reference go.** `T` on the device the reference rests
+  on drops it at once; `T` on another device replaces it.
+
+### Fixed
+
+- **Classic Bluetooth counted one packet per piconet per block.** Live, that
+  was about a fifth of the traffic, and the slot fit and the paging rhythm
+  were read from what was left. Packets are now told apart by time, across
+  blocks: 48 of 48 in the reference at 4, 8 and 20 Msps.
+- The classic slicer's bias tracker learned from noise between packets and
+  wandered 35 kHz at 20 Msps, losing packets that arrived off centre.
+- **Classic df2/df1 read 0.28 to 0.54** for a transmitter sending 0.88; it
+  now reads 0.93, as a compliant tester does at 20 Msps.
+- **BLE df2 read 8.7 % low and df1 3.5 % low** at four samples a symbol,
+  where the straight line between two readings runs under the curve.
+
+### Performance
+
+On the i3 this is developed on, as a share of real time (the same
+measurement run on 0.6.1 and on 0.6.2, over a quiet band):
+
+| View | 0.6.1 | 0.6.2 |
+|---|---|---|
+| Classic, 4 Msps | 1.91x | 0.73x |
+| Classic, 8 Msps | 5.28x | 1.88x |
+| Classic, 20 Msps | 11.22x | 3.28x |
+| Survey, 8 Msps | 0.82x | 0.73x, with a classic channel |
+| Survey, 20 Msps | 1.52x | 0.99x |
+
+The Classic view at 4 Msps now keeps up with the radio on that machine.
+
+No config change.
+
 ## [0.6.1] - 2026-09-25
 
 **NET, a second look.**
@@ -750,7 +826,8 @@ sdrtop stopped being a one-radio program.
   image rejection ratio, wavelength and antenna metrics.
 - Config file with atomic save on quit, and the CLI flags that override it.
 
-[Unreleased]: https://github.com/musithang/sdrtop/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/musithang/sdrtop/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/musithang/sdrtop/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/musithang/sdrtop/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/musithang/sdrtop/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/musithang/sdrtop/compare/v0.5.0...v0.5.1
