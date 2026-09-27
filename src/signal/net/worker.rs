@@ -7,6 +7,13 @@
 //! that owns the state carried between blocks, so that everything below it can
 //! be a pure function of its arguments and be tested with no radio anywhere.
 //!
+//! **One thread owns it; the decoders of one block run side by side.** The
+//! BLE receiver and each classic channel's receiver own everything they
+//! touch and read the same block, so [`push_all`] runs them on scoped
+//! threads for that block and hands their answers back in the order one
+//! thread would have produced them: the same results, in less time on a
+//! machine with more than one core.
+//!
 //! **It counts what arrived and measures what was in the band.** Design
 //! section 13.2 makes what the receiver missed a first-class displayed number
 //! rather than an inference, and a feed whose losses are only visible once
@@ -95,7 +102,77 @@ fn held<'a>(
     )
 }
 
-/// Above this many simultaneous classic BT channels, `NetWorker::new` logs a
+/// What one classic receiver heard in a block: its hits and its headers.
+type Heard = (
+    Vec<crate::signal::bt::receive::AccessHit>,
+    Vec<crate::signal::bt::receive::HeaderHit>,
+);
+
+/// Every classic receiver of the fleet fed `iq`, their answers in fleet
+/// order, the receivers spread over the machine's cores.
+///
+/// **Parallel because nothing is shared, and so exact.** Each receiver owns
+/// its mixer, filter, lanes and captures, and reads the same block; run on
+/// several threads and put back in order, they give what one thread gives,
+/// bit for bit. On the i3 the Classic view at 4 Msps was 1.4 times real time
+/// on one core, most of it three receivers doing the same work side by side.
+/// A block is milliseconds long, so starting the threads for each is lost in
+/// it.
+fn push_fleet(fleet: &mut [BtReceiver], iq: &[num_complex::Complex<f32>]) -> Vec<Heard> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = cores.min(fleet.len());
+    if threads <= 1 {
+        return fleet.iter_mut().map(|rx| rx.push_iq(iq)).collect();
+    }
+    let per = fleet.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let running: Vec<_> = fleet
+            .chunks_mut(per)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter_mut()
+                        .map(|rx| rx.push_iq(iq))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        running
+            .into_iter()
+            .flat_map(|t| {
+                t.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+/// The BLE receiver, when there is one to feed, and the classic fleet, fed
+/// the same block at once: the BLE receiver on a thread of its own beside
+/// [`push_fleet`]'s. Each owns everything it touches, so running them side
+/// by side gives what running them one after the other gave, and the BLE
+/// receiver's packets are handled after the fleet's hits are in, both in
+/// the order they always were.
+fn push_all(
+    ble: Option<&mut BleReceiver>,
+    fleet: &mut [BtReceiver],
+    iq: &[num_complex::Complex<f32>],
+    first_pair: u64,
+) -> (Option<Vec<crate::signal::ble::pdu::Packet>>, Vec<Heard>) {
+    let Some(rx) = ble else {
+        return (None, push_fleet(fleet, iq));
+    };
+    std::thread::scope(|scope| {
+        let packets = scope.spawn(move || rx.push_iq_at(iq, first_pair));
+        let answers = push_fleet(fleet, iq);
+        let packets = packets
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (Some(packets), answers)
+    })
+}
+
+/// Above this many simultaneous classic BT channels/// Above this many simultaneous classic BT channels, `NetWorker::new` logs a
 /// warning naming the cost rather than staying quiet about it -
 /// `signal::bt::receive`'s own doc has the measured tap counts this is
 /// guarding against. Matches `config::default_bt_channels`, so a default
@@ -512,6 +589,9 @@ impl NetWorker {
             } else {
                 crate::signal::ble::channel::to_decode(centre_hz as u64, span_hz, locked)
             };
+            // The advertising channel the BLE receiver is to be fed this
+            // block, if any: fed below, alongside the classic fleet.
+            let mut ble_on: Option<u8> = None;
             match channel {
                 Some(ch)
                     if still_open
@@ -554,86 +634,8 @@ impl NetWorker {
                             }
                         };
                     }
-                    if let Some(rx) = ble.as_mut() {
-                        let mut packets = rx
-                            .push_iq_at(decoded_block(&mut iq, &bytes, self.geometry), first_pair);
-                        // LE 1M read again as a tester reads it
-                        // (`measure::le_1m`), outside the lock; a packet whose
-                        // window is not held keeps no figure rather than the
-                        // receiver's own. LE 2M keeps the receiver's.
-                        if phy == crate::signal::ble::Phy::OneM && !packets.is_empty() {
-                            let window = held(&recent, iq.as_deref().map(|v| (first_pair, v)));
-                            let offset = crate::signal::ble::channel::centre_hz(ch)
-                                .map(|hz| hz as f64 - centre_hz);
-                            for p in packets.iter_mut() {
-                                let read = offset.zip(p.pdu_pair).and_then(|(o, at)| {
-                                    super::measure::le_1m(&window, rate_hz, o, at, &p.air)
-                                });
-                                (p.modulation, p.drift) = read.unwrap_or((None, None));
-                            }
-                        }
-                        let funnel = rx.take_funnel();
-                        if !funnel.is_empty() {
-                            let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                            m.net.health.ble.add(funnel);
-                        }
-                        if !packets.is_empty() {
-                            // Read before the lock: parsing is work the UI
-                            // thread should not wait behind.
-                            let advertised: Vec<_> =
-                                packets.iter().filter_map(advertised_of).collect();
-                            let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                            for (address, said) in advertised {
-                                m.net.advertised.entry(address).or_default().merge(said);
-                            }
-                            if let Some(i) =
-                                crate::signal::ble::channel::advertising_channel_index(ch)
-                            {
-                                m.net.ble_channel_packets[i] += packets.len() as u64;
-                                m.net.ble_channel_crc_ok[i] +=
-                                    packets.iter().filter(|p| p.crc_ok).count() as u64;
-                            }
-                            for p in packets {
-                                // Numbered as it arrives, so `masked` counts in
-                                // the order devices were heard: see `AddressBook`.
-                                if let Some(addr) = p.adv_addr {
-                                    m.net.address_book.number(addr);
-                                }
-                                let locked = m.net.mode == crate::state::NetMode::Lock;
-                                if let Some(snr) = p.snr_db {
-                                    m.net.fer.record(snr, p.crc_ok);
-                                }
-                                census_from_ble(
-                                    &mut m.net.census.devices,
-                                    &p,
-                                    ch,
-                                    locked,
-                                    rate_hz,
-                                    now,
-                                );
-                                m.net.ble_heard += 1;
-                                let seq = m.net.ble_heard;
-                                m.net.ble_packets.push_front(BlePacket {
-                                    seq,
-                                    phy,
-                                    channel: ch,
-                                    pdu_type: p.pdu_type,
-                                    ch_sel: p.ch_sel,
-                                    tx_add_random: p.tx_add_random,
-                                    rx_add_random: p.rx_add_random,
-                                    length: p.length,
-                                    adv_addr: p.adv_addr,
-                                    payload: p.payload,
-                                    crc_ok: p.crc_ok,
-                                    snr_db: p.snr_db,
-                                    freq_offset_hz: p.freq_offset_hz,
-                                    modulation: p.modulation,
-                                    drift: p.drift,
-                                    seen: now,
-                                });
-                            }
-                            m.net.ble_packets.truncate(crate::state::BLE_PACKET_LIMIT);
-                        }
+                    if ble.is_some() {
+                        ble_on = Some(ch);
                     }
                 }
                 Some(_) => {
@@ -649,6 +651,13 @@ impl NetWorker {
                     m.net.ble_channel = None;
                 }
             }
+
+            // Decoded once, before either decoder runs, so both read it at once.
+            if ble_on.is_some() || (is_net_bt && still_open) {
+                decoded_block(&mut iq, &bytes, self.geometry);
+            }
+            let block: &[num_complex::Complex<f32>] = iq.as_deref().unwrap_or(&[]);
+            let mut ble_packets: Option<Vec<crate::signal::ble::pdu::Packet>> = None;
 
             // `net_bt`: B15's own live receiver, one per channel the current
             // tuning and `self.bt_channels` together let it watch. Not
@@ -696,8 +705,10 @@ impl NetWorker {
 
                 let mut hits = Vec::new();
                 let mut header_hits = Vec::new();
-                for rx in bt.iter_mut() {
-                    let (laps, headers) = rx.push_iq(decoded_block(&mut iq, &bytes, self.geometry));
+                let (ble_out, answers) =
+                    push_all(ble_on.and(ble.as_mut()), &mut bt, block, first_pair);
+                ble_packets = ble_out;
+                for (rx, (laps, headers)) in bt.iter().zip(answers) {
                     for hit in laps {
                         hits.push((rx.channel(), hit.lap, hit.at_us));
                         let log = bt_arrivals.entry(hit.lap).or_default();
@@ -885,6 +896,83 @@ impl NetWorker {
                 let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 m.net.bt_refused = None;
                 m.net.bt_channels_watched.clear();
+            }
+
+            // The BLE receiver alone, when no classic fleet ran beside it,
+            // then what it found, as it always was.
+            if ble_packets.is_none() {
+                if let (Some(_), Some(rx)) = (ble_on, ble.as_mut()) {
+                    ble_packets = Some(rx.push_iq_at(block, first_pair));
+                }
+            }
+            if let (Some(ch), Some(mut packets), Some(rx)) = (ble_on, ble_packets, ble.as_mut()) {
+                // LE 1M read again as a tester reads it
+                // (`measure::le_1m`), outside the lock; a packet whose
+                // window is not held keeps no figure rather than the
+                // receiver's own. LE 2M keeps the receiver's.
+                if phy == crate::signal::ble::Phy::OneM && !packets.is_empty() {
+                    let window = held(&recent, iq.as_deref().map(|v| (first_pair, v)));
+                    let offset =
+                        crate::signal::ble::channel::centre_hz(ch).map(|hz| hz as f64 - centre_hz);
+                    for p in packets.iter_mut() {
+                        let read = offset.zip(p.pdu_pair).and_then(|(o, at)| {
+                            super::measure::le_1m(&window, rate_hz, o, at, &p.air)
+                        });
+                        (p.modulation, p.drift) = read.unwrap_or((None, None));
+                    }
+                }
+                let funnel = rx.take_funnel();
+                if !funnel.is_empty() {
+                    let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    m.net.health.ble.add(funnel);
+                }
+                if !packets.is_empty() {
+                    // Read before the lock: parsing is work the UI
+                    // thread should not wait behind.
+                    let advertised: Vec<_> = packets.iter().filter_map(advertised_of).collect();
+                    let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    for (address, said) in advertised {
+                        m.net.advertised.entry(address).or_default().merge(said);
+                    }
+                    if let Some(i) = crate::signal::ble::channel::advertising_channel_index(ch) {
+                        m.net.ble_channel_packets[i] += packets.len() as u64;
+                        m.net.ble_channel_crc_ok[i] +=
+                            packets.iter().filter(|p| p.crc_ok).count() as u64;
+                    }
+                    for p in packets {
+                        // Numbered as it arrives, so `masked` counts in
+                        // the order devices were heard: see `AddressBook`.
+                        if let Some(addr) = p.adv_addr {
+                            m.net.address_book.number(addr);
+                        }
+                        let locked = m.net.mode == crate::state::NetMode::Lock;
+                        if let Some(snr) = p.snr_db {
+                            m.net.fer.record(snr, p.crc_ok);
+                        }
+                        census_from_ble(&mut m.net.census.devices, &p, ch, locked, rate_hz, now);
+                        m.net.ble_heard += 1;
+                        let seq = m.net.ble_heard;
+                        m.net.ble_packets.push_front(BlePacket {
+                            seq,
+                            phy,
+                            channel: ch,
+                            pdu_type: p.pdu_type,
+                            ch_sel: p.ch_sel,
+                            tx_add_random: p.tx_add_random,
+                            rx_add_random: p.rx_add_random,
+                            length: p.length,
+                            adv_addr: p.adv_addr,
+                            payload: p.payload,
+                            crc_ok: p.crc_ok,
+                            snr_db: p.snr_db,
+                            freq_offset_hz: p.freq_offset_hz,
+                            modulation: p.modulation,
+                            drift: p.drift,
+                            seen: now,
+                        });
+                    }
+                    m.net.ble_packets.truncate(crate::state::BLE_PACKET_LIMIT);
+                }
             }
 
             // Held for the measurement path, as much as `measure::HELD_S`
