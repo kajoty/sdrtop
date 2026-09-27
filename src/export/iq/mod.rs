@@ -170,6 +170,7 @@ impl Writer {
                         break stop;
                     }
                 }
+                Ok(RecordMsg::Radio(note)) => self.rec.radio(note),
                 Ok(RecordMsg::Block {
                     at,
                     bytes,
@@ -238,6 +239,7 @@ impl Writer {
             bytes: self.rec.bytes_written(),
             lost: self.rec.lost(),
             short: self.rec.shortfall(),
+            radio_drops: self.rec.radio_drops,
             ended: stop.map(Stop::sentence),
         }
     }
@@ -357,6 +359,12 @@ mod tests {
         let too_big = vec![0u8; crate::hardware::record_tap::RECORD_QUEUE_BYTES + 2];
         tap.offer(at(100, 50), &too_big, vec![], false);
         tap.offer(at(150, 100), &second, gains, false);
+        tap.radio(crate::hardware::record_tap::RadioNote::Counted {
+            events: 3,
+            from_pair: 160,
+            to_pair: 240,
+            longest_bytes: 64,
+        });
         rec.stop();
         let path = data_path_of(&state);
         rec.finish();
@@ -370,6 +378,21 @@ mod tests {
         assert_eq!(meta["captures"][1]["core:sample_start"], 100);
         assert_eq!(meta["captures"][1]["core:global_index"], 150);
         assert_eq!(meta["annotations"][0]["core:label"], "lost 50");
+        assert_eq!(meta["global"]["sdrtop:radio_drops"], 3);
+        let radio = meta["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["core:label"] == "radio dropped 3")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (
+                radio["core:sample_start"].clone(),
+                radio["core:sample_count"].clone()
+            ),
+            (110.into(), 80.into())
+        );
         let m = state.lock().unwrap();
         let done = m.record.current.as_ref().unwrap();
         assert_eq!(

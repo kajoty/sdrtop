@@ -127,6 +127,23 @@ pub fn spawn_rx_task(
                 },
             };
 
+            // A running recording keeps the radio's account too: every
+            // reading, zero included, so the file can tell "none dropped"
+            // from "this radio keeps no count".
+            if rx_ctx.record.armed() {
+                use crate::hardware::record_tap::RadioNote;
+                match &computed.radio_drops {
+                    Some(Ok(Some(w))) => rx_ctx.record.radio(RadioNote::Counted {
+                        events: w.events,
+                        from_pair: w.from_pair,
+                        to_pair: w.to_pair,
+                        longest_bytes: w.reading.longest_bytes,
+                    }),
+                    Some(Err(why)) => rx_ctx.record.radio(RadioNote::Unreadable(why.clone())),
+                    _ => {}
+                }
+            }
+
             let rx_enabled = publish::write_back(
                 &state,
                 &device,

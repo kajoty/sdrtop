@@ -27,6 +27,9 @@ pub struct RecordProgress {
     /// The fraction of its rate the radio did not deliver without reporting
     /// it, once that is past the recording's tolerance.
     pub short: Option<f64>,
+    /// Drops the radio counted in itself while recording, when it keeps
+    /// such a count.
+    pub radio_drops: Option<u64>,
     /// Why it ended; `None` while it runs.
     pub ended: Option<String>,
 }

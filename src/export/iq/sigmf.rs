@@ -157,6 +157,12 @@ pub fn meta(header: &Header, rec: &Recording, stop: Option<&Stop>) -> String {
     put("sdrtop:lost_queue", json!(rec.lost_queue));
     put("sdrtop:lost_unexplained", json!(rec.lost_unexplained));
     put("sdrtop:wall_seconds", json!(rec.wall_seconds()));
+    if let Some(n) = rec.radio_drops {
+        put("sdrtop:radio_drops", json!(n));
+    }
+    if let Some(why) = &rec.radio_unreadable {
+        put("sdrtop:radio_drops_unreadable", json!(why));
+    }
     if let Some(hz) = rec.delivered_hz() {
         put("sdrtop:delivered_rate", json!(hz));
     }
@@ -177,12 +183,12 @@ pub fn meta(header: &Header, rec: &Recording, stop: Option<&Stop>) -> String {
         })
         .collect();
     let annotations: Vec<Value> = rec
-        .annotations
+        .all_annotations()
         .iter()
         .map(|a| {
             json!({
                 "core:sample_start": a.sample_start,
-                "core:sample_count": 0,
+                "core:sample_count": a.sample_count,
                 "core:label": a.label,
                 "core:comment": a.comment,
                 "core:generator": "sdrtop",
@@ -297,6 +303,15 @@ mod tests {
             b.arrived_unix = T0 + (k + 1) as f64 * 0.2;
             rec.block(&b, "");
         }
+        rec.radio(crate::hardware::record_tap::RadioNote::Counted {
+            events: 1,
+            from_pair: 0,
+            to_pair: 50_000,
+            longest_bytes: 1_000,
+        });
+        rec.radio(crate::hardware::record_tap::RadioNote::Unreadable(
+            "a later reading failed".into(),
+        ));
         let written: Value =
             serde_json::from_str(&meta(&header(), &rec, Some(&Stop::Asked))).unwrap();
         let mut ours: Vec<String> = written["global"]

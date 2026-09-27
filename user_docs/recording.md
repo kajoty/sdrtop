@@ -66,10 +66,20 @@ run two seconds it compares the two. More than 1 % short, and the file gets an
 `sdrtop:shortfall` sentence saying so, the log repeats it, and the header shows
 it. From then on, treat a sample's position as a position, not a time.
 
+A HackRF goes one better: it counts its own drops, the moments its buffer was
+full and samples went nowhere. sdrtop reads that count while it streams, and a
+recording writes each one down as a `radio dropped N` annotation over the
+stretch of samples it lies in, with the total in `sdrtop:radio_drops`. A stretch
+rather than a sample, because a drop inside the radio leaves no mark in the
+stream: the samples either side of it arrive joined, and the count is read five
+times a second. The same count is on the Timing bench (`Lab 3`), recording or
+not.
+
 While it runs, the header shows `● REC 12.4 s · 496 MB`. That's the length of
 the file, samples over rate, not the time since you pressed the key. The first
-missing sample adds a second chip, `lost 3.2 ms`, and a radio running short
-adds `short 31 %`. They are different numbers on purpose.
+missing sample adds a second chip, `lost 3.2 ms`, the radio's own drops add
+`radio dropped 7`, and a radio running short adds `short 31 %`. They are
+different numbers on purpose.
 
 ## What stops it
 
@@ -107,14 +117,18 @@ took a full minute of 20 Msps from the recorder without refusing a single
 block, and handing a block over cost the USB callback about a microsecond and a
 half.
 
-The radio was. The first real recording, a HackRF at 20 Msps, came back with 21
+sdrtop was. The first real recording, a HackRF at 20 Msps, came back with 21
 seconds of samples for 31 seconds of wall time, and nothing had reported a
-single drop. That is how the `short` chip came to exist. Measured on that
-machine with that HackRF (Mayhem firmware), recording or not: **about 67 % of
-the rate at 20 Msps, about 95 % at 10 Msps**. Whether the host, the USB link or
-the firmware is the bottleneck, sdrtop can't tell yet; it can only tell you it
-happened. If a recording has to be whole, lower the rate until the chip stays
-away.
+single drop: sdrtop's own work was holding up the USB thread long enough for the
+radio's buffer to overflow. That is fixed: the work moved off the USB thread,
+and the same machine now streams 20 Msps whole.
+
+Recording at 20 Msps to that laptop's encrypted disk still costs a little: the
+kernel's encryption competes for the same two cores, and in fifteen seconds the
+radio dropped samples about seven times. Every one of them is in the file, in
+the header and on the Timing bench. If a recording has to be whole, record to a
+disk that is not encrypted, or lower the rate, and watch the `radio dropped`
+chip stay away.
 
 A Raspberry Pi writing to an SD card will be slower still, and will say `lost`
 or `short`, loudly. Nobody has measured one yet, so that's a warning, not a

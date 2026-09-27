@@ -769,7 +769,9 @@ pub(crate) mod tests {
                 );
                 assert_eq!((gains, boost), (vec![24.0, 30.0], true));
             }
-            RecordMsg::Refused { .. } => panic!("an empty queue refused a block"),
+            RecordMsg::Refused { .. } | RecordMsg::Radio(_) => {
+                panic!("an empty queue refused a block")
+            }
         }
         assert!(rx.try_recv().is_err(), "the idle block was not recorded");
         let forwarded = sample_rx.try_iter().last().unwrap();

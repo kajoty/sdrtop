@@ -22,7 +22,7 @@ const MIN_WALL_S: f64 = 2.0;
 /// shortfall on a starved USB link is tens of percent.
 const SHORT_TOLERANCE: f64 = 0.01;
 
-use crate::hardware::record_tap::BlockAt;
+use crate::hardware::record_tap::{BlockAt, RadioNote};
 
 /// One SigMF capture segment: where it starts in the file, where that is in
 /// the stream the radio delivered, and what the radio was tuned to.
@@ -36,12 +36,13 @@ pub struct Segment {
     pub arrived_unix: f64,
 }
 
-/// One SigMF annotation. Every one sdrtop writes marks a moment, so each
-/// carries a `sample_count` of zero (SigMF 1.12: without one it would mean
-/// "to the end of the capture").
+/// One SigMF annotation. Most mark a moment and carry a `sample_count` of
+/// zero (SigMF 1.12: without one it would mean "to the end of the capture");
+/// a drop inside the radio marks the stretch it is known to lie in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Annotation {
     pub sample_start: u64,
+    pub sample_count: u64,
     pub label: String,
     pub comment: String,
 }
@@ -149,6 +150,15 @@ pub struct Recording {
     /// the latest message, for the delivered rate.
     first_seen: Option<(f64, u64)>,
     last_seen: Option<(f64, u64)>,
+    /// The radio's own drops while recording: `None` until a reading comes,
+    /// which from a radio that keeps no count is never.
+    pub radio_drops: Option<u64>,
+    /// Why the radio's count could not be read, if it could not.
+    pub radio_unreadable: Option<String>,
+    /// Windows with drops in them, as stream positions, mapped to the file
+    /// each time the metadata is written, so a bracket still in flight at one
+    /// writing is whole at the next.
+    radio_windows: Vec<(u32, u64, u64, u32)>,
 }
 
 impl Recording {
@@ -171,6 +181,9 @@ impl Recording {
             gain: None,
             first_seen: None,
             last_seen: None,
+            radio_drops: None,
+            radio_unreadable: None,
+            radio_windows: Vec::new(),
         }
     }
 
@@ -285,6 +298,7 @@ impl Recording {
         if missing > 0 && self.written > 0 {
             self.annotations.push(Annotation {
                 sample_start: self.written,
+                sample_count: 0,
                 label: format!("lost {missing}"),
                 comment: format!(
                     "{missing} pairs ({:.3} ms) missing before this sample: {} dropped by the driver, {} refused by the recorder's queue{}",
@@ -302,6 +316,7 @@ impl Recording {
         if retuned {
             self.annotations.push(Annotation {
                 sample_start: self.written,
+                sample_count: 0,
                 label: format!("tuned {:.3} MHz", at.centre_hz as f64 / 1e6),
                 comment: "the frequency sdrtop had set when this block arrived; \
                           the radio's own settling after a retune is not in the file"
@@ -311,6 +326,7 @@ impl Recording {
         match &self.gain {
             Some(was) if was != gain => self.annotations.push(Annotation {
                 sample_start: self.written,
+                sample_count: 0,
                 label: "gain".to_string(),
                 comment: format!(
                     "{gain}: the setting when this block arrived, not the moment the radio applied it"
@@ -328,10 +344,76 @@ impl Recording {
         (take, stop)
     }
 
+    /// A reading of the radio's own count. A window that ends before the
+    /// recording's first sample belongs to no part of it.
+    pub fn radio(&mut self, note: RadioNote) {
+        match note {
+            RadioNote::Unreadable(why) => self.radio_unreadable = Some(why),
+            RadioNote::Counted {
+                events,
+                from_pair,
+                to_pair,
+                longest_bytes,
+            } => {
+                let started = self.origin.is_some_and(|o| to_pair >= o);
+                let total = self.radio_drops.get_or_insert(0);
+                if started && events > 0 {
+                    *total += u64::from(events);
+                    self.radio_windows
+                        .push((events, from_pair, to_pair, longest_bytes));
+                }
+            }
+        }
+    }
+
+    /// Where a stream position lies in the file: through the segment that
+    /// holds it, at a hole the start of the segment after it, and never past
+    /// what is written. `None` before the first block.
+    pub fn file_index(&self, position: u64) -> Option<u64> {
+        let origin = self.origin?;
+        let global = position.saturating_sub(origin);
+        let at = self
+            .segments
+            .iter()
+            .rposition(|s| s.global_index <= global)
+            .unwrap_or(0);
+        let seg = self.segments.get(at)?;
+        let mut index = seg.sample_start + (global - seg.global_index.min(global));
+        if let Some(next) = self.segments.get(at + 1) {
+            index = index.min(next.sample_start);
+        }
+        Some(index.min(self.written))
+    }
+
+    /// Every annotation, the moments and the radio's stretches, in the order
+    /// SigMF asks for (1.12: sorted by `sample_start`).
+    pub fn all_annotations(&self) -> Vec<Annotation> {
+        let mut all = self.annotations.clone();
+        for &(events, from, to, longest) in &self.radio_windows {
+            let (Some(a), Some(b)) = (self.file_index(from), self.file_index(to)) else {
+                continue;
+            };
+            let longest_ms = longest as f64 / self.bytes_per_pair as f64 / self.rate_hz * 1e3;
+            all.push(Annotation {
+                sample_start: a,
+                sample_count: b.saturating_sub(a),
+                label: format!("radio dropped {events}"),
+                comment: format!(
+                    "the radio dropped samples {events} time(s) somewhere in these samples, the longest {longest_ms:.2} ms: \
+                     a drop inside the radio leaves no mark in the stream, so the samples either side of it \
+                     are joined here and it can be placed only this closely"
+                ),
+            });
+        }
+        all.sort_by_key(|a| a.sample_start);
+        all
+    }
+
     /// The last word: an annotation at the end of the file saying why.
     pub fn finish(&mut self, stop: &Stop) {
         self.annotations.push(Annotation {
             sample_start: self.written,
+            sample_count: 0,
             label: "stopped".to_string(),
             comment: stop.sentence(),
         });
@@ -533,5 +615,66 @@ mod tests {
             on_time.block(&at(k * 1_000, 1_000), "");
         }
         assert_eq!(on_time.shortfall(), None);
+    }
+
+    fn counted(events: u32, from_pair: u64, to_pair: u64) -> RadioNote {
+        RadioNote::Counted {
+            events,
+            from_pair,
+            to_pair,
+            longest_bytes: 2_000,
+        }
+    }
+
+    /// A drop inside the radio is marked over the stretch of the file its
+    /// bracket maps to: through the segments, across a hole to the next
+    /// segment's start, and never past what is written. A bracket still in
+    /// flight grows as the file does.
+    #[test]
+    fn the_radios_drops_are_marked_over_the_stretch_they_lie_in() {
+        let mut r = roomy();
+        r.block(&at(1_000, 100), "");
+        r.radio(counted(0, 0, 1_100));
+        assert_eq!(r.radio_drops, Some(0), "a reading of none is a reading");
+        r.block(&at(1_100, 100), "");
+        // A hole of 300, then the rest.
+        r.block(&at(1_500, 100), "");
+        r.radio(counted(2, 1_150, 1_700));
+        let a = r.all_annotations();
+        let radio: Vec<_> = a.iter().filter(|a| a.label == "radio dropped 2").collect();
+        assert_eq!(radio.len(), 1);
+        assert_eq!(
+            (radio[0].sample_start, radio[0].sample_count),
+            (150, 150),
+            "clamped to what is written"
+        );
+        assert!(radio[0].comment.contains("1.00 ms"), "{}", radio[0].comment);
+        r.block(&at(1_600, 200), "");
+        let a = r.all_annotations();
+        let radio = a.iter().find(|a| a.label == "radio dropped 2").unwrap();
+        assert_eq!(
+            (radio.sample_start, radio.sample_count),
+            (150, 250),
+            "the bracket filled in: stream 1700 is file 400, past the hole"
+        );
+        assert!(
+            a.windows(2).all(|w| w[0].sample_start <= w[1].sample_start),
+            "sorted"
+        );
+        assert_eq!(r.radio_drops, Some(2));
+    }
+
+    /// A reading from before the recording's first block belongs to none of
+    /// it; one that could not be read keeps its reason.
+    #[test]
+    fn a_drop_before_the_recording_is_not_its_and_an_unreadable_count_says_why() {
+        let mut r = roomy();
+        r.radio(counted(4, 0, 900));
+        r.block(&at(1_000, 100), "");
+        r.radio(counted(1, 0, 900));
+        assert_eq!(r.radio_drops, Some(0));
+        assert!(r.all_annotations().is_empty());
+        r.radio(RadioNote::Unreadable("old firmware".into()));
+        assert_eq!(r.radio_unreadable.as_deref(), Some("old firmware"));
     }
 }

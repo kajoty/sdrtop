@@ -44,6 +44,21 @@ pub struct BlockAt {
     pub arrived_unix: f64,
 }
 
+/// One reading of the radio's own drop count, as the rx loop hands it over:
+/// how many drops since the last reading, and the stretch of the stream they
+/// can lie in. See `hardware::SdrDevice::radio_drops`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RadioNote {
+    Counted {
+        events: u32,
+        from_pair: u64,
+        to_pair: u64,
+        longest_bytes: u32,
+    },
+    /// The radio keeps a count and it could not be read.
+    Unreadable(String),
+}
+
 /// What travels to the writer.
 pub enum RecordMsg {
     /// A block to write, exactly as the radio delivered it, with the gain the
@@ -56,6 +71,8 @@ pub enum RecordMsg {
     },
     /// A block the queue had no room for: where it was, not what it held.
     Refused { at: BlockAt },
+    /// A reading of the radio's own drop count.
+    Radio(RadioNote),
 }
 
 /// The recorder's end of `process_block`.
@@ -100,6 +117,15 @@ impl RecordTap {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(bytes))
             });
+    }
+
+    /// Hand a reading of the radio's own drop count to a running recording.
+    /// A few integers, so it never waits on the byte budget.
+    pub fn radio(&self, note: RadioNote) {
+        let slot = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = slot.as_ref() {
+            let _ = tx.send(RecordMsg::Radio(note));
+        }
     }
 
     /// Hand one raw block over, or say where it was if there is no room.
@@ -181,11 +207,11 @@ mod tests {
                 assert_eq!(bytes.len(), big.len());
                 assert_eq!((gains, boost), (vec![20.0], true));
             }
-            RecordMsg::Refused { .. } => panic!("the first fits"),
+            RecordMsg::Refused { .. } | RecordMsg::Radio(_) => panic!("the first fits"),
         }
         match rx.try_recv().unwrap() {
             RecordMsg::Refused { at: a } => assert_eq!(a, at(1, 8)),
-            RecordMsg::Block { .. } => panic!("16 bytes over the budget"),
+            RecordMsg::Block { .. } | RecordMsg::Radio(_) => panic!("16 bytes over the budget"),
         }
         tap.release(big.len());
         tap.offer(at(9, 8), &[1; 16], vec![], false);

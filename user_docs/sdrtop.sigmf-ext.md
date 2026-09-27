@@ -30,6 +30,8 @@ RTL-SDR, `ci16_le` through SoapySDR) and a `.sigmf-meta` file beside it.
 | `sdrtop:lost_unexplained` | true | uint | Samples missing from the stream that nobody reported. Normally zero; counted, not assigned to a cause. |
 | `sdrtop:wall_seconds` | true | double | System-clock seconds from the first block to the last. |
 | `sdrtop:delivered_rate` | false | double | Samples per second the stream actually advanced by against the system clock, reported drops included. Present once the recording has spanned two seconds. |
+| `sdrtop:radio_drops` | false | uint | Drops the radio counted inside itself while the recording ran: each a moment its own buffer was full and samples were thrown away before any reached the host. Present when the radio keeps such a count (a HackRF does), and 0 is a reading, not an absence. Each is placed in the file by a `radio dropped N` annotation. |
+| `sdrtop:radio_drops_unreadable` | false | string | The radio keeps a count and it could not be read, with the reason. |
 | `sdrtop:shortfall` | false | string | Present when `sdrtop:delivered_rate` is more than 1 % below `core:sample_rate`: the radio delivered fewer samples than its rate and reported no drop. The missing samples are somewhere in the file, at places nothing recorded, so a sample's position divided by the rate is **not** its time. A HackRF that USB cannot keep up with does this. |
 
 ## 2 Captures
@@ -52,12 +54,17 @@ No `sdrtop` fields. How sdrtop uses the `core` ones:
 
 ## 3 Annotations
 
-No `sdrtop` fields. Every annotation sdrtop writes marks a moment, so each
-has `core:sample_count` 0, and `core:generator` is `sdrtop`. The labels:
+No `sdrtop` fields. `core:generator` is `sdrtop`. Every annotation marks a
+moment, with `core:sample_count` 0, except `radio dropped N`, which marks the
+stretch a drop inside the radio is known to lie in: such a drop leaves no mark
+in the stream, so it is placed between two readings of the radio's count, and
+the first reading of a recording may bracket a little from before it began.
+The labels:
 
 | `core:label` | at | `core:comment` says |
 |---|---|---|
 | `lost N` | the first sample after a hole | how many samples are missing, how long that is, and how many of them the driver dropped, the queue refused, or nobody explained |
 | `tuned F MHz` | the first sample at a new frequency | that the radio's settling is not in the file |
 | `gain` | the first block after a gain change | the new chain, set by the time the block arrived, not necessarily applied by the radio at that sample |
+| `radio dropped N` | the stretch the drops lie in, with its `core:sample_count` | that the radio dropped samples N times somewhere in the stretch, the longest in ms, and that the samples either side are joined in the file |
 | `stopped` | the end of the file | why the recording ended |

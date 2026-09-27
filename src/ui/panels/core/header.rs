@@ -152,8 +152,9 @@ fn top_band_gap(
 
 /// The recording chip, while an IQ recording runs: `● REC 12.4 s · 496 MB`,
 /// a second chip in the warning colour, `lost 3.2 ms`, from the first missing
-/// sample on, and `short 31 %` when the radio delivers less than its rate
-/// without reporting it. Empty otherwise.
+/// sample on, `radio dropped 7` when the radio counted drops of its own, and
+/// `short 31 %` when the radio delivers less than its rate without reporting
+/// it. Empty otherwise.
 ///
 /// The length is the file's, samples over rate, not the wall clock's: a
 /// recording that lost blocks is shorter than the time it ran, and the chip
@@ -188,6 +189,11 @@ fn record_chips(state: &SdrMetrics, theme: &crate::Theme) -> Vec<Span<'static>> 
             format!(" lost {:.1} ms ", p.lost as f64 / p.rate_hz.max(1.0) * 1e3),
             theme.status_warn,
         ));
+    }
+    // Drops the radio counted in itself: in the file as marked stretches.
+    if let Some(n) = p.radio_drops.filter(|&n| n > 0) {
+        spans.push(Span::raw(" "));
+        spans.push(chip(format!(" radio dropped {n} "), theme.status_warn));
     }
     // Samples the radio never delivered and never reported: the file's
     // positions are not its times.
@@ -1587,6 +1593,7 @@ mod tests {
             bytes: 496_000_000,
             lost: 0,
             short: None,
+            radio_drops: None,
             ended: None,
         };
         m.record.current = Some(p.clone());
@@ -1603,6 +1610,12 @@ mod tests {
         let out = crate::state::fixture::draw(HeaderPanel, 120, 5, &m).join("\n");
         assert!(out.contains("lost 3.2 ms"), "{out}");
         assert!(!out.contains("short"), "{out}");
+
+        p.radio_drops = Some(7);
+        m.record.current = Some(p.clone());
+        let out = crate::state::fixture::draw(HeaderPanel, 140, 5, &m).join("\n");
+        assert!(out.contains("radio dropped 7"), "{out}");
+        p.radio_drops = Some(0);
 
         p.short = Some(0.31);
         m.record.current = Some(p.clone());
