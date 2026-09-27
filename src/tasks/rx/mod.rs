@@ -78,7 +78,7 @@ pub fn spawn_rx_task(
             let now = Instant::now();
 
             hw_rx_active =
-                control::note_unexpected_stop(&state, &device, hw_rx_active, hw_streaming);
+                control::note_unexpected_stop(&state, &device, &rx_ctx, hw_rx_active, hw_streaming);
 
             let drained = poll::drain(&state, &rx_ctx, now, hw_streaming);
             // `[S]` retunes the rate mid-stream. Averaging across that would
@@ -414,5 +414,47 @@ mod power_control_tests {
             .log
             .iter()
             .any(|entry| entry.text.contains("cleaning up") && entry.text.contains("stop failed")));
+    }
+
+    /// **A recording ends with its stream**, whether the user stopped it or
+    /// it stopped on its own: the tap is let go, so the writer closes the
+    /// file saying why instead of waiting, armed, for blocks that will not
+    /// come.
+    #[test]
+    fn a_stream_that_stops_lets_the_recording_go() {
+        let state = Arc::new(Mutex::new(SdrMetrics::fixture()));
+        let device = Arc::new(TestDevice::new());
+        let dyn_device: Arc<dyn SdrDevice> = device.clone();
+        let ctx = context(&state);
+        let arm = || {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            ctx.record.arm(tx);
+            rx
+        };
+
+        let _rx = arm();
+        let mut tp = Throughput::default();
+        let mut rate = metrics::RateTracker::default();
+        assert!(!control::apply_rx_request(
+            &state,
+            &dyn_device,
+            &ctx,
+            &mut tp,
+            &mut rate,
+            false,
+            true
+        ));
+        assert!(!ctx.record.armed(), "asked to stop");
+
+        let _rx = arm();
+        state.lock().unwrap().radio.rx_enabled = true;
+        assert!(!control::note_unexpected_stop(
+            &state,
+            &dyn_device,
+            &ctx,
+            true,
+            false
+        ));
+        assert!(!ctx.record.armed(), "stopped on its own");
     }
 }

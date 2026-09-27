@@ -34,6 +34,14 @@ pub struct BlockAt {
     pub driver_dropped: u64,
     pub centre_hz: u64,
     pub rate_hz: f64,
+    /// When the block reached sdrtop, on the system clock, in Unix seconds.
+    ///
+    /// **The one account of time that does not come from the sample count.**
+    /// A radio that delivers fewer samples than its rate and reports no drop
+    /// (a HackRF short of USB bandwidth does exactly that) leaves positions
+    /// that look unbroken and a count that runs slow; only a clock read as
+    /// the blocks arrive can tell.
+    pub arrived_unix: f64,
 }
 
 /// What travels to the writer.
@@ -136,6 +144,7 @@ mod tests {
             driver_dropped: 0,
             centre_hz: 100_000_000,
             rate_hz: 2e6,
+            arrived_unix: 0.0,
         }
     }
 

@@ -24,6 +24,8 @@ Welcome. This is the plain-language guide to using sdrtop.
 - **[The Lab presets](lab.md)**: what each measurement means and how to act on it
 - **[The NET section](net.md)**: the 2.4 GHz band, BLE and classic Bluetooth:
   what each view answers, and how far each number can be trusted
+- **[Recording the IQ stream](recording.md)**: `Ctrl+R`, the SigMF files it
+  writes, and how a recording says what it lost
 - **[How the demodulator works](demodulator.md)**: the signal chain behind the
   FM, RDS, CTCSS and AM readings, written from scratch in Rust
 - **[Tips and Tricks](tips-and-tricks.md)**: setting gain, pulling weak signals

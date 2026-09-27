@@ -62,12 +62,15 @@ pub(super) fn unexpected_stop(
 pub(super) fn note_unexpected_stop(
     state: &Arc<Mutex<SdrMetrics>>,
     device: &Arc<dyn SdrDevice>,
+    rx_ctx: &Arc<RxContext>,
     hw_rx_active: bool,
     hw_streaming: bool,
 ) -> bool {
     let Some(_) = unexpected_stop(hw_rx_active, hw_streaming, || device.stop_rx()) else {
         return hw_rx_active;
     };
+    // A recording of a stream that has ended is finished, not paused.
+    rx_ctx.record.disarm();
     let mut m = state.lock().unwrap_or_else(|e| e.into_inner());
     m.radio.rx_enabled = false;
     m.radio.hw_streaming = false;
@@ -115,6 +118,9 @@ pub(super) fn apply_rx_request(
             false
         }
         RxRequestTransition::Stopped(result) => {
+            // The recording ends with its stream; the writer says so in the
+            // file once it has written what was queued.
+            rx_ctx.record.disarm();
             rate.reset();
             let mut m = state.lock().unwrap_or_else(|e| e.into_inner());
             m.radio.rx_start_time = None;

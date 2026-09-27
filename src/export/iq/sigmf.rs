@@ -30,7 +30,6 @@ pub struct Header {
     pub bytes_per_pair: u64,
     pub hw: String,
     pub description: String,
-    pub started_unix: f64,
     pub full_scale: f32,
     pub bits: u8,
     pub stack: Option<String>,
@@ -64,7 +63,7 @@ pub fn gain_text(caps: &DeviceCapabilities, gains: &[f64], boost: bool) -> Strin
 
 impl Header {
     /// The header for a recording starting now, or why there cannot be one.
-    pub fn from_state(state: &SdrMetrics, started_unix: f64) -> Result<Header, String> {
+    pub fn from_state(state: &SdrMetrics) -> Result<Header, String> {
         if state.caps.acquisition != AcquisitionKind::IqSamples {
             return Err("this radio delivers power traces, not IQ samples".to_string());
         }
@@ -91,7 +90,6 @@ impl Header {
                 "recorded by sdrtop from the {} layout",
                 state.ui.active_preset
             ),
-            started_unix,
             full_scale: geometry.full_scale,
             bits: geometry.bits(),
             stack: state
@@ -158,6 +156,13 @@ pub fn meta(header: &Header, rec: &Recording, stop: Option<&Stop>) -> String {
     put("sdrtop:lost_driver", json!(rec.lost_driver));
     put("sdrtop:lost_queue", json!(rec.lost_queue));
     put("sdrtop:lost_unexplained", json!(rec.lost_unexplained));
+    put("sdrtop:wall_seconds", json!(rec.wall_seconds()));
+    if let Some(hz) = rec.delivered_hz() {
+        put("sdrtop:delivered_rate", json!(hz));
+    }
+    if let Some(sentence) = rec.shortfall_sentence() {
+        put("sdrtop:shortfall", json!(sentence));
+    }
 
     let captures: Vec<Value> = rec
         .segments
@@ -167,7 +172,7 @@ pub fn meta(header: &Header, rec: &Recording, stop: Option<&Stop>) -> String {
                 "core:sample_start": s.sample_start,
                 "core:global_index": s.global_index,
                 "core:frequency": s.frequency_hz,
-                "core:datetime": datetime(header.started_unix + s.global_index as f64 / header.sample_rate),
+                "core:datetime": datetime(s.arrived_unix),
             })
         })
         .collect();
@@ -206,7 +211,6 @@ mod tests {
             bytes_per_pair: 2,
             hw: "HackRF One, serial 0000".to_string(),
             description: "recorded by sdrtop from the lab_iq layout".to_string(),
-            started_unix: 1_790_500_000.25,
             full_scale: 128.0,
             bits: 8,
             stack: Some("libhackrf 2024.02.1".to_string()),
@@ -223,8 +227,11 @@ mod tests {
             driver_dropped: 0,
             centre_hz: 2_441_000_000,
             rate_hz: 1e6,
+            arrived_unix: T0 + (first_pair + pairs) as f64 / 1e6,
         }
     }
+
+    const T0: f64 = 1_790_500_000.25;
 
     /// Fixed points, including the fraction's carry.
     #[test]
@@ -242,10 +249,10 @@ mod tests {
         assert_eq!(datatype(SampleFormat::Int16), "ci16_le");
     }
 
-    /// The document parses, has the three objects SigMF requires, and a
-    /// second segment's time is the first's plus its distance in the stream.
+    /// The document parses, has the three objects SigMF requires, and each
+    /// segment's time is when its first block arrived.
     #[test]
-    fn the_meta_is_valid_json_with_every_segment_timed_from_the_stream() {
+    fn the_meta_is_valid_json_with_every_segment_timed_by_its_arrival() {
         let mut rec = Recording::new(1e6, 2, Limits::DEFAULT);
         rec.block(&at(0, 1_000), "LNA=16,VGA=20, amp off");
         rec.refused(&at(1_000, 500_000));
@@ -256,10 +263,10 @@ mod tests {
         assert!(doc["global"].get("sdrtop:stopped").is_none());
         let caps = doc["captures"].as_array().unwrap();
         assert_eq!(caps.len(), 2);
-        assert_eq!(caps[0]["core:datetime"], "2026-09-27T09:06:40.250000Z");
+        assert_eq!(caps[0]["core:datetime"], "2026-09-27T09:06:40.251000Z");
         assert_eq!(caps[1]["core:sample_start"], 1_000);
         assert_eq!(caps[1]["core:global_index"], 501_000);
-        assert_eq!(caps[1]["core:datetime"], "2026-09-27T09:06:40.751000Z");
+        assert_eq!(caps[1]["core:datetime"], "2026-09-27T09:06:40.752000Z");
         assert_eq!(doc["annotations"][0]["core:label"], "lost 500000");
 
         rec.finish(&Stop::Asked);
@@ -282,8 +289,14 @@ mod tests {
     #[test]
     fn the_extension_document_and_the_fields_written_agree() {
         let doc_text = include_str!("../../../user_docs/sdrtop.sigmf-ext.md");
+        // Every optional field present: a recording long enough to state its
+        // delivered rate, from a radio running short.
         let mut rec = Recording::new(1e6, 2, Limits::DEFAULT);
-        rec.block(&at(0, 10), "");
+        for k in 0..30u64 {
+            let mut b = at(k * 100_000, 100_000);
+            b.arrived_unix = T0 + (k + 1) as f64 * 0.2;
+            rec.block(&b, "");
+        }
         let written: Value =
             serde_json::from_str(&meta(&header(), &rec, Some(&Stop::Asked))).unwrap();
         let mut ours: Vec<String> = written["global"]

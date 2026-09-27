@@ -146,6 +146,10 @@ pub fn process_block(
                 driver_dropped: dropped_pairs,
                 centre_hz,
                 rate_hz,
+                arrived_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
             },
             buf,
             gains,

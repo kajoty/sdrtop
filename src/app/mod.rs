@@ -33,7 +33,6 @@ pub(crate) type FocusKeys = HashMap<char, Vec<&'static str>>;
 pub struct App {
     pub(super) state: Arc<Mutex<SdrMetrics>>,
     pub(super) device: Option<Arc<dyn SdrDevice>>,
-    #[allow(dead_code)]
     pub(super) rx_ctx: Option<Arc<RxContext>>,
     pub(super) config_path: Option<PathBuf>,
     pub(super) events: EventStream,
@@ -65,6 +64,11 @@ pub struct App {
     /// only way `save_config` can carry it forward is to hold the loaded
     /// value, the same reasoning `tinysa_config` already follows.
     pub(super) net_config: crate::config::NetSettings,
+    /// The `[record]` block as loaded, carried forward for the same reason.
+    pub(super) record_config: crate::config::RecordSettings,
+    /// The IQ recording `Ctrl+R` started, while its writer may still be at
+    /// work. See `export::iq`.
+    pub(super) recorder: Option<crate::export::iq::Recorder>,
 }
 
 impl App {
@@ -117,7 +121,13 @@ impl App {
                         // handlers as a plain `c` before, and focused a panel.
                         self.restore_noise_sweep();
                         self.restore_sweep_tuning();
+                        self.end_recording();
                         return Ok(());
+                    } else if Self::is_record_key(key) {
+                        // Before the handlers: they match the character
+                        // alone, and a plain `r` resets every setting.
+                        self.toggle_recording();
+                        true
                     } else {
                         match input::handle_key(
                             key,
@@ -133,6 +143,7 @@ impl App {
                                         return Err(self.forced_option_quit_error());
                                     }
                                 } else {
+                                    self.end_recording();
                                     self.finish_session()?;
                                     return Ok(());
                                 }
@@ -194,6 +205,67 @@ impl App {
     fn is_unsaved_quit_key(key: KeyEvent) -> bool {
         matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    /// `Ctrl+R`: start or stop recording the raw IQ stream.
+    fn is_record_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    /// Start a recording, or stop the one running, and say in the log what
+    /// happened either way.
+    fn toggle_recording(&mut self) {
+        let running = {
+            let m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            m.record.current.as_ref().is_some_and(|p| p.ended.is_none())
+        };
+        let log = |msg: String| {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_log(msg);
+        };
+        if running {
+            if let Some(recorder) = &self.recorder {
+                recorder.stop();
+                log("IQ: stopping, writing what was already queued".to_string());
+            }
+            return;
+        }
+        let Some(ctx) = self.rx_ctx.as_ref() else {
+            log("IQ: not recording: another program holds this radio, and sdrtop is only watching it".to_string());
+            return;
+        };
+        let dir = crate::export::destination::default_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log(format!(
+                "IQ: not recording: cannot use {}: {e}",
+                dir.display()
+            ));
+            return;
+        }
+        let (limits, notes) = self.record_config.limits();
+        for note in notes {
+            log(format!("IQ: {note}"));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        match crate::export::iq::Recorder::start(&self.state, &ctx.record, &dir, limits, now) {
+            Ok(recorder) => self.recorder = Some(recorder),
+            Err(why) => log(format!("IQ: not recording: {why}")),
+        }
+    }
+
+    /// On the way out: stop a recording and wait for its last write, so the
+    /// file on disk says `finished` and why.
+    fn end_recording(&mut self) {
+        if let Some(recorder) = self.recorder.take() {
+            recorder.stop();
+            recorder.finish();
+        }
     }
 
     fn is_option_quit_key(key: KeyEvent) -> bool {
@@ -516,6 +588,7 @@ impl App {
             },
             tinysa: self.tinysa_config.clone(),
             net: self.net_config.clone(),
+            record: self.record_config.clone(),
             presets: self.user_presets.clone(),
         };
         let mut candidate = cfg.clone();
@@ -539,6 +612,35 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    /// `Ctrl+R` is the recorder's, and a plain `r` is not: the handlers
+    /// match the character alone, and `r` resets every setting.
+    #[test]
+    fn ctrl_r_is_the_record_key_and_r_is_not() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(App::is_record_key(ctrl('r')));
+        assert!(App::is_record_key(ctrl('R')));
+        assert!(!App::is_record_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE
+        )));
+        assert!(!App::is_record_key(KeyEvent::new(
+            KeyCode::Char('R'),
+            KeyModifiers::SHIFT
+        )));
+    }
+
+    /// **And it is answered before any handler sees it.** The loop is not
+    /// driven in a test, so its order is read from the source, the same way
+    /// the registry's tests read the preset files.
+    #[test]
+    fn the_record_key_is_taken_before_the_key_handlers() {
+        let source = include_str!("mod.rs");
+        let run = &source[source.find("pub fn run<").unwrap()..];
+        let record = run.find("Self::is_record_key(key)").unwrap();
+        let handlers = run.find("input::handle_key(").unwrap();
+        assert!(record < handlers, "Ctrl+R would reach the handlers as r");
+    }
     use super::*;
     use crate::hardware::{DeviceCapabilities, DeviceInfo, RateSet};
     use crate::state::DeviceOptionUpdate;

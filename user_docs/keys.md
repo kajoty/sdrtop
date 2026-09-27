@@ -85,6 +85,7 @@ each layout, and the footer shows the numbers for the section you are in.
 | `Esc` | Leave panel focus, or open the menu when nothing is focused |
 | `Tab` | Show or hide the footer bar |
 | `q` | Quit and save settings |
+| `Ctrl+R` | Record the raw IQ stream to a SigMF file pair, or stop ([recording](recording.md)) |
 
 `q` **saves**. Quitting is how your frequency, gains, markers and sweep band
 persist to the [config file](config.md); `Ctrl+C` exits without saving anything.

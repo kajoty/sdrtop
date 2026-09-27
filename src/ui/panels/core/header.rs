@@ -150,6 +150,57 @@ fn top_band_gap(
     (inner_width as usize).saturating_sub(left + right)
 }
 
+/// The recording chip, while an IQ recording runs: `● REC 12.4 s · 496 MB`,
+/// a second chip in the warning colour, `lost 3.2 ms`, from the first missing
+/// sample on, and `short 31 %` when the radio delivers less than its rate
+/// without reporting it. Empty otherwise.
+///
+/// The length is the file's, samples over rate, not the wall clock's: a
+/// recording that lost blocks is shorter than the time it ran, and the chip
+/// beside it says by how much.
+fn record_chips(state: &SdrMetrics, theme: &crate::Theme) -> Vec<Span<'static>> {
+    let Some(p) = state.record.current.as_ref().filter(|p| p.ended.is_none()) else {
+        return Vec::new();
+    };
+    let chip = |text: String, bg: Color| {
+        Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Rgb(15, 4, 4))
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let secs = p.pairs as f64 / p.rate_hz.max(1.0);
+    let mut spans = vec![
+        Span::raw("  "),
+        chip(
+            format!(
+                " \u{25cf} REC {secs:.1} s \u{b7} {:.0} MB ",
+                p.bytes as f64 / 1e6
+            ),
+            theme.status_crit,
+        ),
+    ];
+    if p.lost > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(chip(
+            format!(" lost {:.1} ms ", p.lost as f64 / p.rate_hz.max(1.0) * 1e3),
+            theme.status_warn,
+        ));
+    }
+    // Samples the radio never delivered and never reported: the file's
+    // positions are not its times.
+    if let Some(short) = p.short {
+        spans.push(Span::raw(" "));
+        spans.push(chip(
+            format!(" short {:.0} % ", short * 100.0),
+            theme.status_warn,
+        ));
+    }
+    spans
+}
+
 fn top_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> Line<'static> {
     use ratatui::style::Color;
 
@@ -239,6 +290,8 @@ fn top_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
 
     // --- Gap ---
     let board_len = state.system.board_name.chars().count();
+    let recording = record_chips(state, theme);
+    let recording_len: usize = recording.iter().map(|s| s.content.chars().count()).sum();
     let gap = top_band_gap(
         board_len,
         badge_len,
@@ -246,9 +299,10 @@ fn top_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
         state.caps.gain.has_boost().then(|| amp_val.chars().count()),
         usb_val.chars().count(),
         inner_width,
-    );
+    )
+    .saturating_sub(recording_len);
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(
             format!(" {} ", state.system.board_name),
@@ -265,6 +319,9 @@ fn top_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
                 .bg(badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
+    ];
+    spans.extend(recording);
+    spans.extend([
         Span::raw("  "),
         Span::styled(fw_label, Style::default().fg(theme.label)),
         Span::styled(fw_val.to_string(), Style::default().fg(fw_color)),
@@ -295,7 +352,8 @@ fn top_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
         Span::styled("USB ", Style::default().fg(theme.label)),
         Span::styled(usb_val, Style::default().fg(usb_color)),
         Span::raw("  "),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 /// Compact frequency label for the tuning-range end-caps: "1M", "145M", "1.8G",
@@ -1514,5 +1572,46 @@ mod tests {
         let out = crate::state::fixture::draw(HeaderPanel, 100, 5, &plain).join("\n");
         assert!(out.contains(" 6G "), "{out}");
         assert!(!out.contains("2400"), "{out}");
+    }
+
+    /// While recording, the header says so with the file's own length and
+    /// size, and from the first missing sample, how much is missing. Nothing
+    /// once it has ended: the log says why.
+    #[test]
+    fn a_recording_shows_its_length_and_what_it_lost_in_the_header() {
+        let mut m = SdrMetrics::fixture().streaming();
+        let mut p = crate::state::RecordProgress {
+            path: std::path::PathBuf::from("iq.sigmf-data"),
+            rate_hz: 20e6,
+            pairs: 248_000_000,
+            bytes: 496_000_000,
+            lost: 0,
+            short: None,
+            ended: None,
+        };
+        m.record.current = Some(p.clone());
+        let out = crate::state::fixture::draw(HeaderPanel, 120, 5, &m).join("\n");
+        assert!(out.contains("\u{25cf} REC 12.4 s \u{b7} 496 MB"), "{out}");
+        assert!(!out.contains("lost"), "{out}");
+        assert!(
+            out.contains("USB"),
+            "the right-hand fields still fit: {out}"
+        );
+
+        p.lost = 64_000;
+        m.record.current = Some(p.clone());
+        let out = crate::state::fixture::draw(HeaderPanel, 120, 5, &m).join("\n");
+        assert!(out.contains("lost 3.2 ms"), "{out}");
+        assert!(!out.contains("short"), "{out}");
+
+        p.short = Some(0.31);
+        m.record.current = Some(p.clone());
+        let out = crate::state::fixture::draw(HeaderPanel, 140, 5, &m).join("\n");
+        assert!(out.contains("short 31 %"), "{out}");
+
+        p.ended = Some("stopped by the user".to_string());
+        m.record.current = Some(p);
+        let out = crate::state::fixture::draw(HeaderPanel, 120, 5, &m).join("\n");
+        assert!(!out.contains("REC"), "{out}");
     }
 }

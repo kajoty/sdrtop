@@ -194,6 +194,62 @@ impl Default for NetSettings {
     }
 }
 
+/// `[record]`: how long an IQ recording may run, whichever limit comes first.
+///
+/// No in-app control changes these, so `App` holds the loaded block and
+/// writes it back as it was, the way it holds `[net]`.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct RecordSettings {
+    #[serde(default = "default_record_seconds")]
+    pub max_seconds: f64,
+    #[serde(default = "default_record_gb")]
+    pub max_gb: f64,
+}
+
+fn default_record_seconds() -> f64 {
+    crate::export::iq::recording::Limits::DEFAULT.max_secs
+}
+
+fn default_record_gb() -> f64 {
+    crate::export::iq::recording::Limits::DEFAULT.max_bytes as f64 / 1e9
+}
+
+impl Default for RecordSettings {
+    fn default() -> Self {
+        Self {
+            max_seconds: default_record_seconds(),
+            max_gb: default_record_gb(),
+        }
+    }
+}
+
+impl RecordSettings {
+    /// The limits a recording runs to, and a sentence for each value that
+    /// could not be one and was replaced by its default.
+    pub fn limits(&self) -> (crate::export::iq::recording::Limits, Vec<String>) {
+        let mut notes = Vec::new();
+        let mut pick = |name: &str, v: f64, default: f64| {
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                notes.push(format!(
+                    "[record] {name} = {v} is not a limit, using {default}"
+                ));
+                default
+            }
+        };
+        let secs = pick("max_seconds", self.max_seconds, default_record_seconds());
+        let gb = pick("max_gb", self.max_gb, default_record_gb());
+        (
+            crate::export::iq::recording::Limits {
+                max_secs: secs,
+                max_bytes: (gb * 1e9) as u64,
+            },
+            notes,
+        )
+    }
+}
+
 fn default_tinysa_points() -> u32 {
     450
 }
@@ -250,6 +306,8 @@ pub struct AppConfig {
     pub sweep: SweepSettings,
     #[serde(default)]
     pub net: NetSettings,
+    #[serde(default)]
+    pub record: RecordSettings,
     #[serde(default)]
     pub tinysa: TinySaSettings,
     /// User-defined layout presets, merged into the built-in set at startup.
@@ -844,6 +902,27 @@ panels = [
         let restored: AppConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(restored.radio.gain.as_deref(), Some("LNA=24,VGA=30"));
         assert_eq!(restored.display.active_preset, "spectrum");
+    }
+
+    /// `[record]` defaults to 60 s or 4 GB, survives a save, and a value
+    /// that cannot be a limit is replaced by its default and named.
+    #[test]
+    fn record_settings_default_round_trip_and_refuse_nonsense() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        let (limits, notes) = cfg.record.limits();
+        assert_eq!((limits.max_secs, limits.max_bytes), (60.0, 4_000_000_000));
+        assert!(notes.is_empty());
+
+        let cfg: AppConfig = toml::from_str("[record]\nmax_seconds = 5.5").unwrap();
+        let back: AppConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.record.max_seconds, 5.5);
+        assert_eq!(back.record.max_gb, 4.0);
+
+        let cfg: AppConfig = toml::from_str("[record]\nmax_seconds = -1.0\nmax_gb = 0.0").unwrap();
+        let (limits, notes) = cfg.record.limits();
+        assert_eq!((limits.max_secs, limits.max_bytes), (60.0, 4_000_000_000));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("max_seconds = -1"), "{notes:?}");
     }
 
     #[test]

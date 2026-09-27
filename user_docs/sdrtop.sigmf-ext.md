@@ -28,6 +28,9 @@ RTL-SDR, `ci16_le` through SoapySDR) and a `.sigmf-meta` file beside it.
 | `sdrtop:lost_driver` | true | uint | Samples the radio's driver reported it dropped. |
 | `sdrtop:lost_queue` | true | uint | Samples sdrtop could not hand to the disk in time, because the queue in front of it was full. |
 | `sdrtop:lost_unexplained` | true | uint | Samples missing from the stream that nobody reported. Normally zero; counted, not assigned to a cause. |
+| `sdrtop:wall_seconds` | true | double | System-clock seconds from the first block to the last. |
+| `sdrtop:delivered_rate` | false | double | Samples per second the stream actually advanced by against the system clock, reported drops included. Present once the recording has spanned two seconds. |
+| `sdrtop:shortfall` | false | string | Present when `sdrtop:delivered_rate` is more than 1 % below `core:sample_rate`: the radio delivered fewer samples than its rate and reported no drop. The missing samples are somewhere in the file, at places nothing recorded, so a sample's position divided by the rate is **not** its time. A HackRF that USB cannot keep up with does this. |
 
 ## 2 Captures
 
@@ -41,12 +44,11 @@ No `sdrtop` fields. How sdrtop uses the `core` ones:
 - `core:frequency` is the frequency sdrtop had set when the block arrived.
   The radio's own settling after a retune is not measured and not in the
   file.
-- `core:datetime` of the first segment is the system clock when the first
-  block reached sdrtop, which is after the driver's own buffering: late by up
-  to one block. Every later segment's time is the first one's plus its
-  `core:global_index` divided by the sample rate, so the segments agree with
-  each other to the sample, and with the wall clock only as well as the
-  first one does.
+- `core:datetime` is the system clock when the block holding the segment's
+  first sample reached sdrtop: measured for every segment, never worked out
+  from the sample count, because a radio can deliver fewer samples than its
+  rate without saying so (`sdrtop:shortfall`). It is after the driver's own
+  buffering, so late by up to a block, a few milliseconds.
 
 ## 3 Annotations
 

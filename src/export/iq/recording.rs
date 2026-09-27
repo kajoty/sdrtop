@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 MusiThang <viktor.laszlo92@protonmail.com>
 
-//! What a recording knows about itself, decided from block positions alone.
+//! What a recording knows about itself, decided from what each block carries.
 //!
-//! No file, no clock, no lock: the writer hands each message here, is told
-//! how many pairs of it to write and whether to stop, and writes. So every
-//! rule about segments, losses and limits is tested with integers.
+//! No file, no clock of its own, no lock: the writer hands each message here,
+//! is told how many pairs of it to write and whether to stop, and writes. So
+//! every rule about segments, losses, limits and time is tested with numbers.
+//!
+//! **Two accounts of time, kept apart.** Positions count the samples the
+//! driver says it delivered or dropped; each block's arrival on the system
+//! clock is the other. Where they disagree, the radio delivered fewer samples
+//! than its rate without saying so, and the recording says it instead.
+
+/// The wall time a recording must span before its delivered rate is stated:
+/// blocks arrive in bursts a few milliseconds apart, so a shorter span would
+/// measure the bursts.
+const MIN_WALL_S: f64 = 2.0;
+
+/// How far short of its rate the radio may run before the recording says so.
+/// Arrival jitter over [`MIN_WALL_S`] is a few tenths of a percent; a real
+/// shortfall on a starved USB link is tens of percent.
+const SHORT_TOLERANCE: f64 = 0.01;
 
 use crate::hardware::record_tap::BlockAt;
 
@@ -16,6 +31,9 @@ pub struct Segment {
     pub sample_start: u64,
     pub global_index: u64,
     pub frequency_hz: u64,
+    /// When the block holding this segment's first sample reached sdrtop, on
+    /// the system clock: measured, never extrapolated from the sample count.
+    pub arrived_unix: f64,
 }
 
 /// One SigMF annotation. Every one sdrtop writes marks a moment, so each
@@ -127,6 +145,10 @@ pub struct Recording {
     /// The hole the next written block will close: driver, queue, unexplained.
     pending: (u64, u64, u64),
     gain: Option<String>,
+    /// `(arrival, stream position at the block's end)` for the first and
+    /// the latest message, for the delivered rate.
+    first_seen: Option<(f64, u64)>,
+    last_seen: Option<(f64, u64)>,
 }
 
 impl Recording {
@@ -147,7 +169,47 @@ impl Recording {
             lost_unexplained: 0,
             pending: (0, 0, 0),
             gain: None,
+            first_seen: None,
+            last_seen: None,
         }
+    }
+
+    /// System-clock seconds from the first block to the latest.
+    pub fn wall_seconds(&self) -> f64 {
+        match (self.first_seen, self.last_seen) {
+            (Some(a), Some(b)) => (b.0 - a.0).max(0.0),
+            _ => 0.0,
+        }
+    }
+
+    /// Samples per second the stream actually advanced by, drops the driver
+    /// reported included, against the system clock. `None` until the
+    /// recording has run long enough to say.
+    pub fn delivered_hz(&self) -> Option<f64> {
+        let (a, b) = (self.first_seen?, self.last_seen?);
+        let wall = b.0 - a.0;
+        (wall >= MIN_WALL_S).then(|| (b.1 - a.1) as f64 / wall)
+    }
+
+    /// The fraction of its rate the radio did not deliver, when that is past
+    /// [`SHORT_TOLERANCE`] and nothing reported it.
+    pub fn shortfall(&self) -> Option<f64> {
+        let short = 1.0 - self.delivered_hz()? / self.rate_hz;
+        (short > SHORT_TOLERANCE).then_some(short)
+    }
+
+    /// What a shortfall means for the file, as a sentence.
+    pub fn shortfall_sentence(&self) -> Option<String> {
+        let short = self.shortfall()?;
+        Some(format!(
+            "the radio delivered {:.1} % of its {:.3} Msps over {:.1} s of wall time and reported no drop: \
+             {:.0} % of the samples are missing at places the file cannot show, so a sample's position \
+             is not its time; the capture segments' datetimes are measured and remain right",
+            (1.0 - short) * 100.0,
+            self.rate_hz / 1e6,
+            self.wall_seconds(),
+            short * 100.0
+        ))
     }
 
     pub fn bytes_written(&self) -> u64 {
@@ -166,6 +228,9 @@ impl Recording {
             self.origin = Some(at.first_pair);
             self.next = at.first_pair;
         }
+        let seen = (at.arrived_unix, at.first_pair + at.pairs);
+        self.first_seen.get_or_insert(seen);
+        self.last_seen = Some(seen);
         let gap = at.first_pair.checked_sub(self.next)?;
         let driver = gap.min(at.driver_dropped);
         self.pending.0 += driver;
@@ -214,6 +279,7 @@ impl Recording {
                 sample_start: self.written,
                 global_index,
                 frequency_hz: at.centre_hz,
+                arrived_unix: at.arrived_unix,
             });
         }
         if missing > 0 && self.written > 0 {
@@ -285,6 +351,8 @@ mod tests {
             driver_dropped: 0,
             centre_hz: 100_000_000,
             rate_hz: RATE,
+            // Delivered exactly at its rate, unless a test says otherwise.
+            arrived_unix: (first_pair + pairs) as f64 / RATE,
         }
     }
 
@@ -305,7 +373,8 @@ mod tests {
             vec![Segment {
                 sample_start: 0,
                 global_index: 0,
-                frequency_hz: 100_000_000
+                frequency_hz: 100_000_000,
+                arrived_unix: 7_100.0 / RATE,
             }]
         );
         assert!(r.annotations.is_empty());
@@ -330,7 +399,8 @@ mod tests {
             Segment {
                 sample_start: 500,
                 global_index: 1_000,
-                frequency_hz: 100_000_000
+                frequency_hz: 100_000_000,
+                arrived_unix: 1_500.0 / RATE,
             }
         );
         assert_eq!(
@@ -431,5 +501,37 @@ mod tests {
         );
         assert_eq!(Limits::DEFAULT.bytes(20e6, 2), 2_400_000_000);
         assert_eq!(Limits::DEFAULT.bytes(20e6, 4), 4_000_000_000);
+    }
+    /// **A radio short of its rate, with nothing reported**: the positions
+    /// run unbroken, only the clock shows the samples arrived at 69 % of the
+    /// rate, and the recording says so. A second segment's time is the clock
+    /// when it arrived, not its position over the rate.
+    #[test]
+    fn a_radio_that_delivers_less_than_its_rate_is_caught_by_the_clock() {
+        let mut r = roomy();
+        let short = |first_pair: u64| {
+            let mut b = at(first_pair, 1_000);
+            b.arrived_unix = (first_pair + 1_000) as f64 / (RATE * 0.69);
+            b
+        };
+        for k in 0..3_000 {
+            r.block(&short(k * 1_000), "");
+        }
+        assert_eq!(r.lost(), 0, "nothing reported a drop");
+        let delivered = r.delivered_hz().unwrap();
+        assert!((delivered / RATE - 0.69).abs() < 1e-9, "{delivered}");
+        assert!((r.shortfall().unwrap() - 0.31).abs() < 1e-9);
+        assert!(r.shortfall_sentence().unwrap().contains("69.0 %"));
+
+        let mut moved = short(3_000_000);
+        moved.centre_hz = 101_000_000;
+        r.block(&moved, "");
+        assert_eq!(r.segments[1].arrived_unix, 3_001_000.0 / (RATE * 0.69));
+
+        let mut on_time = roomy();
+        for k in 0..3_000 {
+            on_time.block(&at(k * 1_000, 1_000), "");
+        }
+        assert_eq!(on_time.shortfall(), None);
     }
 }

@@ -58,6 +58,10 @@ base = "nord"                        # see themes.md for the six palettes
 [net]
 bt_channels = 8            # classic Bluetooth channels given a receiver at once
 
+[record]
+max_seconds = 60.0         # an IQ recording stops at whichever limit comes first
+max_gb      = 4.0          # see recording.md
+
 [sweep]
 start_hz = 400000000       # scanner band start
 stop_hz  = 500000000       # scanner band end

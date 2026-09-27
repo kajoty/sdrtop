@@ -18,9 +18,6 @@
 //! says every loss up to its last second. A document written only at the end
 //! would leave gigabytes of samples nobody can place.
 
-// Started only by its tests until the key that starts it is bound.
-#![cfg_attr(not(test), allow(dead_code))]
-
 pub mod recording;
 pub mod sigmf;
 
@@ -48,7 +45,6 @@ const DISK_MARGIN_BYTES: u64 = 64 << 20;
 pub struct Recorder {
     tap: Arc<RecordTap>,
     asked: Arc<Mutex<Option<Stop>>>,
-    pub data_path: PathBuf,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -69,7 +65,7 @@ impl Recorder {
             if !m.radio.rx_enabled {
                 return Err("not streaming: start the radio with Space first".to_string());
             }
-            (Header::from_state(&m, now_unix)?, Arc::clone(&m.caps))
+            (Header::from_state(&m)?, Arc::clone(&m.caps))
         };
         let needed = limits.bytes(header.sample_rate, header.bytes_per_pair) + DISK_MARGIN_BYTES;
         let free = crate::export::destination::free_bytes(dir)?;
@@ -123,7 +119,6 @@ impl Recorder {
         Ok(Recorder {
             tap: Arc::clone(tap),
             asked,
-            data_path,
             thread: Some(thread),
         })
     }
@@ -137,12 +132,12 @@ impl Recorder {
         self.tap.disarm();
     }
 
-    /// Wait for the writer to finish. Tests only: the app never blocks on a
-    /// disk.
-    #[cfg(test)]
-    pub fn join(mut self) {
+    /// Wait for the writer to finish: at most what was queued, 32 MiB. Only
+    /// on the way out, where a finished file is worth a moment; while the app
+    /// runs it never waits for a disk.
+    pub fn finish(mut self) {
         if let Some(t) = self.thread.take() {
-            t.join().unwrap();
+            let _ = t.join();
         }
     }
 }
@@ -242,6 +237,7 @@ impl Writer {
             pairs: self.rec.written,
             bytes: self.rec.bytes_written(),
             lost: self.rec.lost(),
+            short: self.rec.shortfall(),
             ended: stop.map(Stop::sentence),
         }
     }
@@ -263,6 +259,9 @@ impl Writer {
                 self.rec.lost(),
                 self.data_path.display()
             ));
+            if let Some(sentence) = self.rec.shortfall_sentence() {
+                m.push_log(format!("IQ: {sentence}"));
+            }
         }
     }
 }
@@ -307,10 +306,23 @@ mod tests {
             driver_dropped: 0,
             centre_hz: 100_000_000,
             rate_hz: 1e6,
+            arrived_unix: NOW + (first_pair + pairs) as f64 / 1e6,
         }
     }
 
     const NOW: f64 = 1_790_500_000.0;
+
+    fn data_path_of(state: &Arc<Mutex<SdrMetrics>>) -> PathBuf {
+        state
+            .lock()
+            .unwrap()
+            .record
+            .current
+            .as_ref()
+            .unwrap()
+            .path
+            .clone()
+    }
 
     fn meta_of(data: &Path) -> Value {
         let text = std::fs::read_to_string(data.with_extension("sigmf-meta")).unwrap();
@@ -346,8 +358,8 @@ mod tests {
         tap.offer(at(100, 50), &too_big, vec![], false);
         tap.offer(at(150, 100), &second, gains, false);
         rec.stop();
-        let path = rec.data_path.clone();
-        rec.join();
+        let path = data_path_of(&state);
+        rec.finish();
 
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes, [first, second].concat());
@@ -380,8 +392,8 @@ mod tests {
         let rec = Recorder::start(&state, &tap, &dir, limits, NOW).unwrap();
         tap.offer(at(0, 100), &[1; 200], vec![], false);
         tap.offer(at(100, 100), &[2; 200], vec![], false);
-        let path = rec.data_path.clone();
-        rec.join();
+        let path = data_path_of(&state);
+        rec.finish();
         assert!(!tap.armed(), "a finished recording must not keep the feed");
         assert_eq!(std::fs::read(&path).unwrap().len(), 300);
         let meta = meta_of(&path);
@@ -436,8 +448,8 @@ mod tests {
             offering += t.elapsed();
         }
         rec.stop();
-        let path = rec.data_path.clone();
-        rec.join();
+        let path = data_path_of(&state);
+        rec.finish();
         let meta = meta_of(&path);
         eprintln!(
             "20 Msps for {seconds} s: {} of {} pairs refused by the queue; the callback spent {:.1} us an offer",
@@ -477,7 +489,7 @@ mod tests {
             .unwrap();
         assert!(err.contains("running already"), "{err}");
         rec.stop();
-        rec.join();
+        rec.finish();
 
         // One pair per second is the naming, and a name is never reused.
         let err = Recorder::start(&state, &tap, &dir, Limits::DEFAULT, NOW)

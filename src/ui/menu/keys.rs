@@ -248,6 +248,7 @@ pub const GLOBAL: &[(&str, &[Binding])] = &[
                 Footer::Tail("Menu"),
             ),
             f("Q", Some('q'), "quit, saving the config", Footer::Tail("Quit")),
+            b("Ctrl+R", None, "record the raw IQ stream, or stop"),
         ],
     ),
 ];

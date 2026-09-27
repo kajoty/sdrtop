@@ -24,6 +24,9 @@ pub struct RecordProgress {
     pub bytes: u64,
     /// Pairs missing from the file, of every cause.
     pub lost: u64,
+    /// The fraction of its rate the radio did not deliver without reporting
+    /// it, once that is past the recording's tolerance.
+    pub short: Option<f64>,
     /// Why it ended; `None` while it runs.
     pub ended: Option<String>,
 }
