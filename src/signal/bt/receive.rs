@@ -71,16 +71,6 @@ use super::header;
 /// the same GFSK chain as BLE").
 const SYMBOL_RATE_HZ: f64 = 1_000_000.0;
 
-/// Convert a count of this receiver's own symbols into CLK1-6 ticks
-/// (`header::CLOCK_HZ`, 3200 Hz) - exact integer arithmetic rather than a
-/// floating-point ratio that would drift: `SYMBOL_RATE_HZ / header::
-/// CLOCK_HZ == 312.5` symbols per tick, so 625 symbols is exactly 2 ticks,
-/// the smallest whole-symbol multiple, and every real symbol count this
-/// receiver ever produces is measured in exactly that unit.
-fn ticks_from_symbols(symbols: u64) -> i64 {
-    (symbols * 2 / 625) as i64
-}
-
 /// One access code found: its LAP, and when its last bit was sliced, in µs
 /// on the stream's own sample clock (net-ux-polish-plan 6.5). To a quarter
 /// symbol: the working-rate sample the lane sliced, not the symbol count,
@@ -102,17 +92,6 @@ pub struct AccessHit {
 pub struct HeaderHit {
     pub lap: u32,
     pub whitened: [bool; header::HEADER_BITS],
-    /// CLK1-6 ticks on the **stream's own clock**, counted from the start
-    /// of the stream - not from when this receiver was built, and not from
-    /// any particular header. `header::PiconetClock::observe` only ever
-    /// needs differences between these, but it needs them across receivers:
-    /// the worker rebuilds its fleet whenever the tuning moves or the feed
-    /// breaks, and a piconet's clock has to keep counting straight through
-    /// both. A count local to each receiver restarted at zero on every
-    /// rebuild and fell behind real time on every dropped block, and the
-    /// UAP narrowing, which divides elapsed time into clock ticks, then
-    /// discarded the right candidate on the strength of the wrong interval.
-    pub tick: i64,
     /// The raw, still-whitened bits captured immediately after the
     /// header, up to [`PAYLOAD_CAPTURE_BITS`] of them regardless of what
     /// packet type this header turns out to name - this lane has no way
@@ -169,11 +148,6 @@ fn same_packet(log: &[(u32, u64)], lap: u32, at: u64) -> bool {
 /// LAP it was for.
 struct PendingHeader {
     lap: u32,
-    /// This lane's own symbol count at the moment the access code that
-    /// triggered this capture completed - the trailer and header follow
-    /// starting at the very next symbol, so this is also the tick
-    /// [`HeaderHit::tick`] is measured from.
-    start_symbol: u64,
     /// Trailer bits first, header air bits next
     /// ([`HEADER_CAPTURE_BITS`] in total), the raw payload region after
     /// that ([`PAYLOAD_CAPTURE_BITS`] more, once [`Self::header_whitened`]
@@ -322,15 +296,11 @@ pub struct Receiver {
     /// How many symbols each lane has sliced since this receiver was built.
     /// Exact integer arithmetic, but only valid while the samples are
     /// unbroken - which is why the worker rebuilds the receiver at every
-    /// break, and why a hit's tick adds [`Self::anchor_symbols`].
+    /// break.
     lane_symbols: [u64; PHASES],
     /// Where on the stream's own clock this receiver's first sample sits, in
-    /// symbol periods: the stream position it was built at, converted. Adding
-    /// it turns this receiver's local count into the stream's.
-    anchor_symbols: u64,
-    /// The same anchor, exact, in µs: [`AccessHit::at_us`]'s origin. The
-    /// symbol anchor is rounded to a whole symbol, which a grid fitted to a
-    /// fraction of a microsecond cannot afford.
+    /// µs: [`AccessHit::at_us`]'s origin, exact, so a hit's time is the
+    /// stream's and not this receiver's.
     anchor_us: f64,
     /// The stream position of this receiver's first raw sample.
     first_pair: u64,
@@ -354,12 +324,7 @@ impl Receiver {
     ///
     /// `first_pair` is the stream position of the first block this receiver
     /// will be given ([`crate::hardware::StreamBlock::first_pair`]); it
-    /// anchors the receiver's symbol count to the stream's own clock. Its
-    /// conversion to symbols is rounded to the nearest one, so an anchor can
-    /// sit up to half a symbol - 0.16 % of a clock tick - off the true
-    /// position; it can move a hit across a tick boundary only when the hit
-    /// is already within half a microsecond of one, and `PiconetClock`
-    /// reseeds itself when an observation leaves it no candidate.
+    /// anchors the receiver's times to the stream's own clock.
     pub fn new(
         raw_rate: f64,
         ch: u8,
@@ -385,7 +350,6 @@ impl Receiver {
             lane: 0,
             detectors: [Detector::new(); PHASES],
             lane_symbols: [0; PHASES],
-            anchor_symbols: (first_pair as f64 * SYMBOL_RATE_HZ / raw_rate).round() as u64,
             anchor_us: first_pair as f64 * 1e6 / raw_rate,
             first_pair,
             recent_hits: Vec::new(),
@@ -490,7 +454,6 @@ impl Receiver {
                         headers.push(HeaderHit {
                             lap: pending.lap,
                             whitened,
-                            tick: ticks_from_symbols(self.anchor_symbols + pending.start_symbol),
                             payload_raw: pending.bits[HEADER_CAPTURE_BITS..].to_vec(),
                             ch: self.ch,
                             sync_end_pair: pending.sync_end_pair,
@@ -520,7 +483,6 @@ impl Receiver {
                 if self.pending[self.lane].is_none() {
                     self.pending[self.lane] = Some(PendingHeader {
                         lap,
-                        start_symbol: self.lane_symbols[self.lane],
                         bits: Vec::with_capacity(TOTAL_CAPTURE_BITS),
                         header_whitened: None,
                         sync_end_pair,
@@ -802,15 +764,20 @@ mod tests {
         assert_eq!(decoded.packet_type, header::PacketType::Dh1);
         assert_eq!(decoded.flags, flags);
 
-        // **The tick is on the stream's clock, not the receiver's.** The same
-        // samples, handed to a receiver built one second into the stream
-        // (20 million pairs at 20 Msps), put the same header exactly one
-        // second - 3200 CLK1-6 ticks - later. A receiver-local count put it
-        // at the same tick whenever the receiver happened to be rebuilt.
+        // **The time is on the stream's clock, not the receiver's.** The
+        // same samples, handed to a receiver built one second into the
+        // stream (20 million pairs at 20 Msps), put the same header exactly
+        // one second later. A receiver-local count put it at the same time
+        // whenever the receiver happened to be rebuilt, and a piconet's
+        // clock counts its slots across receivers.
         let mut later = Receiver::new(RAW_RATE, ch, TUNED_CENTRE, 20_000_000).unwrap();
         let (_, later_headers) = later.push(&bytes, geometry);
         assert_eq!(later_headers.len(), 1);
-        assert_eq!(later_headers[0].tick - hit.tick, 3200);
+        assert!(
+            (later_headers[0].at_us - hit.at_us - 1e6).abs() < 1e-6,
+            "{} us",
+            later_headers[0].at_us - hit.at_us
+        );
     }
 
     /// [`PAYLOAD_CAPTURE_BITS`]'s own doc claims it covers every packet

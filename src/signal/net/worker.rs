@@ -806,7 +806,7 @@ impl NetWorker {
                 let window = held(&recent, iq.as_deref().map(|v| (first_pair, v)));
                 for hit in &header_hits {
                     let clock = piconet_clocks.entry(hit.lap).or_default();
-                    clock.observe(hit.tick, &hit.whitened);
+                    clock.observe(hit.at_us, &hit.whitened);
                     // The UAPs still standing, each at the clocks the
                     // piconet's own clock gives it for this header: never the
                     // first clock that happens to fit, which about one
@@ -819,7 +819,7 @@ impl NetWorker {
                         .iter()
                         .flat_map(|&uap| {
                             clock
-                                .clocks_for(uap, hit.tick)
+                                .clocks_for(uap, hit.at_us)
                                 .into_iter()
                                 .map(move |clk6| (uap, clk6))
                         })
@@ -834,7 +834,7 @@ impl NetWorker {
                             match payload::break_uap_tie(&pairs, &hit.whitened, &hit.payload_raw) {
                                 Some((uap, clk6)) => {
                                     resolved_bt_uap.insert(hit.lap, uap);
-                                    clock.pin(hit.tick, clk6);
+                                    clock.pin(hit.at_us, clk6);
                                     (vec![uap], Some((uap, clk6)))
                                 }
                                 None => (standing, None),

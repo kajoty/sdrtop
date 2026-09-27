@@ -370,6 +370,10 @@ pub fn decode_with_uap(whitened: &[bool; HEADER_BITS], uap: u8) -> Option<Header
 #[allow(dead_code)]
 pub const CLOCK_HZ: f64 = 3200.0;
 
+/// One slot, 625 us: how often CLK1-6 steps. It is bits 1 to 6 of CLK, so
+/// it moves at half [`CLOCK_HZ`].
+pub const SLOT_US: f64 = 625.0;
+
 /// Narrows a piconet's own CLK1-6 *and* UAP together from several headers
 /// sharing one LAP, none individually trustworthy on its own - `libbtbb`'s
 /// own `btbb_uap_from_header` (`lib/src/bluetooth_piconet.c`), ported for
@@ -388,17 +392,32 @@ pub const CLOCK_HZ: f64 = 3200.0;
 /// something else about a piconet has to.
 ///
 /// **What actually breaks it: real elapsed time.** CLK1-6 does not reset
-/// between packets - it keeps advancing at [`CLOCK_HZ`]. `libbtbb`'s own
+/// between packets - it keeps advancing, **once a slot** ([`SLOT_US`]):
+/// CLK itself ticks at [`CLOCK_HZ`], but CLK1-6 is its bits 1 to 6 and so
+/// steps at half that. Counting it at the full CLK rate, as this port first
+/// did, eliminated the true hypothesis at the first header one slot on; on
+/// the air every piconet's candidates fell back to 32 again and again, and
+/// the headers' own ground truth (two real devices, their addresses read
+/// off them) showed the clock stepping once per 625 us. `libbtbb`'s own
 /// design keeps 64 *persistent* hypotheses, one per guess at the very
 /// first header's own CLK1-6, indexed by that guess rather than by the UAP
 /// it happened to produce. For every later header, hypothesis `count`
-/// predicts the *current* clock as `count` plus however many ticks have
+/// predicts the *current* clock as `count` plus however many slots have
 /// elapsed, and is kept only if that predicted clock still reproduces the
 /// exact UAP it committed to the first time. A wrong guess drifts out of
 /// step with the real header content packet after packet and is
 /// eliminated; the true guess, and only the true guess, keeps agreeing
-/// with itself forever. This needs the caller to know elapsed time in
-/// CLK1-6 ticks, not just that a header arrived.
+/// with itself forever. This needs the caller to know when each header
+/// arrived, on one clock.
+///
+/// **Slots are counted from the previous header, not the first.** Packets
+/// start on slot boundaries, so the time between two headers of one
+/// piconet is a whole number of slots give or take the transmitter's
+/// jitter, and rounding it is safe. Rounding the time since the *first*
+/// header is not: the two clocks, ours and the piconet's, drift apart by
+/// their crystals' difference, 16 ppm measured on one real device, which
+/// is half a slot in 20 seconds. Chained header to header, the drift in
+/// any one gap is a few microseconds.
 ///
 /// **The honest floor this reaches is two candidates, not one - measured,
 /// not assumed, and said so rather than quietly reported as a confirmed
@@ -421,9 +440,9 @@ pub const CLOCK_HZ: f64 = 3200.0;
 /// standing ([`Self::hypotheses`]) are shown beside what they say.
 #[allow(dead_code)]
 pub struct PiconetClock {
-    /// The tick the very first header this instance saw arrived on -
-    /// `None` until one has.
-    first_tick: Option<i64>,
+    /// When the last header arrived (us, on the stream's clock) and how many
+    /// slots after the first it was - `None` before the first header.
+    last: Option<(f64, i64)>,
     /// One candidate per possible CLK1-6 for that first header - `libbtbb`'s
     /// own `clock6_candidates`. `None` once eliminated.
     candidates: [Option<u8>; 64],
@@ -432,7 +451,7 @@ pub struct PiconetClock {
 impl Default for PiconetClock {
     fn default() -> Self {
         Self {
-            first_tick: None,
+            last: None,
             candidates: [None; 64],
         }
     }
@@ -461,11 +480,11 @@ impl PiconetClock {
     /// `uap`: the clocks a header arriving then can be read at under it.
     /// Usually one; two when two hypotheses with the same UAP survive, and
     /// then a header cannot be read with certainty.
-    pub fn clocks_for(&self, uap: u8, tick: i64) -> Vec<u8> {
-        let Some(first) = self.first_tick else {
+    pub fn clocks_for(&self, uap: u8, at_us: f64) -> Vec<u8> {
+        let Some(slot) = self.slot_at(at_us) else {
             return Vec::new();
         };
-        let elapsed = tick.wrapping_sub(first).rem_euclid(64) as usize;
+        let elapsed = slot.rem_euclid(64) as usize;
         let mut clocks: Vec<u8> = self
             .candidates
             .iter()
@@ -481,11 +500,11 @@ impl PiconetClock {
     /// Keep only the hypothesis whose clock at `tick` is `clk6`: a payload
     /// that checked out at that clock has shown it is the piconet's own,
     /// so every header after it has one clock to be read at.
-    pub fn pin(&mut self, tick: i64, clk6: u8) {
-        let Some(first) = self.first_tick else {
+    pub fn pin(&mut self, at_us: f64, clk6: u8) {
+        let Some(slot) = self.slot_at(at_us) else {
             return;
         };
-        let elapsed = tick.wrapping_sub(first).rem_euclid(64) as usize;
+        let elapsed = slot.rem_euclid(64) as usize;
         for (count, slot) in self.candidates.iter_mut().enumerate() {
             if (count + elapsed) % 64 != clk6 as usize {
                 *slot = None;
@@ -500,8 +519,16 @@ impl PiconetClock {
         uaps
     }
 
-    fn seed(&mut self, tick: i64, whitened: &[bool; HEADER_BITS]) {
-        self.first_tick = Some(tick);
+    /// Slots since the first header, for a header arriving at `at_us`:
+    /// the last header's count plus the gap since it, rounded to whole
+    /// slots.
+    fn slot_at(&self, at_us: f64) -> Option<i64> {
+        let (last_us, last_slot) = self.last?;
+        Some(last_slot + ((at_us - last_us) / SLOT_US).round() as i64)
+    }
+
+    fn seed(&mut self, at_us: f64, whitened: &[bool; HEADER_BITS]) {
+        self.last = Some((at_us, 0));
         let seed = candidate_uaps(whitened);
         for (count, slot) in self.candidates.iter_mut().enumerate() {
             *slot = Some(seed[count]);
@@ -519,12 +546,13 @@ impl PiconetClock {
     /// to begin with (a false access-code detection on this LAP, most
     /// plausibly), and clinging to it would refuse every future header
     /// too. This header becomes the new "first" instead.
-    pub fn observe(&mut self, tick: i64, whitened: &[bool; HEADER_BITS]) {
-        let Some(first) = self.first_tick else {
-            self.seed(tick, whitened);
+    pub fn observe(&mut self, at_us: f64, whitened: &[bool; HEADER_BITS]) {
+        let Some(slot) = self.slot_at(at_us) else {
+            self.seed(at_us, whitened);
             return;
         };
-        let elapsed = tick.wrapping_sub(first).rem_euclid(64) as u64;
+        self.last = Some((at_us, slot));
+        let elapsed = slot.rem_euclid(64) as u64;
         let mut remaining = 0u32;
         for count in 0..64u64 {
             let Some(expected) = self.candidates[count as usize] else {
@@ -541,7 +569,7 @@ impl PiconetClock {
             }
         }
         if remaining == 0 {
-            self.seed(tick, whitened);
+            self.seed(at_us, whitened);
         }
     }
 }
@@ -733,23 +761,27 @@ mod tests {
             PacketType::Dm3
         );
 
-        // The same piconet 25 ticks earlier, at clock 19, then this header.
+        // The same piconet 25 slots earlier, at clock 19, then this header.
         let (earlier, _) = synthetic_header(0b010 | (4 << 3), hec_for(0b010 | (4 << 3), uap), 19);
         let mut clock = PiconetClock::new();
-        clock.observe(100, &earlier);
-        clock.observe(125, &whitened);
+        clock.observe(100.0 * SLOT_US, &earlier);
+        clock.observe(125.0 * SLOT_US, &whitened);
         assert!(
-            clock.clocks_for(uap, 125).contains(&44),
+            clock.clocks_for(uap, 125.0 * SLOT_US).contains(&44),
             "{:?}",
-            clock.clocks_for(uap, 125)
+            clock.clocks_for(uap, 125.0 * SLOT_US)
         );
-        assert!(!clock.clocks_for(uap, 125).contains(&19));
+        assert!(!clock.clocks_for(uap, 125.0 * SLOT_US).contains(&19));
 
         // A payload that checked out at 44 pins the clock: from then on one
         // hypothesis, one clock, one UAP.
-        clock.pin(125, 44);
-        assert_eq!(clock.clocks_for(uap, 125), vec![44]);
-        assert_eq!(clock.clocks_for(uap, 131), vec![50], "and it runs on");
+        clock.pin(125.0 * SLOT_US, 44);
+        assert_eq!(clock.clocks_for(uap, 125.0 * SLOT_US), vec![44]);
+        assert_eq!(
+            clock.clocks_for(uap, 131.0 * SLOT_US),
+            vec![50],
+            "and it runs on"
+        );
         assert_eq!(clock.narrowed(), vec![uap]);
     }
 
@@ -823,7 +855,7 @@ mod tests {
         ];
         for &(elapsed, data10) in &observations {
             let whitened = header_at(true_first_clk6, elapsed, data10, true_uap);
-            clock.observe(elapsed, &whitened);
+            clock.observe(elapsed as f64 * SLOT_US, &whitened);
         }
         let narrowed = clock.narrowed();
         assert!(
@@ -860,7 +892,7 @@ mod tests {
         ];
         for &(tick, data10) in &observations {
             let whitened = header_at(true_first_clk6, tick, data10, true_uap);
-            clock.observe(tick, &whitened);
+            clock.observe(tick as f64 * SLOT_US, &whitened);
         }
         assert!(
             clock.narrowed().contains(&true_uap),
@@ -879,8 +911,8 @@ mod tests {
         let mut clock = PiconetClock::new();
         // Two unrelated, mutually inconsistent "headers" - random noise
         // that happened to pass the FEC quality gate, not a real piconet.
-        clock.observe(0, &[true; HEADER_BITS]);
-        clock.observe(5, &[false; HEADER_BITS]);
+        clock.observe(0.0, &[true; HEADER_BITS]);
+        clock.observe(5.0 * SLOT_US, &[false; HEADER_BITS]);
 
         // Now a real, consistent piconet starts - re-seeded from here.
         let true_uap = 0x64u8;
@@ -895,7 +927,7 @@ mod tests {
         ];
         for &(tick, data10) in &observations {
             let whitened = header_at(true_first_clk6, tick, data10, true_uap);
-            clock.observe(tick, &whitened);
+            clock.observe(tick as f64 * SLOT_US, &whitened);
         }
         assert!(
             clock.narrowed().contains(&true_uap),
@@ -909,5 +941,57 @@ mod tests {
     #[test]
     fn nothing_narrowed_before_the_first_header() {
         assert!(PiconetClock::new().narrowed().is_empty());
+    }
+    /// **What the air showed: CLK1-6 steps once a slot, 625 us.** A piconet
+    /// sending a header every slot, its CLK1-6 moving one step each time,
+    /// on a clock of ours that its own sits 16 ppm from (measured on a real
+    /// device), with 25 us of jitter either way on every header, for a
+    /// minute: the true hypothesis is never lost. Counted at the full CLK
+    /// rate, or rounded from the first header, it would be within seconds.
+    #[test]
+    fn the_clock_steps_once_a_slot_through_jitter_and_drift() {
+        let true_uap = 0x67u8;
+        let first = 30u8;
+        let mut clock = PiconetClock::new();
+        // An arbitrary stream origin and a phase inside the slot: neither
+        // may matter.
+        let origin_us = 123_456.7;
+        let mut slot = 0i64;
+        let mut lost = 0;
+        let mut widest_after_converging = 0;
+        for k in 0..1_200u64 {
+            // A header every 80 slots (50 ms), give or take a few.
+            slot += 80 + (k % 7) as i64;
+            let jitter = ((k * 7919) % 51) as f64 - 25.0;
+            let at_us = origin_us + slot as f64 * SLOT_US * (1.0 + 16e-6) + jitter;
+            let data10 = ((k * 613) % 1024) as u16;
+            let whitened = header_at(first, slot, data10, true_uap);
+            clock.observe(at_us, &whitened);
+            if !clock.narrowed().contains(&true_uap) {
+                lost += 1;
+            }
+            // A lost hypothesis does not show as a missing UAP: the clock
+            // reseeds, and a fresh seed holds the true UAP again among 32.
+            // It shows as the candidates widening after they had narrowed.
+            if k >= 100 {
+                widest_after_converging = widest_after_converging.max(clock.narrowed().len());
+            }
+        }
+        assert_eq!(lost, 0, "the true UAP fell out {lost} times");
+        assert_eq!(
+            widest_after_converging, 2,
+            "the clock reseeded after converging"
+        );
+        assert_eq!(clock.narrowed().len(), 2, "{:?}", clock.narrowed());
+    }
+
+    /// Two headers one slot apart: CLK1-6 has moved one step, not two.
+    #[test]
+    fn one_slot_is_one_step() {
+        let uap = 0x3au8;
+        let mut clock = PiconetClock::new();
+        clock.observe(1_000.0, &header_at(24, 0, 0b0_011_000_101, uap));
+        clock.observe(1_000.0 + SLOT_US, &header_at(24, 1, 0b1_100_001_010, uap));
+        assert_eq!(clock.clocks_for(uap, 1_000.0 + SLOT_US), vec![25]);
     }
 }
