@@ -129,9 +129,7 @@ pub fn rows(state: &SdrMetrics) -> Vec<String> {
             match fields {
                 Some(hd) => f.extend([
                     hd.lt_addr.to_string(),
-                    PacketType::from_code(hd.packet_type.code())
-                        .label()
-                        .to_string(),
+                    PacketType::from_code(hd.packet_type.code()).shown(),
                     (hd.flags & 1).to_string(),
                     (hd.flags >> 1 & 1).to_string(),
                     (hd.flags >> 2 & 1).to_string(),
@@ -220,7 +218,11 @@ mod tests {
         let dh1 = &out[11];
         assert_eq!(get(dh1, "header"), "decoded");
         assert_eq!(get(dh1, "lt_addr"), "2");
-        assert_eq!(get(dh1, "packet_type"), "DH1");
+        assert_eq!(
+            get(dh1, "packet_type"),
+            "DH1/2-DH1",
+            "every reading, the header cannot say which"
+        );
         assert_eq!(
             (get(dh1, "flow"), get(dh1, "arqn"), get(dh1, "seqn")),
             ("1".to_string(), "0".to_string(), "1".to_string())

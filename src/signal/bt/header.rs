@@ -256,8 +256,50 @@ impl PacketType {
         Self::from_bits(bits)
     }
 
-    /// The short label a panel shows - upper case, four characters or
-    /// fewer, so a row of them lines up.
+    /// Every packet this TYPE code can be, basic-rate name first.
+    ///
+    /// **The header does not say which.** A TYPE code means one packet on an
+    /// ACL link in basic rate, another once the link has switched to the EDR
+    /// packet table (which the link managers agree between themselves, out
+    /// of the header's sight), and others again on a SCO or eSCO voice link.
+    /// On the air a phone playing music to headphones sent code 10 almost
+    /// throughout: a DM3 by the basic-rate table, a 2-DH3 in fact, with the
+    /// switch to the EDR table seen in its own link-manager traffic. So every
+    /// reading is named, rather than the likeliest.
+    ///
+    /// The codes are the Core's packet type tables (Vol 2 Part B 6.5) as
+    /// test-instrument and reference documentation quote them; the Core text
+    /// itself would not load here.
+    pub fn names(self) -> &'static [&'static str] {
+        match self {
+            PacketType::Null => &["NULL"],
+            PacketType::Poll => &["POLL"],
+            PacketType::Fhs => &["FHS"],
+            PacketType::Dm1 => &["DM1"],
+            PacketType::Dh1 => &["DH1", "2-DH1"],
+            PacketType::Hv1 => &["HV1"],
+            PacketType::Hv2 => &["HV2", "2-EV3"],
+            PacketType::Hv3 => &["HV3", "EV3", "3-EV3"],
+            PacketType::Dv => &["DV", "3-DH1"],
+            PacketType::Aux1 => &["AUX1"],
+            PacketType::Dm3 => &["DM3", "2-DH3"],
+            PacketType::Dh3 => &["DH3", "3-DH3"],
+            PacketType::Ev4 => &["EV4", "2-EV5"],
+            PacketType::Ev5 => &["EV5", "3-EV5"],
+            PacketType::Dm5 => &["DM5", "2-DH5"],
+            PacketType::Dh5 => &["DH5", "3-DH5"],
+        }
+    }
+
+    /// Every reading of the code, as a panel and an export show it:
+    /// `DM3/2-DH3`.
+    pub fn shown(self) -> String {
+        self.names().join("/")
+    }
+
+    /// The basic-rate name alone: the table as the header decode was first
+    /// written, which the tests still list.
+    #[cfg(test)]
     pub fn label(self) -> &'static str {
         match self {
             PacketType::Null => "NULL",
@@ -993,5 +1035,21 @@ mod tests {
         clock.observe(1_000.0, &header_at(24, 0, 0b0_011_000_101, uap));
         clock.observe(1_000.0 + SLOT_US, &header_at(24, 1, 0b1_100_001_010, uap));
         assert_eq!(clock.clocks_for(uap, 1_000.0 + SLOT_US), vec![25]);
+    }
+
+    /// Each code names every packet it can be, the basic-rate name first,
+    /// and the codes that mean one thing everywhere name one.
+    #[test]
+    fn a_code_names_every_packet_it_can_be() {
+        assert_eq!(PacketType::from_code(10).shown(), "DM3/2-DH3");
+        assert_eq!(PacketType::from_code(14).shown(), "DM5/2-DH5");
+        assert_eq!(PacketType::from_code(7).shown(), "HV3/EV3/3-EV3");
+        for code in [0u8, 1, 2, 3, 5, 9] {
+            assert_eq!(PacketType::from_code(code).names().len(), 1, "{code}");
+        }
+        for code in 0..16u8 {
+            let t = PacketType::from_code(code);
+            assert_eq!(t.names()[0], t.label(), "{code}: basic rate first");
+        }
     }
 }

@@ -196,10 +196,11 @@ signals. Where it matters, the screen says which:
   packets a connection sends while it is being set up, so switching the
   headphones off and on while sdrtop listens is the quickest way to a
   value.
-- **A header's packet type is named the basic-rate way**: on a link that
-  has switched to EDR, which most audio links do, `DM3`, `DM5` and `DH1`
-  are really `2-DH3`, `2-DH5` and `2-DH1`, and the header alone cannot say
-  which.
+- **A header's packet type shows every packet its code can be**, like
+  `DM3/2-DH3`: the same code means one packet on a basic-rate link and
+  another once the link has switched to EDR, which most audio links do,
+  and the header alone cannot say which. Your headphones' music is the
+  second name. The export's `packet_type` column says the same.
 - **"predicted, not followed"** beside a BLE connection's hop sequence means
   sdrtop worked out which channels the connection will use from its own
   parameters, and did not follow it there. It never does.

@@ -896,7 +896,7 @@ fn header_lines(
         "-".to_string()
     } else {
         mix.iter()
-            .map(|(n, c)| format!("{} {n}", PacketType::from_code(*c).label()))
+            .map(|(n, c)| format!("{} {n}", PacketType::from_code(*c).shown()))
             .collect::<Vec<_>>()
             .join(" \u{00b7} ")
     };
@@ -1407,7 +1407,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("POLL 3 \u{00b7} NULL 1 \u{00b7} DH1 1"),
+            out.contains("POLL 3 \u{00b7} NULL 1 \u{00b7} DH1/2-DH1 1"),
             "{out}"
         );
         assert!(out.contains("0 (broadcast), 1, 2"), "{out}");
