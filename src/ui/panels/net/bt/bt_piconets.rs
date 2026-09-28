@@ -851,7 +851,7 @@ fn header_lines(
     };
     let mut out = vec![crate::ui::chrome::section(
         "headers",
-        "libbtbb port, unchecked on air",
+        "libbtbb port, checked on air",
         iw,
         theme,
     )];
@@ -1401,7 +1401,7 @@ mod tests {
         );
         let out = draw(NetBtPiconetsPanel, 70, 30, &m).join("\n");
         assert!(out.contains("HEADERS"), "{out}");
-        assert!(out.contains("unchecked on air"), "{out}");
+        assert!(out.contains("checked on air"), "{out}");
         assert!(
             out.contains("5 of 7 captured, 1 did not decode under 0x4c"),
             "{out}"

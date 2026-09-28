@@ -178,9 +178,28 @@ signals. Where it matters, the screen says which:
   drift rate from `3.3`, on LE 1M and LE 2M alike. The section heading
   names both.
 - The classic Bluetooth header decode is a port of `libbtbb`, and its
-  section is headed "libbtbb port, unchecked on air". It has passed every
-  test I could write for it and has never met a real classic transmitter,
-  which are two different kinds of confidence.
+  section is headed "libbtbb port, checked on air". For a long time it said
+  "unchecked": it had passed every test I could write and never met a real
+  transmitter. Then it met two, a phone playing music to a pair of
+  headphones, with both addresses read off the devices themselves. The
+  LAPs matched, and the UAPs narrowed to two candidates within half a
+  minute. Then a reconnect's DM1 packets, the few link-manager messages
+  sent before the link encrypts, passed their CRC and settled both, to
+  exactly the devices' own. Their contents made sense too, down to the
+  encryption request right before the CRCs stopped passing. Checked on the
+  air: the header decode, the UAP narrowing and the DM1 payload. Not yet:
+  DH payloads and DM3/DM5, because none arrived unencrypted and in basic
+  rate.
+- **An encrypted link stays at `2 left`**, and that is not a fault: the
+  payload is encrypted, so no CRC can be checked without the key, and the
+  true UAP is always one of the two. It resolves from the few unencrypted
+  packets a connection sends while it is being set up, so switching the
+  headphones off and on while sdrtop listens is the quickest way to a
+  value.
+- **A header's packet type is named the basic-rate way**: on a link that
+  has switched to EDR, which most audio links do, `DM3`, `DM5` and `DH1`
+  are really `2-DH3`, `2-DH5` and `2-DH1`, and the header alone cannot say
+  which.
 - **"predicted, not followed"** beside a BLE connection's hop sequence means
   sdrtop worked out which channels the connection will use from its own
   parameters, and did not follow it there. It never does.

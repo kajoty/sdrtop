@@ -45,7 +45,8 @@ pub fn note(state: &SdrMetrics) -> String {
     let kept = state.net.bt_hops.len() as u64;
     let heard = state.net.health.bt_hits;
     let mut parts = vec![
-        "header fields from a libbtbb port, unchecked on the air".to_string(),
+        "header fields from a libbtbb port, checked on the air against two devices (net.md)"
+            .to_string(),
         "residuals from each piconet's own fitted 625 us grid".to_string(),
         "clock_ppm is the piconet's slot clock from the same fit, worth what the reference line says"
             .to_string(),
@@ -233,7 +234,7 @@ mod tests {
             "{}",
             note(&m)
         );
-        assert!(note(&m).contains("unchecked on the air"));
+        assert!(note(&m).contains("checked on the air against two devices"));
     }
 
     /// A grid fitted on another stream gives no residual: those times are
