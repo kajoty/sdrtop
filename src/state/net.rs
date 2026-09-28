@@ -461,6 +461,9 @@ pub struct NetState {
     pub bt_view: super::Selection<u32>,
     /// How much of the past the hop scatter shows, and how far back it ends.
     pub hop_view: HopView,
+    /// Where the Piconet view's packet list is scrolled to, and the packet
+    /// it is held at.
+    pub packets_view: PacketsView,
     /// The tuning the survey interrupted, so it can be given back.
     ///
     /// **In the state rather than in the task**, for the reason
@@ -750,6 +753,22 @@ pub const BLE_PACKET_LIMIT: usize = 200;
 /// single hops of one piconet separate, to a minute, where piconets come and
 /// go.
 pub const HOP_WINDOWS_MS: [u64; 7] = [500, 1_000, 2_000, 5_000, 10_000, 20_000, 60_000];
+
+/// The Piconet view's packet list: held or live, and how far down.
+///
+/// **Held at a packet, not a copy of the list.** The list is newest first
+/// and grows at the top, so holding it means drawing from one packet down
+/// while newer ones arrive above: the ring already keeps them, so there is
+/// nothing to copy, and how many arrived since is simply how far down the
+/// held one now sits.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PacketsView {
+    /// The newest packet shown while held, by its stream and its time on
+    /// that stream (`piconet::BtPacket`); `None` while live.
+    pub held: Option<(u32, f64)>,
+    /// Rows scrolled past, from the held packet (or the newest, live).
+    pub first_visible: usize,
+}
 
 /// Which stretch of time the classic hop scatter shows
 /// (net-ux-polish-plan 6.2): a zoom step, and how far before now it ends.

@@ -7,5 +7,6 @@
 //! the panel layer keeps the same split.
 
 pub mod bt_hops;
+pub mod bt_packets;
 pub mod bt_piconets;
 mod sections;

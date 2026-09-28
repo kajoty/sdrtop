@@ -83,6 +83,7 @@ impl App {
         registry.register(ui::NetBlePacketsPanel);
         registry.register(ui::NetBtHopsPanel);
         registry.register(ui::NetBtPiconetsPanel);
+        registry.register(ui::NetBtPacketsPanel);
         registry.register(ui::NetBleDetailPanel);
         registry.register(ui::NetCensusPanel);
         registry.register(ui::NetCoexistPanel);
@@ -492,7 +493,9 @@ mod tests {
         let rendered = net_panels_with_one_device(crate::state::AddressDisplay::Full);
         let mut checked = 0;
         for (name, text, chrome) in &rendered {
-            let prints_ppm = text.contains(" ppm");
+            // A ppm, or the packet list's f0 in kHz: an offset either way,
+            // corrected by the reference where there is one.
+            let prints_ppm = text.contains(" ppm") || text.contains("f0 kHz");
             let declares = chrome.offsets;
             if prints_ppm || declares {
                 checked += 1;
@@ -601,6 +604,23 @@ mod tests {
             .collect();
         m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
         m.net.bt_view.selected = Some(lap);
+        // And one packet of it, so the packet list draws its table.
+        crate::signal::bt::piconet::observe_packet(
+            &mut m.net.bt_piconets,
+            lap,
+            crate::signal::bt::piconet::BtPacket {
+                seen: now,
+                at_us: 0.0,
+                stream: 0,
+                channel: 10,
+                header: None,
+                direction: None,
+                deviation: Default::default(),
+                carrier: Default::default(),
+                f0_ppm: None,
+                payload: crate::signal::bt::piconet::PayloadVerdict::NoPayload,
+            },
+        );
 
         let theme = crate::Theme::sdr();
         engine

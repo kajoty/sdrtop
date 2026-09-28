@@ -65,19 +65,12 @@ use crate::signal::bt::receive::Receiver as BtReceiver;
 use crate::signal::stream::plan_block;
 use crate::state::{BlePacket, BtHop, SdrMetrics};
 
+// The views the classic receiver runs for (the Classic and the Piconet
+// view): a plain string comparison, because that is what the menu is keyed
+// by, and the registry's structural tests hold the strings and the preset
+// files' names to agreeing. A view left out would show an empty list forever.
+use super::lock::CLASSIC_VIEWS;
 use super::scan::Scan;
-
-/// The name `net_bt`'s own preset carries in the menu, gating this worker's
-/// classic Bluetooth branch the same way `signal::net::gate` gates whole
-/// presets elsewhere - a plain string comparison because that is what the
-/// menu itself is keyed by (`app/builder/registry.rs`'s own structural
-/// tests hold this string and the preset file's name to agreeing).
-const NET_BT_PRESET: &str = "net_bt";
-
-/// The Piconet view's preset: one piconet, packet by packet. It listens as
-/// the Classic view does, on every channel `bt_channels` allows; left out
-/// of the gate, it would show an empty list forever.
-const NET_PICONET_PRESET: &str = "net_piconet";
 
 /// The survey's preset, where the classic receiver runs on as many channels
 /// as the measured load leaves room for ([`SURVEY_LOAD_HIGH`]).
@@ -598,7 +591,7 @@ impl NetWorker {
                 (
                     m.ui.is_net_section(),
                     span.min(rate_hz),
-                    m.ui.active_preset == NET_BT_PRESET || m.ui.active_preset == NET_PICONET_PRESET,
+                    CLASSIC_VIEWS.contains(&m.ui.active_preset.as_str()),
                     m.ui.active_preset == NET_SURVEY_PRESET,
                     m.net.ble_phy,
                     m.net.mode == crate::state::NetMode::Lock,
@@ -900,18 +893,24 @@ impl NetWorker {
                                     crate::signal::bt::piconet::Carrier::of(&drift, hz as f64)
                                 })
                                 .unwrap_or_default();
-                            Some((r.deviation, carrier))
+                            let f0_ppm = r
+                                .carrier
+                                .map(|(_, drift)| drift.initial_hz.scale(1e6 / hz as f64));
+                            Some((r.deviation, carrier, f0_ppm))
                         })
                         .unwrap_or_default();
                     headers_read.push((
                         hit.lap,
                         hit.at_us,
-                        read,
                         clock.hypotheses(),
-                        measured.0,
-                        measured.1,
-                        direction,
-                        payload,
+                        crate::signal::bt::piconet::PacketReading {
+                            header: read,
+                            direction,
+                            deviation: measured.0,
+                            carrier: measured.1,
+                            f0_ppm: measured.2,
+                            payload,
+                        },
                     ));
                     narrowed_by_lap.push((hit.lap, shown));
                 }
@@ -976,6 +975,7 @@ impl NetWorker {
                                 direction: None,
                                 deviation: Default::default(),
                                 carrier: Default::default(),
+                                f0_ppm: None,
                                 payload: crate::signal::bt::piconet::PayloadVerdict::NoPayload,
                             },
                         );
@@ -993,9 +993,7 @@ impl NetWorker {
                             p.pace = pace;
                         }
                     }
-                    for (lap, at_us, read, hypotheses, deviation, carrier, direction, payload) in
-                        headers_read
-                    {
+                    for (lap, at_us, hypotheses, reading) in headers_read {
                         // Joined to its hit by LAP and time: the header's
                         // capture starts on the lane that found the access
                         // code, which may be a quarter-symbol lane off the
@@ -1003,28 +1001,22 @@ impl NetWorker {
                         if let Some(hop) = m.net.bt_hops.iter_mut().find(|h| {
                             h.lap == lap && h.stream == stream_id && (h.at_us - at_us).abs() < 2.0
                         }) {
-                            hop.header = Some(read);
+                            hop.header = Some(reading.header);
                         }
                         crate::signal::bt::piconet::observe_header(
                             &mut m.net.bt_piconets,
                             lap,
-                            read,
+                            reading.header,
                             hypotheses,
-                            deviation,
-                            carrier,
+                            reading.deviation,
+                            reading.carrier,
                         );
                         crate::signal::bt::piconet::read_packet(
                             &mut m.net.bt_piconets,
                             lap,
                             stream_id,
                             at_us,
-                            crate::signal::bt::piconet::PacketReading {
-                                header: read,
-                                direction,
-                                deviation,
-                                carrier,
-                                payload,
-                            },
+                            reading,
                         );
                     }
                 }
@@ -2358,7 +2350,7 @@ mod tests {
     #[test]
     fn the_piconet_view_runs_the_classic_receiver() {
         let (bytes, tuned) = access_code_only(0x0044_5566);
-        let state = run_classic(NET_PICONET_PRESET, tuned, bytes);
+        let state = run_classic("net_piconet", tuned, bytes);
         let m = state.lock().unwrap();
         assert!(m.net.bt_refused.is_none(), "{:?}", m.net.bt_refused);
         assert_eq!(m.net.bt_channels_watched.len(), SAFE_BT_CHANNELS);
@@ -2384,6 +2376,15 @@ mod tests {
         assert_eq!(packet.direction, Some(Direction::of_clk6(h.clk6)));
         assert_eq!(packet.payload, PayloadVerdict::Crc(true));
         assert!(packet.deviation.settled.n > 0, "its own readings kept");
+        // Its own f0, with the spread the pooled sums cannot give back, and
+        // the same figure the sums hold.
+        assert_eq!(packet.carrier.f0_ppm.n, 1);
+        let f0 = packet.f0_ppm.expect("its own f0");
+        assert!(
+            (f0.value() - packet.carrier.f0_ppm.sum).abs() < 1e-3,
+            "{f0:?}"
+        );
+        assert!(f0.sigma() > 0.0 && f0.sigma().is_finite(), "{f0:?}");
         let side = p.headers.sides.clone().of(packet.direction).packets;
         assert_eq!(side, 1, "counted on its side, not under unknown");
         assert_eq!(p.headers.sides.unknown.packets, 0);

@@ -116,6 +116,9 @@ pub(in crate::app::input) fn reset_positions(panel: &str, m: &mut crate::state::
         }
         "net_ble_packets" => m.net.ble_view.selection = Default::default(),
         "net_bt_piconets" => m.net.bt_view = Default::default(),
+        // The piconet is what the view is of, not a place in it, and the
+        // hold is a mode as the BLE list's is: only the scroll goes.
+        "net_bt_packets" => m.net.packets_view.first_visible = 0,
         // The zoom is a mode; where in time the window ends is a position.
         "net_bt_hops" => {
             m.net.bt_view = Default::default();

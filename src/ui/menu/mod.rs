@@ -159,7 +159,15 @@ fn right_pane(
                 let n = s.entries.len();
                 // The section's focus keys beside its count: a letter
                 // belongs to its section, which is why keys never collide.
-                let keys: String = controls.iter().map(|c| format!(" {}", c.key)).collect();
+                // Once each: two of its panels may share a letter when no
+                // view shows both (`app::FocusKeys`), and it is one key.
+                let mut letters: Vec<char> = Vec::new();
+                for c in controls.iter() {
+                    if !letters.contains(&c.key) {
+                        letters.push(c.key);
+                    }
+                }
+                let keys: String = letters.iter().map(|k| format!(" {k}")).collect();
                 let mut hint = format!("{n} view{}", if n == 1 { "" } else { "s" });
                 if !keys.is_empty() {
                     hint.push_str(&format!(" \u{00b7} focus keys{keys}"));
@@ -428,7 +436,14 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("NET"), "{all}");
-        assert!(all.contains("5 views"), "{all}");
+        assert!(all.contains("6 views"), "{all}");
+        // A letter two views' panels share is one key, named once.
+        let heading = all.lines().find(|l| l.contains("6 views")).unwrap();
+        let vs = heading
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| *w == "v")
+            .count();
+        assert_eq!(vs, 1, "{heading}");
         // The selected view wears the bar, not a triangle.
         assert!(all.contains("\u{258c} 4  BLE"), "{all}");
         assert!(!all.contains("\u{25b8}"), "{all}");
@@ -484,7 +499,7 @@ mod tests {
         assert!(block < radio, "the section's block comes first");
 
         let views = draw(110, 30, &at(net, 0)).join("\n");
-        let heading = views.lines().find(|l| l.contains("5 views")).unwrap();
+        let heading = views.lines().find(|l| l.contains("6 views")).unwrap();
         for key in ['v', 'c', 'b', 'u'] {
             assert!(heading.contains(&format!(" {key}")), "{key}: {heading}");
         }

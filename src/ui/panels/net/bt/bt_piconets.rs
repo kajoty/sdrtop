@@ -147,13 +147,55 @@ fn cells(p: &Piconet, state: &SdrMetrics, now: std::time::Instant) -> Vec<String
         since(p.last_seen),
         p.hits.to_string(),
         p.channels_hit().to_string(),
-        match Inquiry::of(p.lap) {
-            // Fixed by the specification, not narrowed from anything.
-            Some(_) => "DCI".to_string(),
-            None => uap_cell(state.net.bt_uap.get(&p.lap), &state.net),
-        },
+        uap_text(p.lap, &state.net),
         since(p.first_seen),
     ]
+}
+
+/// A LAP's UAP as the roster's column states it, and the packet list's
+/// title with it.
+pub(super) fn uap_text(lap: u32, net: &crate::state::NetState) -> String {
+    match Inquiry::of(lap) {
+        // Fixed by the specification, not narrowed from anything.
+        Some(_) => "DCI".to_string(),
+        None => uap_cell(net.bt_uap.get(&lap), net),
+    }
+}
+
+/// What the section's classic panels say with no piconet to show: which of
+/// the three silences it is (refused, not running, listening with nothing
+/// heard), each in its own words. `None` once anything has been heard.
+pub(super) fn silence(
+    state: &SdrMetrics,
+    width: usize,
+    theme: &crate::Theme,
+) -> Option<Vec<Line<'static>>> {
+    if !state.net.bt_piconets.is_empty() {
+        return None;
+    }
+    let note = |text: &str, ink| {
+        crate::ui::chrome::wrap(text, width, 4)
+            .into_iter()
+            .map(move |chunk| Line::from(Span::styled(chunk, Style::default().fg(ink))))
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match &state.net.bt_refused {
+        Some(reason) => {
+            lines.extend(note("not watching", theme.stale));
+            lines.extend(note(reason, theme.label));
+        }
+        None if state.net.bt_channels_watched.is_empty() => {
+            lines.extend(note("no classic receiver running", theme.stale));
+        }
+        None => lines.extend(note(
+            &format!(
+                "watching {} channels - no piconet heard yet",
+                state.net.bt_channels_watched.len()
+            ),
+            theme.stale,
+        )),
+    }
+    Some(lines)
 }
 
 /// How the hits are spaced, in words (`Piconet::pace`), for the rows it can
@@ -855,35 +897,13 @@ impl Panel for NetBtPiconetsPanel {
             return;
         }
         let width = inner.width as usize;
-        let note = |text: &str, ink| {
-            crate::ui::chrome::wrap(text, width, 4)
-                .into_iter()
-                .map(move |chunk| Line::from(Span::styled(chunk, Style::default().fg(ink))))
-        };
 
         // The three silences, each named (bar item 3).
-        let roster = ordered(&state.net.bt_piconets);
-        if roster.is_empty() {
-            let mut lines: Vec<Line> = Vec::new();
-            match &state.net.bt_refused {
-                Some(reason) => {
-                    lines.extend(note("not watching", theme.stale));
-                    lines.extend(note(reason, theme.label));
-                }
-                None if state.net.bt_channels_watched.is_empty() => {
-                    lines.extend(note("no classic receiver running", theme.stale));
-                }
-                None => lines.extend(note(
-                    &format!(
-                        "watching {} channels - no piconet heard yet",
-                        state.net.bt_channels_watched.len()
-                    ),
-                    theme.stale,
-                )),
-            }
+        if let Some(lines) = silence(state, width, theme) {
             f.render_widget(Paragraph::new(lines), inner);
             return;
         }
+        let roster = ordered(&state.net.bt_piconets);
 
         let now = std::time::Instant::now();
         // A column holds its widest cell whole (a long session's hit count).

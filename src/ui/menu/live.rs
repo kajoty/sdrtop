@@ -41,7 +41,7 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
     let on = streaming
         && match preset {
             "net_ble" | "net_census" => net.ble_channel.is_some(),
-            "net_bt" => !net.bt_channels_watched.is_empty(),
+            "net_bt" | "net_piconet" => !net.bt_channels_watched.is_empty(),
             _ => m.ui.active_preset == preset,
         };
     let quiet = |text: String| Live {
@@ -124,6 +124,33 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
                 net.bt_refused.as_ref(),
             ))
         }
+        "net_piconet" => {
+            let laps: Vec<u32> = crate::signal::bt::piconet::ordered(&net.bt_piconets)
+                .iter()
+                .map(|p| p.lap)
+                .collect();
+            let Some(p) = net
+                .bt_view
+                .cursor(&laps)
+                .and_then(|i| net.bt_piconets.iter().find(|p| p.lap == laps[i]))
+            else {
+                return Some(said(
+                    "no piconet selected".to_string(),
+                    net.bt_refused.as_ref(),
+                ));
+            };
+            let s = &p.headers.sides;
+            Some(said(
+                format!(
+                    "{}: {} packets, {} master, {} slave",
+                    net.show_lap(p.lap),
+                    s.master.packets + s.slave.packets + s.unknown.packets,
+                    s.master.packets,
+                    s.slave.packets
+                ),
+                net.bt_refused.as_ref(),
+            ))
+        }
         _ => None,
     }
 }
@@ -192,7 +219,7 @@ mod tests {
         if streaming {
             match preset {
                 "net_ble" | "net_census" => m.net.ble_channel = Some(37),
-                "net_bt" => m.net.bt_channels_watched = vec![10, 11],
+                "net_bt" | "net_piconet" => m.net.bt_channels_watched = vec![10, 11],
                 _ => {}
             }
         }
@@ -295,6 +322,36 @@ mod tests {
         m.net.bt_uap.insert(2, vec![0x4c, 0x9a]);
         let l = line("net_bt", &m, now).unwrap();
         assert_eq!(l.text, "2 piconets heard, 1 UAP resolved");
+    }
+
+    /// NET 6's line: the piconet it would show and the packets it has, as
+    /// the address mode shows it, or that none is selected.
+    #[test]
+    fn the_piconet_view_has_a_live_line() {
+        let mut m = at("net_piconet", true);
+        let now = Instant::now();
+        let l = line("net_piconet", &m, now).unwrap();
+        assert_eq!(l.text, "no piconet selected");
+        crate::signal::bt::piconet::observe(&mut m.net.bt_piconets, 0xc3_d318, 10, now);
+        let sides = &mut m.net.bt_piconets[0].headers.sides;
+        sides.master.packets = 180;
+        sides.slave.packets = 230;
+        sides.unknown.packets = 2;
+        m.net.bt_view.selected = Some(0xc3_d318);
+        let l = line("net_piconet", &m, now).unwrap();
+        assert_eq!(l.text, "0xc3d318: 412 packets, 180 master, 230 slave");
+        assert!(l.running);
+
+        m.net.address_display = crate::state::AddressDisplay::Masked;
+        assert!(!line("net_piconet", &m, now)
+            .unwrap()
+            .text
+            .contains("c3d318"));
+
+        m.net.bt_channels_watched.clear();
+        let l = line("net_piconet", &m, now).unwrap();
+        assert!(!l.running);
+        assert!(l.text.ends_with("; not listening now"), "{}", l.text);
     }
 
     #[test]

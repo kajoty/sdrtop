@@ -41,7 +41,10 @@
 //! bracket names the limit instead, and the gutter outside it carries an arrow
 //! when the value is past it.
 
-use ratatui::{style::Style, text::Span};
+use ratatui::{
+    style::{Color, Style},
+    text::Span,
+};
 
 use super::reading::{fmt_at, Ink, Reading};
 use crate::signal::dsp::uncertainty::Uncertain;
@@ -216,6 +219,17 @@ impl<'a> LimitRow<'a> {
             Ink::Warn
         } else {
             Ink::Ok
+        }
+    }
+
+    /// The colour a table cell of this reading wears when it is not safely
+    /// inside its limit: the row's own amber or red. `None` inside by more
+    /// than the uncertainty, or with no value to judge, so a table keeps its
+    /// ordinary ink for the ordinary case and only a problem stands out.
+    pub(crate) fn flag_colour(&self, theme: &Theme) -> Option<Color> {
+        match self.severity() {
+            ink @ (Ink::Warn | Ink::Crit) => Some(ink.colour(theme)),
+            _ => None,
         }
     }
 
@@ -677,5 +691,32 @@ mod tests {
             .bar(6)
             .iter()
             .all(|(s, _)| s.trim().is_empty()));
+    }
+
+    /// A table cell keeps its ordinary ink inside the limit and takes the
+    /// row's amber or red only where the row would show them.
+    #[test]
+    fn a_cell_is_flagged_only_where_the_row_is() {
+        let theme = crate::Theme::sdr();
+        assert_eq!(mod_index(0.5).flag_colour(&theme), None);
+        assert_eq!(
+            mod_index(0.452).flag_colour(&theme),
+            Some(theme.status_warn),
+            "inside by less than its uncertainty"
+        );
+        assert_eq!(mod_index(0.40).flag_colour(&theme), Some(theme.status_crit));
+        let unsupported = LimitRow::new(
+            "Mod index",
+            Reading::new(Uncertain::from_sigma(0.40, 0.2), "", 0.05),
+            Limit::Band {
+                low: 0.45,
+                high: 0.55,
+            },
+        );
+        assert_eq!(
+            unsupported.flag_colour(&theme),
+            None,
+            "no value, no verdict"
+        );
     }
 }

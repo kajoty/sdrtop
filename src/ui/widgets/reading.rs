@@ -156,6 +156,15 @@ impl<'a> Reading<'a> {
         out
     }
 
+    /// The value alone, at the places its uncertainty gives it, or `None`
+    /// where the cell would dash: for a table whose column title carries the
+    /// unit and whose rows have no room for the ±. The digits still follow
+    /// the uncertainty, so a cell never claims more than the reading.
+    pub(crate) fn value_text(&self) -> Option<String> {
+        self.resolved_value()
+            .map(|v| fmt_at(v, self.value_places()))
+    }
+
     /// The cell as plain text, for tests, for the log and for export.
     pub(crate) fn text(&self) -> String {
         self.pieces()
@@ -331,5 +340,15 @@ mod tests {
             .find(|s| !s.content.trim().is_empty())
             .unwrap();
         assert_eq!(first.style.fg, Some(theme.stale));
+    }
+
+    /// The value alone keeps the places its uncertainty gives it, and is
+    /// absent where the full cell would dash.
+    #[test]
+    fn the_value_alone_follows_the_uncertainty() {
+        let r = Reading::new(Uncertain::from_sigma(3.2175, 0.124), "kHz", 10.0);
+        assert_eq!(r.value_text().as_deref(), Some("3.22"));
+        let r = Reading::new(Uncertain::from_sigma(3.2175, 40.0), "kHz", 10.0);
+        assert_eq!(r.value_text(), None);
     }
 }

@@ -205,6 +205,10 @@ pub struct BtPacket {
     /// This packet's own readings; empty when none were taken.
     pub deviation: Deviation,
     pub carrier: Carrier,
+    /// Its f0 in ppm of its channel, with the uncertainty its preamble
+    /// gives: `carrier` keeps sums for pooling, which one reading's spread
+    /// cannot come back out of.
+    pub f0_ppm: Option<Uncertain>,
     pub payload: PayloadVerdict,
 }
 
@@ -483,6 +487,7 @@ pub struct PacketReading {
     pub direction: Option<Direction>,
     pub deviation: Deviation,
     pub carrier: Carrier,
+    pub f0_ppm: Option<Uncertain>,
     pub payload: PayloadVerdict,
 }
 
@@ -513,6 +518,7 @@ pub fn read_packet(
     packet.direction = reading.direction;
     packet.deviation = reading.deviation;
     packet.carrier = reading.carrier;
+    packet.f0_ppm = reading.f0_ppm;
     packet.payload = reading.payload;
     let sides = &mut p.headers.sides;
     sides.unknown.packets = sides.unknown.packets.saturating_sub(1);
@@ -660,6 +666,7 @@ mod tests {
             direction,
             deviation: Deviation::from_readings(&[settled], &[settled * 0.9]),
             carrier: Carrier::default(),
+            f0_ppm: None,
             payload: PayloadVerdict::NoPayload,
         }
     }
@@ -756,6 +763,7 @@ mod tests {
                 direction: Some(Direction::Slave),
                 deviation: reading,
                 carrier: Carrier::default(),
+                f0_ppm: None,
                 payload: PayloadVerdict::NotRead("clock not known"),
             },
         );
@@ -778,6 +786,7 @@ mod tests {
                 direction: Some(Direction::Master),
                 deviation: reading,
                 carrier: Carrier::default(),
+                f0_ppm: None,
                 payload: PayloadVerdict::NoPayload,
             },
         );

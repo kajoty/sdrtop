@@ -31,6 +31,11 @@ use crate::state::LockTarget;
 /// the advertising decoder feeds.
 pub const ADVERTISING_VIEWS: &[&str] = &["net_ble", "net_census"];
 
+/// The views the classic receiver runs for: the Classic view and the
+/// Piconet view read the same receiver, so they watch the same channels,
+/// step the radio by the same block, and say the same thing in the menu.
+pub const CLASSIC_VIEWS: &[&str] = &["net_bt", "net_piconet"];
+
 /// The lowest and highest centre a step lands on: classic channel 0 and 78,
 /// which are also BLE channels 37 and 39.
 const BOTTOM_HZ: u64 = super::gate::LOWEST_CENTRE_HZ;

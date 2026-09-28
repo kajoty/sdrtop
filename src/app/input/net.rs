@@ -230,6 +230,69 @@ pub(super) fn net_bt_piconets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyActio
     KeyAction::Continue
 }
 
+/// The Piconet view's packet list. `↓` scrolls into the past and holds the
+/// list at its newest packet first, so the rows do not slide under the
+/// reader as packets arrive; `↑` scrolls back up; `h` holds the list or lets
+/// it run, as on the BLE list; `End` is live again, at the top. `← →` step
+/// to the previous or next piconet in the roster's order, the view starting
+/// afresh on each; with none heard they do nothing, rather than stepping the
+/// radio from under a focused list.
+pub(super) fn net_bt_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
+    let mut m = metrics(ctx.state);
+    let order: Vec<u32> = crate::signal::bt::piconet::ordered(&m.net.bt_piconets)
+        .iter()
+        .map(|p| p.lap)
+        .collect();
+    let packets: Option<&std::collections::VecDeque<_>> = m
+        .net
+        .bt_view
+        .cursor(&order)
+        .and_then(|i| m.net.bt_piconets.iter().find(|p| p.lap == order[i]))
+        .map(|p| &p.packets);
+    let newest = packets.and_then(|k| k.front()).map(|k| (k.stream, k.at_us));
+    // Rows below the held packet (or the newest), to scroll no further than.
+    let below = packets.map_or(0, |k| {
+        let from = m.net.packets_view.held.map_or(Some(0), |(stream, at)| {
+            k.iter().position(|p| p.stream == stream && p.at_us == at)
+        });
+        from.map_or(0, |i| k.len().saturating_sub(i + 1))
+    });
+    let view = &mut m.net.packets_view;
+    match key.code {
+        KeyCode::Up => view.first_visible = view.first_visible.saturating_sub(1),
+        KeyCode::Down => {
+            if view.held.is_none() {
+                view.held = newest;
+            }
+            if view.held.is_some() {
+                view.first_visible = (view.first_visible + 1).min(below);
+            }
+        }
+        KeyCode::Char('h') => {
+            *view = match view.held {
+                Some(_) => Default::default(),
+                None => crate::state::PacketsView {
+                    held: newest,
+                    ..*view
+                },
+            };
+        }
+        KeyCode::End => *view = Default::default(),
+        KeyCode::Left | KeyCode::Right => {
+            if !order.is_empty() {
+                let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                m.net.bt_view.move_by(&order, delta);
+                m.net.packets_view = Default::default();
+            }
+        }
+        _ => {
+            drop(m);
+            return global::handle(key, ctx);
+        }
+    }
+    KeyAction::Continue
+}
+
 /// The classic hop scatter: `↑↓` move the piconet selection the roster
 /// shares, in the roster's order; `+`/`-` zoom the window; `←`/`→` move it
 /// back and forward in time, no further back than the oldest hit kept;
@@ -837,7 +900,7 @@ mod tests {
             fn(&mut SdrMetrics),
             fn(&SdrMetrics) -> bool,
         );
-        let cases: [Case; 6] = [
+        let cases: [Case; 7] = [
             (
                 "net_survey",
                 "net_occupancy",
@@ -894,6 +957,22 @@ mod tests {
                 |m| m.net.bt_view.selected = Some(0x5a3c71),
                 |m| m.net.bt_view.selected.is_none(),
             ),
+            (
+                "net_piconet",
+                "net_bt_packets",
+                |m| {
+                    m.net.bt_view.selected = Some(0x5a3c71);
+                    m.net.packets_view.first_visible = 12;
+                    m.net.packets_view.held = Some((1, 5_000.0));
+                },
+                // The scroll goes; the piconet is what the view is of, and
+                // the hold is a mode, as the BLE list's is.
+                |m| {
+                    m.net.packets_view.first_visible == 0
+                        && m.net.packets_view.held == Some((1, 5_000.0))
+                        && m.net.bt_view.selected == Some(0x5a3c71)
+                },
+            ),
         ];
         for (preset, panel, set, cleared) in cases {
             let (mut engine, keys, state) = focused_on(preset, panel);
@@ -905,6 +984,136 @@ mod tests {
             );
             assert!(cleared(&metrics(&state)), "{panel} kept a position");
         }
+    }
+
+    /// NET 6 with two piconets heard, the first with `n` packets kept, one
+    /// a slot apart on stream 1, and the packet list focused.
+    fn piconet_view(n: u32) -> (LayoutEngine, crate::app::FocusKeys, Arc<Mutex<SdrMetrics>>) {
+        use crate::signal::bt::piconet::{observe, observe_packet, BtPacket, PayloadVerdict};
+        let (engine, keys, state) = focused_on("net_piconet", "net_bt_packets");
+        {
+            let mut m = metrics(&state);
+            m.net.bt_channels_watched = (60..80).collect();
+            observe(&mut m.net.bt_piconets, 0xc3_d318, 73, Instant::now());
+            observe(
+                &mut m.net.bt_piconets,
+                0xfe_17f1,
+                71,
+                Instant::now() - Duration::from_secs(5),
+            );
+            for k in 0..n {
+                observe_packet(
+                    &mut m.net.bt_piconets,
+                    0xc3_d318,
+                    BtPacket {
+                        seen: Instant::now(),
+                        at_us: k as f64 * 625.0,
+                        stream: 1,
+                        channel: 73,
+                        header: None,
+                        direction: None,
+                        deviation: Default::default(),
+                        carrier: Default::default(),
+                        f0_ppm: None,
+                        payload: PayloadVerdict::NoPayload,
+                    },
+                );
+            }
+            m.net.bt_view.selected = Some(0xc3_d318);
+        }
+        (engine, keys, state)
+    }
+
+    /// The packet list's keys: `↓` holds the list where it is and scrolls
+    /// into the past, `↑` back up, `h` holds or lets it run, `End` returns
+    /// to live at the top.
+    #[test]
+    fn the_packet_list_scrolls_holds_and_returns_to_live() {
+        let (mut engine, keys, state) = piconet_view(30);
+        let view = |s: &Arc<Mutex<SdrMetrics>>| metrics(s).net.packets_view;
+
+        key(&mut engine, &keys, &state, KeyCode::Up);
+        assert_eq!(view(&state).first_visible, 0, "nothing above the top");
+        assert_eq!(view(&state).held, None, "and still live");
+
+        key(&mut engine, &keys, &state, KeyCode::Down);
+        key(&mut engine, &keys, &state, KeyCode::Down);
+        assert_eq!(view(&state).first_visible, 2);
+        assert_eq!(
+            view(&state).held,
+            Some((1, 29.0 * 625.0)),
+            "held at the newest, so the rows do not slide under the reader"
+        );
+        key(&mut engine, &keys, &state, KeyCode::Up);
+        assert_eq!(view(&state).first_visible, 1);
+        for _ in 0..40 {
+            key(&mut engine, &keys, &state, KeyCode::Down);
+        }
+        assert_eq!(view(&state).first_visible, 29, "no further than the oldest");
+
+        key(&mut engine, &keys, &state, KeyCode::End);
+        assert_eq!(view(&state), Default::default(), "live, at the top");
+
+        key(&mut engine, &keys, &state, KeyCode::Char('h'));
+        assert_eq!(view(&state).held, Some((1, 29.0 * 625.0)));
+        key(&mut engine, &keys, &state, KeyCode::Char('h'));
+        assert_eq!(view(&state), Default::default());
+    }
+
+    /// `← →` step through the piconets in the roster's order, the view
+    /// starting afresh on each; with no piconet heard they do nothing, and
+    /// never step the radio from under the list.
+    #[test]
+    fn the_arrows_step_through_the_piconets() {
+        let (mut engine, keys, state) = piconet_view(30);
+        metrics(&state).net.packets_view.first_visible = 4;
+        key(&mut engine, &keys, &state, KeyCode::Right);
+        assert_eq!(metrics(&state).net.bt_view.selected, Some(0xfe_17f1));
+        assert_eq!(metrics(&state).net.packets_view, Default::default());
+        key(&mut engine, &keys, &state, KeyCode::Right);
+        assert_eq!(
+            metrics(&state).net.bt_view.selected,
+            Some(0xfe_17f1),
+            "stops at the end"
+        );
+        key(&mut engine, &keys, &state, KeyCode::Left);
+        assert_eq!(metrics(&state).net.bt_view.selected, Some(0xc3_d318));
+
+        let (mut engine, keys, state) = focused_on("net_piconet", "net_bt_packets");
+        {
+            let mut m = metrics(&state);
+            m.net.mode = crate::state::NetMode::Lock;
+            m.net.bt_view.selected = Some(0x12_3456);
+        }
+        key(&mut engine, &keys, &state, KeyCode::Right);
+        let m = metrics(&state);
+        assert_eq!(m.net.bt_view.selected, Some(0x12_3456), "left as it was");
+        assert!(m.net.lock_at.is_none(), "the radio did not move");
+    }
+
+    /// Unfocused, `← →` step a locked radio in NET 6 exactly as in NET 5:
+    /// the same classic receiver, the same block.
+    #[test]
+    fn the_piconet_view_steps_the_radio_as_the_classic_view_does() {
+        let step = |preset: &str| {
+            let (mut engine, keys) = crate::app::App::build_ui(preset, &HashMap::new(), None, true);
+            let state = Arc::new(Mutex::new(SdrMetrics::fixture().streaming()));
+            {
+                let mut m = metrics(&state);
+                m.ui.active_preset = preset.to_string();
+                m.ui.section = crate::signal::net::SECTION.to_string();
+                m.net.mode = crate::state::NetMode::Lock;
+                m.radio.frequency = 2_440_000_000;
+                m.radio.config_sample_rate = 20e6;
+                m.radio.bb_filter_hz = 0;
+                m.net.bt_capacity = 4;
+            }
+            key(&mut engine, &keys, &state, KeyCode::Right);
+            let m = metrics(&state);
+            m.net.lock_at.as_ref().map(|t| t.tune_hz)
+        };
+        assert_eq!(step("net_bt"), Some(2_444_000_000));
+        assert_eq!(step("net_piconet"), step("net_bt"));
     }
 
     /// **The one selection that outlives its focus**: a census device chosen,

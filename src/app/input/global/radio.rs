@@ -177,8 +177,9 @@ pub(super) fn step_net_channel(ctx: &mut InputCtx<'_>, forward: bool) {
         m.radio.config_sample_rate
     };
     let span_mhz = (span / 1e6).floor() as u64;
-    let block_mhz = match (m.ui.active_preset.as_str(), m.net.bt_capacity as u64) {
-        ("net_bt", cap) if cap > 0 => span_mhz.min(cap),
+    let classic = lock::CLASSIC_VIEWS.contains(&m.ui.active_preset.as_str());
+    let block_mhz = match m.net.bt_capacity as u64 {
+        cap if classic && cap > 0 => span_mhz.min(cap),
         _ => span_mhz,
     };
     let how = lock::stepping(&m.ui.active_preset, block_mhz);

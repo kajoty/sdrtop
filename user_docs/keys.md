@@ -358,7 +358,8 @@ just as importantly, what it does not.
 ## NET panel focus modes
 
 A focus letter belongs to its section: `v` is Hardware Vitals on the Lab
-timing bench and the BLE packet list in NET, and no layout shows both. The
+timing bench and a packet list in NET (BLE's, and one classic piconet's),
+and no layout shows two of them. The
 alphabet has twenty-six letters and sdrtop has rather more panels than that,
 so they share, carefully. What
 each panel's numbers mean is on [the NET page](net.md).
@@ -372,6 +373,7 @@ each panel's numbers mean is on [the NET page](net.md).
 | `v` | BLE Advertising | `NET 4` | `↑↓` select a packet · `Enter` only this address, or all again · `H` hold the list, or let it run |
 | `b` | Classic Bluetooth Hops | `NET 5` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
 | `c` | Piconets | `NET 5` | `↑↓` select a piconet |
+| `v` | Packets | `NET 6` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
 
 `T` in the Census asks how far the trusted device's crystal can be off, in
 ppm, as text you type; `Enter` confirms and `Esc` cancels. This table is

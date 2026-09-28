@@ -140,6 +140,25 @@ pub(crate) fn grow_to_contents(
     out
 }
 
+/// `columns` spaced out over a wide panel: each but the last grown by the
+/// same amount, up to `extra`, from what `width` leaves once every column is
+/// laid. The growth lands where the alignment puts the padding, before a
+/// number and after a name, so it reads as a wider gap. A table that only
+/// just fits gets nothing, so [`columns_that_fit`] decides as it did.
+pub(crate) fn breathe(columns: &[Column], width: usize, extra: usize) -> Vec<Column> {
+    let mut out = columns.to_vec();
+    let spaced = columns.len().saturating_sub(1);
+    if spaced == 0 {
+        return out;
+    }
+    let used = SELECTION_GUTTER + columns.iter().map(|c| c.width).sum::<usize>() + GAP * spaced;
+    let each = (width.saturating_sub(used) / spaced).min(extra);
+    for c in out.iter_mut().take(spaced) {
+        c.width += each;
+    }
+    out
+}
+
 /// A cell laid into its column.
 fn cell(text: &str, column: &Column) -> String {
     let n = text.chars().count();
@@ -495,5 +514,39 @@ mod tests {
         // Degenerate: no height, no rows.
         assert_eq!(viewport_start(0, 0, 0, 4), 0);
         assert_eq!(viewport_start(0, 5, 10, 0), 0);
+    }
+
+    /// A wide table gets up to `extra` more columns between its columns,
+    /// evenly, from what is left over; a narrow one keeps its widths, so
+    /// what fits never changes.
+    #[test]
+    fn a_wide_table_breathes_and_a_narrow_one_keeps_its_widths() {
+        let used = SELECTION_GUTTER
+            + COLUMNS.iter().map(|c| c.width).sum::<usize>()
+            + GAP * (COLUMNS.len() - 1);
+        let wide = breathe(COLUMNS, used + 100, 2);
+        let grown: Vec<usize> = wide
+            .iter()
+            .zip(COLUMNS)
+            .map(|(a, b)| a.width - b.width)
+            .collect();
+        let last = grown.len() - 1;
+        assert!(grown[..last].iter().all(|&g| g == 2), "{grown:?}");
+        assert_eq!(grown[last], 0, "nothing after the last column to space");
+
+        let snug = breathe(COLUMNS, used + 3, 2);
+        let added: usize = snug
+            .iter()
+            .zip(COLUMNS)
+            .map(|(a, b)| a.width - b.width)
+            .sum();
+        assert!(added <= 3, "never more than is left over");
+
+        let narrow = breathe(COLUMNS, used - 5, 2);
+        assert!(narrow.iter().zip(COLUMNS).all(|(a, b)| a.width == b.width));
+        assert_eq!(
+            columns_that_fit(&narrow, used - 5),
+            columns_that_fit(COLUMNS, used - 5)
+        );
     }
 }
