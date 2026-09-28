@@ -25,6 +25,7 @@ use ratatui::{
     Frame,
 };
 
+use super::sections::{self, LABEL_W};
 use crate::signal::bt::piconet::{ordered, Inquiry, Kind, Piconet, DCI};
 use crate::signal::dsp::uncertainty::Uncertain;
 use crate::state::SdrMetrics;
@@ -87,9 +88,6 @@ pub(crate) const CHIP: char = '\u{25cf}';
 
 /// Rows the table keeps before the detail block may take any.
 const TABLE_KEEPS: usize = 3;
-
-/// Label width in the detail block.
-const LABEL_W: usize = 9;
 
 /// The same shape the census uses: a bench glances, it does not time.
 fn ago(secs: u64) -> String {
@@ -359,36 +357,6 @@ fn detail_within(
     out
 }
 
-/// BR's modulation index band, **read from the Core Specification 5.4,
-/// Vol 2, Part A, 3.1.1** on the SIG's own site this session: "The
-/// Modulation index shall be between 0.28 and 0.35" (GFSK, BT = 0.5,
-/// 1 Msym/s).
-const BR_INDEX: Limit = Limit::Band {
-    low: 0.28,
-    high: 0.35,
-};
-
-/// The same band as a deviation: `h = 2 * delta_f / 1 Msym/s`, so 140 to
-/// 175 kHz. Derived from [`BR_INDEX`], not a second figure from the text.
-const BR_DELTA_F1_KHZ: Limit = Limit::Band {
-    low: 140.0,
-    high: 175.0,
-};
-
-/// The same section: "the minimum frequency deviation, Fmin ... which
-/// corresponds to 1010 sequence shall be no smaller than ±80% of the
-/// frequency deviation (fd) ... which corresponds to a 00001111 sequence".
-/// The text states it for the minimum; what is shown against it here is the
-/// ratio of the means, which is what a header's symbols support, and the
-/// row is labelled so.
-const BR_RATIO: Limit = Limit::Min(0.8);
-
-/// Resolutions a reading must beat before it prints, as the BLE rows'
-/// (`ble_detail`): a fraction of the band each limit states.
-const INDEX_RESOLUTION: f64 = 0.02;
-const DELTA_F1_RESOLUTION_KHZ: f64 = 10.0;
-const RATIO_RESOLUTION: f64 = 0.1;
-
 /// The MODULATION section (net-ux-polish-plan 6.4): the piconet's BR
 /// modulation index, read from the trailer and header symbols of every
 /// header captured on its LAP (`piconet::Deviation`), as the test suite
@@ -419,7 +387,7 @@ fn modulation_lines(p: &Piconet, iw: usize, theme: &crate::Theme) -> Vec<Line<'s
             d.neighbour_busy
         ))
     });
-    let Some(df1) = d.settled.mean() else {
+    let Some(rows) = sections::modulation_rows(&d, iw, theme) else {
         out.push(quiet(&format!(
             "not measured: {} settled bits in {} headers, two needed",
             d.settled.n, p.headers.captured
@@ -427,31 +395,7 @@ fn modulation_lines(p: &Piconet, iw: usize, theme: &crate::Theme) -> Vec<Line<'s
         out.extend(busy);
         return out;
     };
-    let mut rows = vec![
-        LimitRow::new(
-            "Mod index",
-            Reading::new(df1.scale(2.0 / 1e6), "", INDEX_RESOLUTION),
-            BR_INDEX,
-        ),
-        LimitRow::new(
-            "df1 avg",
-            Reading::new(df1.scale(0.001), "kHz", DELTA_F1_RESOLUTION_KHZ),
-            BR_DELTA_F1_KHZ,
-        ),
-    ];
-    let ratio = d.alternating.mean().map(|df2| df2.ratio(&df1));
-    if let Some(r) = ratio {
-        rows.push(LimitRow::new(
-            "df2/df1",
-            Reading::new(r, "", RATIO_RESOLUTION),
-            BR_RATIO,
-        ));
-    }
-    let w = RowWidths::fit_within(&rows, iw);
-    out.extend(rows.iter().map(|r| Line::from(r.spans(theme, w))));
-    if ratio.is_none() {
-        out.push(quiet("df2/df1: fewer than two alternating bits yet"));
-    }
+    out.extend(rows);
     for chunk in crate::ui::chrome::wrap(
         &format!(
             "{} settled and {} alternating bits from {} headers, every member's, \
@@ -469,37 +413,6 @@ fn modulation_lines(p: &Piconet, iw: usize, theme: &crate::Theme) -> Vec<Line<'s
     out.extend(busy);
     out
 }
-
-/// The initial carrier's limit, **read from the Core Specification 5.4,
-/// Vol 2, Part A, 3.1.3**: "The transmitted initial center frequency shall
-/// be within ±75 kHz from Fc."
-const F0_LIMIT_KHZ: Limit = Limit::Band {
-    low: -75.0,
-    high: 75.0,
-};
-
-/// The drift's limit, **read from the same section's Table 3.3**: ±25 kHz
-/// for a one-slot packet, ±40 kHz for three and five slots. What is read
-/// here is the access code and header, which every packet type must keep
-/// within 40 of its f0; a one-slot packet's 25 is over its whole length,
-/// which a header cannot show. So 40 is what a reading is held to, and a
-/// reading over it is a packet over its limit whatever its type.
-const DRIFT_LIMIT_KHZ: Limit = Limit::Band {
-    low: -40.0,
-    high: 40.0,
-};
-
-/// **The same table**: "Maximum drift rate 400 Hz/µs", allowed "anywhere in
-/// a packet".
-const DRIFT_RATE_LIMIT: Limit = Limit::Band {
-    low: -400.0,
-    high: 400.0,
-};
-
-/// As the BLE rows' (`ble_detail`).
-const F0_RESOLUTION_KHZ: f64 = 10.0;
-const DRIFT_RESOLUTION_KHZ: f64 = 10.0;
-const DRIFT_RATE_RESOLUTION: f64 = 80.0;
 
 /// The CARRIER section: the piconet's initial carrier and drift as the test
 /// suites define them (`piconet::Carrier`, `signal::net::measure`), every
@@ -526,51 +439,11 @@ fn carrier_lines(
             Style::default().fg(theme.stale),
         ))
     };
-    let (Some(f0), Some(mhz)) = (c.f0_ppm.mean(), c.channel_mhz.mean()) else {
+    let Some(rows) = sections::carrier_rows(&c, state, iw, theme) else {
         out.push(quiet("not measured: two headers with enough blocks needed"));
         return out;
     };
-    let now = std::time::Instant::now();
-    let (ppm, provenance) = state.radio.corrected_ppm(f0, now);
-    let khz = ppm.scale(mhz.value() / 1e3);
-    let judged = provenance != crate::state::Provenance::Unreferenced;
-    let mut rows = Vec::new();
-    if judged {
-        rows.push(LimitRow::new(
-            "f0",
-            Reading::new(khz, "kHz", F0_RESOLUTION_KHZ),
-            F0_LIMIT_KHZ,
-        ));
-    }
-    if let Some(d) = c.worst_drift_hz {
-        rows.push(LimitRow::new(
-            "Drift worst",
-            Reading::new(d.scale(0.001), "kHz", DRIFT_RESOLUTION_KHZ),
-            DRIFT_LIMIT_KHZ,
-        ));
-    }
-    if let Some(r) = c.worst_rate_hz_per_us {
-        rows.push(LimitRow::new(
-            "Rate worst",
-            Reading::new(r, "Hz/us", DRIFT_RATE_RESOLUTION),
-            DRIFT_RATE_LIMIT,
-        ));
-    }
-    let w = RowWidths::fit_within(&rows, iw);
-    out.extend(rows.iter().map(|r| Line::from(r.spans(theme, w))));
-    if !judged {
-        out.push(Line::from(vec![
-            crate::ui::chrome::field("f0", LABEL_W, theme),
-            Span::styled(
-                Reading::new(khz, "kHz", F0_RESOLUTION_KHZ).text(),
-                Style::default().fg(theme.value),
-            ),
-            Span::styled(
-                "  relative to our own oscillator".to_string(),
-                Style::default().fg(theme.label),
-            ),
-        ]));
-    }
+    out.extend(rows);
     for chunk in crate::ui::chrome::wrap(
         &format!(
             "from {} headers' access code and header, as the test suite defines them",
