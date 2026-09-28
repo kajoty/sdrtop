@@ -151,7 +151,102 @@ pub struct Headers {
     pub deviation: Deviation,
     /// The carrier under every measured header, likewise.
     pub carrier: Carrier,
+    /// The same readings kept by who sent them, so each device of the
+    /// piconet has its own figures; `deviation` and `carrier` above stay
+    /// their sum.
+    pub sides: Sides,
 }
+
+/// Who sent a packet. The master starts its transmissions in even slots and
+/// the slave in odd ones, both on the master's clock, so the slot's parity
+/// is CLK1, the lowest bit of the CLK1-6 a header is read at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Master,
+    Slave,
+}
+
+impl Direction {
+    /// From the CLK1-6 a header was read at.
+    pub fn of_clk6(clk6: u8) -> Self {
+        if clk6 & 1 == 0 {
+            Direction::Master
+        } else {
+            Direction::Slave
+        }
+    }
+}
+
+/// What a packet's payload told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayloadVerdict {
+    /// POLL, NULL, or an access code with no header after it.
+    NoPayload,
+    /// Checked: the CRC passed (`true`) or failed. A failure says nothing
+    /// about why: an encrypted payload and a damaged capture fail alike.
+    Crc(bool),
+    /// Not read, and why ("PSK", "clock not known").
+    NotRead(&'static str),
+}
+
+/// One packet of a piconet, as the Piconet view lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BtPacket {
+    pub seen: Instant,
+    /// When its access code ended, us on the stream's clock, and which
+    /// stream (`state::BtHop` keeps the same pair, for the same reason).
+    pub at_us: f64,
+    pub stream: u32,
+    pub channel: u8,
+    /// `None`: an access code with no header after it.
+    pub header: Option<HeaderRead>,
+    /// `None` until the header is read at one clock.
+    pub direction: Option<Direction>,
+    /// This packet's own readings; empty when none were taken.
+    pub deviation: Deviation,
+    pub carrier: Carrier,
+    pub payload: PayloadVerdict,
+}
+
+/// One side's readings, and how many packets it has sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Side {
+    pub deviation: Deviation,
+    pub carrier: Carrier,
+    pub packets: u64,
+}
+
+impl Side {
+    fn add(&mut self, deviation: Deviation, carrier: Carrier) {
+        self.deviation.settled.add(deviation.settled);
+        self.deviation.alternating.add(deviation.alternating);
+        self.deviation.neighbour_busy += deviation.neighbour_busy;
+        self.carrier.add(carrier);
+    }
+}
+
+/// A piconet's readings by who sent them. `unknown` holds the packets whose
+/// direction is not known yet: never guessed onto a side.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sides {
+    pub master: Side,
+    pub slave: Side,
+    pub unknown: Side,
+}
+
+impl Sides {
+    pub fn of(&mut self, direction: Option<Direction>) -> &mut Side {
+        match direction {
+            Some(Direction::Master) => &mut self.master,
+            Some(Direction::Slave) => &mut self.slave,
+            None => &mut self.unknown,
+        }
+    }
+}
+
+/// How many packets a piconet keeps: its own ring, so a busy neighbour
+/// cannot push out the one being watched.
+pub const PACKETS_KEPT: usize = 1000;
 
 /// A piconet's carrier as the test suites define it (`dsp::carrier`, read by
 /// `signal::net::measure`), from every header measured on its LAP:
@@ -235,6 +330,8 @@ pub struct Piconet {
     /// for a piconet, odd half slots too for inquiry and paging. Refreshed
     /// with `slots`.
     pub pace: super::slots::Pace,
+    /// Its last [`PACKETS_KEPT`] packets, newest first.
+    pub packets: std::collections::VecDeque<BtPacket>,
 }
 
 /// What a LAP's hits are, as far as they can say.
@@ -320,6 +417,7 @@ pub fn observe(roster: &mut Vec<Piconet>, lap: u32, channel: u8, now: Instant) {
                 slots: None,
                 slots_stream: 0,
                 pace: Default::default(),
+                packets: std::collections::VecDeque::new(),
             });
             roster.last_mut().expect("just pushed")
         }
@@ -362,6 +460,65 @@ pub fn observe_header(
             h.lt_addrs |= 1 << (header.lt_addr & 0x07);
         }
     }
+}
+
+/// Record one packet: into the piconet's ring, newest first, and its
+/// readings onto its side. A LAP the roster has no row for is skipped: a
+/// packet always follows the access code that made the row.
+pub fn observe_packet(roster: &mut [Piconet], lap: u32, packet: BtPacket) {
+    let Some(p) = roster.iter_mut().find(|p| p.lap == lap) else {
+        return;
+    };
+    let side = p.headers.sides.of(packet.direction);
+    side.add(packet.deviation, packet.carrier);
+    side.packets += 1;
+    p.packets.push_front(packet);
+    p.packets.truncate(PACKETS_KEPT);
+}
+
+/// What reading a packet's header told, handed over together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PacketReading {
+    pub header: HeaderRead,
+    pub direction: Option<Direction>,
+    pub deviation: Deviation,
+    pub carrier: Carrier,
+    pub payload: PayloadVerdict,
+}
+
+/// A header read after its access code was recorded: fill in the record
+/// made at the hit (same stream, within 2 us, the tolerance the hop join
+/// uses) and move it from `unknown` to its side, with its readings. The
+/// hit's record came with empty readings, so only the count moves; the
+/// readings are added where the direction puts them. No record near that
+/// time, or one already read: nothing changes.
+pub fn read_packet(
+    roster: &mut [Piconet],
+    lap: u32,
+    stream: u32,
+    at_us: f64,
+    reading: PacketReading,
+) {
+    let Some(p) = roster.iter_mut().find(|p| p.lap == lap) else {
+        return;
+    };
+    let Some(packet) = p
+        .packets
+        .iter_mut()
+        .find(|k| k.stream == stream && k.header.is_none() && (k.at_us - at_us).abs() < 2.0)
+    else {
+        return;
+    };
+    packet.header = Some(reading.header);
+    packet.direction = reading.direction;
+    packet.deviation = reading.deviation;
+    packet.carrier = reading.carrier;
+    packet.payload = reading.payload;
+    let sides = &mut p.headers.sides;
+    sides.unknown.packets = sides.unknown.packets.saturating_sub(1);
+    let side = sides.of(reading.direction);
+    side.packets += 1;
+    side.add(reading.deviation, reading.carrier);
 }
 
 /// The LAPs in the order the roster is drawn: the most recently heard
@@ -491,5 +648,139 @@ mod tests {
         // Most recently heard first.
         let order: Vec<u32> = ordered(&roster).iter().map(|p| p.lap).collect();
         assert_eq!(order, vec![0x5a3c71, 0x123456]);
+    }
+
+    fn packet(at_us: f64, direction: Option<Direction>, settled: f32) -> BtPacket {
+        BtPacket {
+            seen: Instant::now(),
+            at_us,
+            stream: 1,
+            channel: 40,
+            header: None,
+            direction,
+            deviation: Deviation::from_readings(&[settled], &[settled * 0.9]),
+            carrier: Carrier::default(),
+            payload: PayloadVerdict::NoPayload,
+        }
+    }
+
+    /// The master starts in even slots and the slave in odd ones, on the
+    /// master's clock: the slot's parity is CLK1-6's lowest bit.
+    #[test]
+    fn direction_is_the_clocks_slot_parity() {
+        assert_eq!(Direction::of_clk6(44), Direction::Master);
+        assert_eq!(Direction::of_clk6(45), Direction::Slave);
+        assert_eq!(Direction::of_clk6(0), Direction::Master);
+        assert_eq!(Direction::of_clk6(63), Direction::Slave);
+    }
+
+    /// Each piconet keeps its own last thousand packets, newest first, so a
+    /// busy neighbour cannot push out the one being watched.
+    #[test]
+    fn a_piconet_keeps_its_last_thousand_packets_newest_first() {
+        let mut roster = Vec::new();
+        observe(&mut roster, 0xc3_d318, 73, Instant::now());
+        for k in 0..1005 {
+            observe_packet(&mut roster, 0xc3_d318, packet(k as f64, None, 160e3));
+        }
+        let ring = &roster[0].packets;
+        assert_eq!(ring.len(), PACKETS_KEPT);
+        assert_eq!(ring[0].at_us, 1004.0);
+        assert_eq!(ring[PACKETS_KEPT - 1].at_us, 5.0);
+    }
+
+    /// Each packet's readings land on its own side, and the three sides add
+    /// up to the totals every header already feeds.
+    #[test]
+    fn each_side_adds_up_to_the_totals() {
+        let mut roster = Vec::new();
+        observe(&mut roster, 0xfe_17f1, 73, Instant::now());
+        for (k, dir) in [Some(Direction::Master), Some(Direction::Slave), None]
+            .into_iter()
+            .enumerate()
+        {
+            let p = packet(k as f64, dir, 150e3 + k as f32 * 5e3);
+            observe_header(
+                &mut roster,
+                0xfe_17f1,
+                HeaderRead::Unresolved,
+                2,
+                p.deviation,
+                p.carrier,
+            );
+            observe_packet(&mut roster, 0xfe_17f1, p);
+        }
+        let h = &roster[0].headers;
+        assert_eq!(
+            (
+                h.sides.master.packets,
+                h.sides.slave.packets,
+                h.sides.unknown.packets
+            ),
+            (1, 1, 1)
+        );
+        let by_side = h.sides.master.deviation.settled.n
+            + h.sides.slave.deviation.settled.n
+            + h.sides.unknown.deviation.settled.n;
+        assert_eq!(by_side, h.deviation.settled.n);
+        assert_eq!(h.sides.master.deviation.settled.sum, 150e3);
+        assert_eq!(h.sides.slave.deviation.settled.sum, 155e3);
+    }
+
+    /// A packet of a LAP with no row is dropped: a packet always follows the
+    /// access code that made the row.
+    #[test]
+    fn a_packet_for_an_unknown_lap_is_dropped() {
+        let mut roster: Vec<Piconet> = Vec::new();
+        observe_packet(&mut roster, 0x12_3456, packet(0.0, None, 1.0));
+        assert!(roster.is_empty());
+    }
+
+    /// Reading a packet fills in its record and moves it from `unknown` to
+    /// its side, with its readings; one read with no known direction stays
+    /// under `unknown`, its readings added there.
+    #[test]
+    fn reading_a_packet_moves_it_to_its_side() {
+        let mut roster = Vec::new();
+        observe(&mut roster, 0xc3_d318, 73, Instant::now());
+        observe_packet(&mut roster, 0xc3_d318, packet(100.0, None, 0.0));
+        observe_packet(&mut roster, 0xc3_d318, packet(900.0, None, 0.0));
+        let reading = Deviation::from_readings(&[160e3], &[150e3]);
+        read_packet(
+            &mut roster,
+            0xc3_d318,
+            1,
+            100.5,
+            PacketReading {
+                header: HeaderRead::Unresolved,
+                direction: Some(Direction::Slave),
+                deviation: reading,
+                carrier: Carrier::default(),
+                payload: PayloadVerdict::NotRead("clock not known"),
+            },
+        );
+        let p = &roster[0];
+        let read = p.packets.iter().find(|k| k.at_us == 100.0).unwrap();
+        assert_eq!(read.direction, Some(Direction::Slave));
+        assert_eq!(read.header, Some(HeaderRead::Unresolved));
+        assert_eq!(read.deviation.settled.n, 1);
+        let sides = &p.headers.sides;
+        assert_eq!((sides.slave.packets, sides.unknown.packets), (1, 1));
+        assert_eq!(sides.slave.deviation.settled.n, 1);
+        // No record near that time: nothing changes.
+        read_packet(
+            &mut roster,
+            0xc3_d318,
+            1,
+            5_000.0,
+            PacketReading {
+                header: HeaderRead::Unresolved,
+                direction: Some(Direction::Master),
+                deviation: reading,
+                carrier: Carrier::default(),
+                payload: PayloadVerdict::NoPayload,
+            },
+        );
+        assert_eq!(roster[0].headers.sides.master.packets, 0);
     }
 }

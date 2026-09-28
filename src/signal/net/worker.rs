@@ -74,6 +74,11 @@ use super::scan::Scan;
 /// tests hold this string and the preset file's name to agreeing).
 const NET_BT_PRESET: &str = "net_bt";
 
+/// The Piconet view's preset: one piconet, packet by packet. It listens as
+/// the Classic view does, on every channel `bt_channels` allows; left out
+/// of the gate, it would show an empty list forever.
+const NET_PICONET_PRESET: &str = "net_piconet";
+
 /// The survey's preset, where the classic receiver runs on as many channels
 /// as the measured load leaves room for ([`SURVEY_LOAD_HIGH`]).
 const NET_SURVEY_PRESET: &str = "net_survey";
@@ -593,7 +598,7 @@ impl NetWorker {
                 (
                     m.ui.is_net_section(),
                     span.min(rate_hz),
-                    m.ui.active_preset == NET_BT_PRESET,
+                    m.ui.active_preset == NET_BT_PRESET || m.ui.active_preset == NET_PICONET_PRESET,
                     m.ui.active_preset == NET_SURVEY_PRESET,
                     m.net.ble_phy,
                     m.net.mode == crate::state::NetMode::Lock,
@@ -853,6 +858,30 @@ impl NetWorker {
                         ([_], None) => crate::signal::bt::piconet::HeaderRead::Undecoded,
                         _ => crate::signal::bt::piconet::HeaderRead::Unresolved,
                     };
+                    // Who sent it: the slot parity of the clock it was read
+                    // at, and only once it was read there. And what its
+                    // payload told: checked where sdrtop can read the type,
+                    // never guessed where it cannot.
+                    let direction = match read {
+                        crate::signal::bt::piconet::HeaderRead::Decoded(h) => {
+                            Some(crate::signal::bt::piconet::Direction::of_clk6(h.clk6))
+                        }
+                        _ => None,
+                    };
+                    let payload = {
+                        use crate::signal::bt::header::PacketType;
+                        use crate::signal::bt::piconet::{HeaderRead, PayloadVerdict};
+                        match (read, read_at) {
+                            (HeaderRead::Decoded(h), Some((uap, clk6))) => match h.packet_type {
+                                PacketType::Null | PacketType::Poll => PayloadVerdict::NoPayload,
+                                t => match payload::verify_crc(&hit.payload_raw, clk6, t, uap) {
+                                    Some(ok) => PayloadVerdict::Crc(ok),
+                                    None => PayloadVerdict::NotRead("PSK"),
+                                },
+                            },
+                            _ => PayloadVerdict::NotRead("clock not known"),
+                        }
+                    };
                     // The header read again from the raw samples, as the
                     // test suites define its readings (`measure::classic`).
                     let channel_hz = crate::signal::bt::channel::centre_hz(hit.ch);
@@ -881,6 +910,8 @@ impl NetWorker {
                         clock.hypotheses(),
                         measured.0,
                         measured.1,
+                        direction,
+                        payload,
                     ));
                     narrowed_by_lap.push((hit.lap, shown));
                 }
@@ -931,6 +962,23 @@ impl NetWorker {
                             stream: stream_id,
                             header: None,
                         });
+                        // Every hit is a packet, read or not: an ID row
+                        // until a header is joined to it.
+                        crate::signal::bt::piconet::observe_packet(
+                            &mut m.net.bt_piconets,
+                            lap,
+                            crate::signal::bt::piconet::BtPacket {
+                                seen: now,
+                                at_us,
+                                stream: stream_id,
+                                channel,
+                                header: None,
+                                direction: None,
+                                deviation: Default::default(),
+                                carrier: Default::default(),
+                                payload: crate::signal::bt::piconet::PayloadVerdict::NoPayload,
+                            },
+                        );
                     }
                     m.net.bt_hops.truncate(crate::state::BT_HOP_LIMIT);
                     for (lap, narrowed) in narrowed_by_lap {
@@ -945,7 +993,9 @@ impl NetWorker {
                             p.pace = pace;
                         }
                     }
-                    for (lap, at_us, read, hypotheses, deviation, carrier) in headers_read {
+                    for (lap, at_us, read, hypotheses, deviation, carrier, direction, payload) in
+                        headers_read
+                    {
                         // Joined to its hit by LAP and time: the header's
                         // capture starts on the lane that found the access
                         // code, which may be a quarter-symbol lane off the
@@ -962,6 +1012,19 @@ impl NetWorker {
                             hypotheses,
                             deviation,
                             carrier,
+                        );
+                        crate::signal::bt::piconet::read_packet(
+                            &mut m.net.bt_piconets,
+                            lap,
+                            stream_id,
+                            at_us,
+                            crate::signal::bt::piconet::PacketReading {
+                                header: read,
+                                direction,
+                                deviation,
+                                carrier,
+                                payload,
+                            },
                         );
                     }
                 }
@@ -2246,6 +2309,102 @@ mod tests {
         assert!(m.net.bt_load_limited);
         assert_eq!(m.net.bt_hops.len(), 1, "{:?}", m.net.bt_hops);
         assert_eq!(m.net.bt_hops[0].lap, lap);
+    }
+
+    /// An access code with nothing after it on channel 45 of a 20 Msps
+    /// capture tuned to it: the device bytes and the tuning.
+    fn access_code_only(lap: u32) -> (Vec<u8>, u64) {
+        use crate::signal::ble::gfsk::modulate;
+        use crate::signal::bt::access_code::access_code_bits;
+        use crate::signal::dsp::testkit::{at_snr, Rng};
+        use num_complex::Complex;
+        const RAW_RATE: f64 = 20_000_000.0;
+        let channel_hz = crate::signal::bt::channel::centre_hz(45).unwrap();
+        let mut bits: Vec<bool> = (0..40).map(|i| i % 2 == 0).collect();
+        bits.extend(access_code_bits(lap));
+        bits.extend((0..40).map(|i| i % 2 == 1));
+        let clean = modulate(&bits, 20, 160_000.0, RAW_RATE, 0.5);
+        let placed = at_snr(&clean, 40.0, &mut Rng::new(7));
+        let geometry = eight_bit();
+        let bytes = placed
+            .iter()
+            .flat_map(|s: &Complex<f32>| {
+                let re = (s.re * geometry.full_scale).clamp(-127.0, 127.0) as i8;
+                let im = (s.im * geometry.full_scale).clamp(-127.0, 127.0) as i8;
+                [re as u8, im as u8]
+            })
+            .collect();
+        (bytes, channel_hz)
+    }
+
+    /// Run one capture through the worker on `preset`, tuned to `tuned`.
+    fn run_classic(preset: &str, tuned: u64, bytes: Vec<u8>) -> Arc<Mutex<SdrMetrics>> {
+        let mut m = SdrMetrics::fixture().streaming();
+        m.ui.section = crate::signal::net::SECTION.to_string();
+        m.ui.active_preset = preset.to_string();
+        m.radio.frequency = tuned;
+        m.radio.config_sample_rate = 20_000_000.0;
+        m.radio.bb_filter_hz = 0;
+        let state = Arc::new(Mutex::new(m));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(stamped(&state, 1, false, bytes)).unwrap();
+        drop(tx);
+        NetWorker::new(rx, Arc::clone(&state), eight_bit(), SAFE_BT_CHANNELS).run();
+        state
+    }
+
+    /// The Piconet view listens as the Classic view does: without it in the
+    /// gate, the view would be empty forever.
+    #[test]
+    fn the_piconet_view_runs_the_classic_receiver() {
+        let (bytes, tuned) = access_code_only(0x0044_5566);
+        let state = run_classic(NET_PICONET_PRESET, tuned, bytes);
+        let m = state.lock().unwrap();
+        assert!(m.net.bt_refused.is_none(), "{:?}", m.net.bt_refused);
+        assert_eq!(m.net.bt_channels_watched.len(), SAFE_BT_CHANNELS);
+        assert_eq!(m.net.bt_hops.len(), 1);
+    }
+
+    /// A header read at one clock is a packet with its direction, which is
+    /// that clock's slot parity, and its payload's verdict: this DH1's CRC
+    /// checks out.
+    #[test]
+    fn a_header_read_at_one_clock_is_a_packet_with_its_direction() {
+        use crate::signal::bt::piconet::{Direction, HeaderRead, PayloadVerdict};
+        let lap = 0x0033_2211u32;
+        let (bytes, tuned) = dh1_capture(lap, 0x7b);
+        let state = run_classic("net_bt", tuned, bytes);
+        let m = state.lock().unwrap();
+        let p = m.net.bt_piconets.iter().find(|p| p.lap == lap).unwrap();
+        assert_eq!(p.packets.len(), 1, "{:?}", p.packets);
+        let packet = &p.packets[0];
+        let Some(HeaderRead::Decoded(h)) = packet.header else {
+            panic!("{:?}", packet.header);
+        };
+        assert_eq!(packet.direction, Some(Direction::of_clk6(h.clk6)));
+        assert_eq!(packet.payload, PayloadVerdict::Crc(true));
+        assert!(packet.deviation.settled.n > 0, "its own readings kept");
+        let side = p.headers.sides.clone().of(packet.direction).packets;
+        assert_eq!(side, 1, "counted on its side, not under unknown");
+        assert_eq!(p.headers.sides.unknown.packets, 0);
+    }
+
+    /// An access code with no header after it is an ID row: no header, no
+    /// payload, no direction.
+    #[test]
+    fn a_hit_with_no_header_is_an_id_row() {
+        use crate::signal::bt::piconet::PayloadVerdict;
+        let lap = 0x0044_5566;
+        let (bytes, tuned) = access_code_only(lap);
+        let state = run_classic("net_bt", tuned, bytes);
+        let m = state.lock().unwrap();
+        let p = m.net.bt_piconets.iter().find(|p| p.lap == lap).unwrap();
+        assert_eq!(p.packets.len(), 1);
+        let packet = &p.packets[0];
+        assert_eq!(packet.header, None);
+        assert_eq!(packet.payload, PayloadVerdict::NoPayload);
+        assert_eq!(packet.direction, None);
+        assert_eq!(p.headers.sides.unknown.packets, 1);
     }
 
     /// A classic packet on channel 45 of a 20 Msps capture tuned to it:
