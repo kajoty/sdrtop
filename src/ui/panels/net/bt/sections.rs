@@ -349,7 +349,7 @@ pub(super) fn header_lines(
                     h.captured
                 ),
             ));
-            out.push(field("clock", clock_text(h.clock_hypotheses)));
+            out.push(field("CLK1-6", clock_text(h.clock_hypotheses)));
             return out;
         }
     };
@@ -400,7 +400,7 @@ pub(super) fn header_lines(
             addrs.join(", ")
         },
     ));
-    out.push(field("clock", clock_text(h.clock_hypotheses)));
+    out.push(field("CLK1-6", clock_text(h.clock_hypotheses)));
     out
 }
 
@@ -408,9 +408,9 @@ pub(super) fn header_lines(
 /// depends on it.
 fn clock_text(hypotheses: u8) -> String {
     match hypotheses {
-        0 => "CLK1-6 not tracked yet".to_string(),
-        1 => "CLK1-6 found (1 of 64 hypotheses left)".to_string(),
-        n => format!("CLK1-6: {n} of 64 hypotheses left"),
+        0 => "not tracked yet".to_string(),
+        1 => "found (1 of 64 hypotheses left)".to_string(),
+        n => format!("{n} of 64 hypotheses left"),
     }
 }
 

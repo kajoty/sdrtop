@@ -26,7 +26,8 @@ use ratatui::{
 };
 
 use super::sections::{
-    self, channel_runs, F0_RESOLUTION_KHZ, INDEX_RESOLUTION, JITTER_RESOLUTION_US, LABEL_W,
+    self, channel_runs, CLOCK_RESOLUTION_PPM, F0_RESOLUTION_KHZ, INDEX_RESOLUTION,
+    JITTER_RESOLUTION_US, LABEL_W,
 };
 use crate::signal::bt::piconet::{ordered, Inquiry, Kind, Piconet, DCI};
 use crate::state::SdrMetrics;
@@ -368,6 +369,7 @@ fn piconet_lines(
             channel_runs(p.channel_mask())
         ),
     );
+    wrapped(&mut out, "clock", &clock_row(p, state));
     let value = |r: Option<Reading>| {
         r.and_then(|r| r.value_text())
             .unwrap_or_else(|| "—".to_string())
@@ -385,12 +387,6 @@ fn piconet_lines(
                 Reading::new(ppm.scale(mhz.value() / 1e3), "kHz", F0_RESOLUTION_KHZ)
             }),
     );
-    let rms = value(
-        p.slots
-            .as_ref()
-            .and_then(|s| s.as_ref().ok())
-            .map(|f| Reading::new(f.rms_us, "us", JITTER_RESOLUTION_US)),
-    );
     let dot = || Span::styled(" · ".to_string(), Style::default().fg(theme.label));
     let unit = |u: &str| Span::styled(u.to_string(), Style::default().fg(theme.label));
     let ink = |t: String| Span::styled(t, Style::default().fg(theme.value));
@@ -401,15 +397,72 @@ fn piconet_lines(
         unit("f0 "),
         ink(f0),
         unit(" kHz"),
-        dot(),
-        unit("grid rms "),
-        ink(rms),
-        unit(" us"),
+        unit(", every member's"),
     ]));
-    out.push(Line::from(Span::styled(
-        " Enter: packet by packet, on NET 6".to_string(),
-        Style::default().fg(theme.label),
-    )));
+    out
+}
+
+/// The piconet's slot clock from its fitted grid, with the grid's rms and
+/// what they rest on, or why there is no grid, in the words the bench's
+/// TIMING uses. The rms is every member's residuals together, so it is not
+/// a jitter: the two ends' offset from each other is in it (the bench has
+/// each end's).
+fn clock_row(p: &Piconet, state: &SdrMetrics) -> String {
+    use crate::signal::bt::slots::SlotRefusal;
+    match &p.slots {
+        None => "no hit timed yet".to_string(),
+        Some(Err(SlotRefusal::Collecting { have, need })) => {
+            format!("collecting: {have} of {need} hits to fit a slot grid")
+        }
+        Some(Err(SlotRefusal::NoGrid { hits })) => {
+            format!("no slot grid: {hits} hits do not line up at 625 us beyond chance")
+        }
+        Some(Ok(f)) => {
+            let (clock, judged) = sections::clock_of(f, state);
+            let span = crate::ui::widgets::timing_fmt::seconds_ms((f.span_us / 1e3) as u64);
+            format!(
+                "{}{} · grid rms {} · {} hits over {span}",
+                Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM).text(),
+                if judged { "" } else { ", relative" },
+                Reading::new(f.rms_us, "us", JITTER_RESOLUTION_US).text(),
+                f.hits
+            )
+        }
+    }
+}
+
+/// A piconet's sections within `budget` rows: PICONET whole or nothing
+/// (the table's rows come first, as the census's do), then HEADERS while
+/// it fits whole, a line naming it where it does not, and the way to NET 6
+/// last.
+fn piconet_within(
+    p: &Piconet,
+    state: &SdrMetrics,
+    now: std::time::Instant,
+    iw: usize,
+    budget: usize,
+    theme: &crate::Theme,
+) -> Vec<Line<'static>> {
+    let mut out = piconet_lines(p, state, now, iw, theme);
+    if out.len() > budget {
+        return Vec::new();
+    }
+    let note = |text: &str| {
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(theme.label),
+        ))
+    };
+    let headers = sections::header_lines(p, state, iw, theme);
+    // Whole, leaving a row for the way to NET 6.
+    if out.len() + headers.len() < budget {
+        out.extend(headers);
+    } else if out.len() < budget {
+        out.push(note("+ HEADERS on a taller panel"));
+    }
+    if out.len() < budget {
+        out.push(note("Enter: packet by packet, on NET 6"));
+    }
     out
 }
 
@@ -426,10 +479,7 @@ fn detail_within(
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let text = match p.kind() {
-        Kind::Piconet => {
-            let out = piconet_lines(p, state, now, iw, theme);
-            return if out.len() > budget { Vec::new() } else { out };
-        }
+        Kind::Piconet => return piconet_within(p, state, now, iw, budget, theme),
         Kind::Inquiry(_) => format!(
             "UAP fixed at the DCI, {DCI:#04x}. Every device inquiring sends this code, \
              so there is no one clock, modulation or header stream to read"
@@ -930,6 +980,169 @@ mod tests {
         let full = line(&m);
         assert!(full.contains("index 0.32"), "{full}");
         assert!(full.contains("f0 12.2 kHz"), "{full}");
-        assert!(full.contains("grid rms"), "{full}");
+        assert!(!full.contains("grid rms"), "on the clock row now: {full}");
+    }
+
+    /// **Headers are read only under one UAP**: before, the section says
+    /// how many wait and why; after, the read and the undecoded counts (a
+    /// rising undecoded count is how a wrong UAP would show), the session's
+    /// type mix and LT_ADDRs, and the clock hunt, under a heading that says
+    /// it is a port.
+    #[test]
+    fn headers_are_read_only_once_the_uap_is_one_value() {
+        use crate::signal::bt::header::{Header, PacketType};
+        use crate::signal::bt::piconet::observe_header;
+        use crate::signal::bt::piconet::HeaderRead;
+        const LAP: u32 = 0x5a3c71;
+        let mut m = heard();
+        m.net.bt_view.selected = Some(LAP);
+        m.net.bt_uap.insert(LAP, vec![0x4c, 0x9a]);
+        let at = |m: &SdrMetrics| draw(NetBtPiconetsPanel, 70, 40, m).join("\n");
+        assert!(at(&m).contains("none yet"), "{}", at(&m));
+
+        observe_header(
+            &mut m.net.bt_piconets,
+            LAP,
+            HeaderRead::Unresolved,
+            2,
+            Default::default(),
+            Default::default(),
+        );
+        let out = at(&m);
+        assert!(
+            out.contains("1, not read: UAP not resolved (2 candidates)"),
+            "{out}"
+        );
+
+        m.net.bt_uap.insert(LAP, vec![0x4c]);
+        let read = |t, a| {
+            HeaderRead::Decoded(Header {
+                lt_addr: a,
+                packet_type: t,
+                flags: 0,
+                hec: 0,
+                clk6: 0,
+            })
+        };
+        for (t, a) in [
+            (PacketType::Poll, 1),
+            (PacketType::Poll, 1),
+            (PacketType::Null, 0),
+            (PacketType::Dh1, 2),
+            (PacketType::Poll, 2),
+        ] {
+            observe_header(
+                &mut m.net.bt_piconets,
+                LAP,
+                read(t, a),
+                1,
+                Default::default(),
+                Default::default(),
+            );
+        }
+        observe_header(
+            &mut m.net.bt_piconets,
+            LAP,
+            HeaderRead::Undecoded,
+            1,
+            Default::default(),
+            Default::default(),
+        );
+        let out = at(&m);
+        assert!(
+            out.contains("HEADERS") && out.contains("checked on air"),
+            "{out}"
+        );
+        assert!(
+            out.contains("5 of 7 captured, 1 did not decode under 0x4c"),
+            "{out}"
+        );
+        assert!(
+            out.contains("POLL 3 \u{00b7} NULL 1 \u{00b7} DH1/2-DH1 1"),
+            "{out}"
+        );
+        assert!(out.contains("0 (broadcast), 1, 2"), "{out}");
+        assert!(out.contains("CLK1-6   found"), "{out}");
+    }
+
+    /// The piconet's clock from its slot grid, with the grid's rms and what
+    /// it rests on: a reading relative to our own oscillator with no
+    /// reference, and corrected once a reference makes it absolute.
+    #[test]
+    fn the_piconet_clock_is_relative_until_a_reference_judges_it() {
+        let mut m = heard();
+        m.net.bt_view.selected = Some(0x123456);
+        let times: Vec<f64> = (0..40u32)
+            .map(|k| f64::from(k * 5) * crate::signal::bt::slots::SLOT_US * (1.0 + 6e-6))
+            .collect();
+        let p = m
+            .net
+            .bt_piconets
+            .iter_mut()
+            .find(|p| p.lap == 0x123456)
+            .unwrap();
+        p.slots = Some(crate::signal::bt::slots::fit(&times));
+        let out = draw(NetBtPiconetsPanel, 70, 40, &m);
+        let clock = out
+            .iter()
+            .find(|l| l.starts_with("│ clock "))
+            .unwrap()
+            .clone();
+        // Slots 6 ppm long: a clock 6 ppm slow.
+        assert!(
+            clock.contains("-6") && clock.contains("relative") && clock.contains("grid rms"),
+            "{clock}"
+        );
+
+        m.radio.reference = Some(crate::state::FrequencyReference {
+            ppm: 2.0,
+            sigma_ppm: 0.1,
+            provenance: crate::state::Provenance::Traceable,
+            source: "WWV 10 MHz".to_string(),
+            at: std::time::Instant::now(),
+            efficiency: None,
+            trusted: None,
+        });
+        let out = draw(NetBtPiconetsPanel, 70, 40, &m);
+        let clock = out.iter().find(|l| l.starts_with("│ clock ")).unwrap();
+        assert!(
+            clock.contains("-4") && !clock.contains("relative"),
+            "corrected: {clock}"
+        );
+    }
+
+    /// On the laptop's own terminal, 191 x 41 with the header, the log and
+    /// the footer, the Classic view shows both of the selected piconet's
+    /// sections whole.
+    #[test]
+    fn at_191_by_41_net_5_shows_every_section() {
+        let (engine, _) =
+            crate::app::App::build_ui("net_bt", &std::collections::HashMap::new(), None, true);
+        let mut m = heard();
+        m.ui.active_preset = "net_bt".to_string();
+        observe(&mut m.net.bt_piconets, 0x9a_0001, 30, Instant::now());
+        m.net.bt_view.selected = Some(0x5a3c71);
+        let theme = crate::Theme::sdr();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(191, 41)).unwrap();
+        t.draw(|f| engine.draw(f, &m, &theme)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: String = (0..41)
+            .map(|y| (0..191).map(|x| buf.get(x, y).symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(
+            text.contains("PICONET") && text.contains("HEADERS"),
+            "{text}"
+        );
+        assert!(!text.contains("taller panel"), "{text}");
+    }
+
+    /// A short panel keeps what fits whole and names the rest.
+    #[test]
+    fn a_short_panel_names_what_does_not_fit() {
+        let mut m = heard();
+        m.net.bt_view.selected = Some(0x5a3c71);
+        let text = draw(NetBtPiconetsPanel, 70, 16, &m).join("\n");
+        assert!(text.contains("PICONET"), "{text}");
+        assert!(text.contains("+ HEADERS on a taller panel"), "{text}");
     }
 }

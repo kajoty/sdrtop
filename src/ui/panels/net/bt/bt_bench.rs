@@ -1289,84 +1289,6 @@ mod tests {
         assert!(note.contains("plots on a taller panel"), "whole: {text}");
     }
 
-    /// **Headers are read only under one UAP**: before, the section says
-    /// how many wait and why; after, the read and the undecoded counts (a
-    /// rising undecoded count is how a wrong UAP would show), the session's
-    /// type mix and LT_ADDRs, and the clock hunt, under a heading that says
-    /// it is a port.
-    #[test]
-    fn headers_are_read_only_once_the_uap_is_one_value() {
-        use crate::signal::bt::piconet::observe_header;
-        let mut m = heard();
-        m.net.bt_uap.insert(LAP, vec![0x4c, 0x9a]);
-        let at = |m: &SdrMetrics| draw(NetBtBenchPanel, 100, 80, m).join("\n");
-        assert!(at(&m).contains("none yet"), "{}", at(&m));
-
-        observe_header(
-            &mut m.net.bt_piconets,
-            LAP,
-            HeaderRead::Unresolved,
-            2,
-            Default::default(),
-            Default::default(),
-        );
-        let out = at(&m);
-        assert!(
-            out.contains("1, not read: UAP not resolved (2 candidates)"),
-            "{out}"
-        );
-
-        m.net.bt_uap.insert(LAP, vec![0x4c]);
-        let read = |t, a| {
-            HeaderRead::Decoded(Header {
-                lt_addr: a,
-                packet_type: t,
-                flags: 0,
-                hec: 0,
-                clk6: 0,
-            })
-        };
-        for (t, a) in [
-            (PacketType::Poll, 1),
-            (PacketType::Poll, 1),
-            (PacketType::Null, 0),
-            (PacketType::Dh1, 2),
-            (PacketType::Poll, 2),
-        ] {
-            observe_header(
-                &mut m.net.bt_piconets,
-                LAP,
-                read(t, a),
-                1,
-                Default::default(),
-                Default::default(),
-            );
-        }
-        observe_header(
-            &mut m.net.bt_piconets,
-            LAP,
-            HeaderRead::Undecoded,
-            1,
-            Default::default(),
-            Default::default(),
-        );
-        let out = at(&m);
-        assert!(
-            out.contains("HEADERS") && out.contains("checked on air"),
-            "{out}"
-        );
-        assert!(
-            out.contains("5 of 7 captured, 1 did not decode under 0x4c"),
-            "{out}"
-        );
-        assert!(
-            out.contains("POLL 3 \u{00b7} NULL 1 \u{00b7} DH1/2-DH1 1"),
-            "{out}"
-        );
-        assert!(out.contains("0 (broadcast), 1, 2"), "{out}");
-        assert!(out.contains("CLK1-6 found"), "{out}");
-    }
-
     /// What every reading rests on is said under it, as it was on the
     /// Classic view: the bits and headers the modulation is read from, the
     /// headers a busy neighbour kept from being read, and the headers the
@@ -1407,45 +1329,6 @@ mod tests {
         assert!(
             out.contains("from 2 headers' access code and header"),
             "{out}"
-        );
-    }
-
-    /// The piconet's clock from its slot grid: a reading relative to our
-    /// own oscillator with no reference, and corrected once a reference
-    /// makes it absolute.
-    #[test]
-    fn the_piconet_clock_is_relative_until_a_reference_judges_it() {
-        let mut m = heard();
-        let times: Vec<f64> = (0..40u32)
-            .map(|k| f64::from(k * 5) * crate::signal::bt::slots::SLOT_US * (1.0 + 6e-6))
-            .collect();
-        m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
-        let out = draw(NetBtBenchPanel, 100, 80, &m);
-        let clock = out
-            .iter()
-            .find(|l| l.starts_with("│ clock "))
-            .unwrap()
-            .clone();
-        // Slots 6 ppm long: a clock 6 ppm slow.
-        assert!(
-            clock.contains("-6") && clock.contains("relative to our own oscillator"),
-            "{clock}"
-        );
-
-        m.radio.reference = Some(crate::state::FrequencyReference {
-            ppm: 2.0,
-            sigma_ppm: 0.1,
-            provenance: crate::state::Provenance::Traceable,
-            source: "WWV 10 MHz".to_string(),
-            at: std::time::Instant::now(),
-            efficiency: None,
-            trusted: None,
-        });
-        let out = draw(NetBtBenchPanel, 100, 80, &m);
-        let clock = out.iter().find(|l| l.starts_with("│ clock ")).unwrap();
-        assert!(
-            clock.contains("-4") && !clock.contains("relative"),
-            "corrected: {clock}"
         );
     }
 
