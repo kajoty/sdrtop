@@ -48,9 +48,6 @@ use crate::ui::widgets::reading::Reading;
 
 pub struct NetBtBenchPanel;
 
-/// Columns between the master's column and the slave's.
-const GAP: usize = 1;
-
 /// `line` cut to `width` columns, span by span, so a row too wide for its
 /// column never runs into the next.
 fn fit(line: Line<'static>, width: usize) -> Line<'static> {
@@ -81,9 +78,9 @@ fn quiet(text: String, theme: &crate::Theme) -> Line<'static> {
     ))
 }
 
-/// A note under a section: what its readings rest on, in the label ink.
-fn footnote(text: &str, iw: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
-    crate::ui::chrome::wrap(text, iw.saturating_sub(1), 2)
+/// A note under a plot: what it rests on, in the label ink.
+fn footnote(text: &str, width: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
+    crate::ui::chrome::wrap(text, width.saturating_sub(1), 2)
         .into_iter()
         .map(|chunk| {
             Line::from(Span::styled(
@@ -94,8 +91,7 @@ fn footnote(text: &str, iw: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A field row across the whole bench: its label, a value, and what the
-/// value is.
+/// A field row across a section: its label, a value, and what the value is.
 fn field(label: &str, value: String, note: &str, theme: &crate::Theme) -> Line<'static> {
     Line::from(vec![
         crate::ui::chrome::field(label, PAIR_LABEL, theme),
@@ -105,69 +101,50 @@ fn field(label: &str, value: String, note: &str, theme: &crate::Theme) -> Line<'
     ])
 }
 
-/// The longest label a paired row carries, `Drift worst`.
+/// The longest label a row carries, `Drift worst`.
 const PAIR_LABEL: usize = 11;
+
+/// A row's label column: a space, the label, a space.
+const LABEL_COLUMN: usize = PAIR_LABEL + 2;
+
+/// The room a reading takes before its bar, `167.03 ±0.03 kHz` and a
+/// little over, so the bars of one section start in one column.
+const READING_W: usize = 18;
 
 /// The widest a bar is drawn, so a wide bench does not stretch a gauge
 /// into a line nobody reads end to end.
 const BAR_MAX: usize = 32;
 
-/// The bench's columns: the labels once, then the master's and the
-/// slave's, a gap between.
+/// The narrowest bar worth drawing.
+const BAR_MIN: usize = 10;
+
+/// The two ends' inks: the master in the piconet's own colour, its chip on
+/// the hop chart and in the roster; the slave in the ordinary ink, which no
+/// piconet's colour is, so the two never look alike.
 #[derive(Clone, Copy)]
-struct Columns {
-    side: usize,
-    /// Too narrow for two columns: each side's reading on a line of its
-    /// own, marked with its arrow, and no bars.
-    stacked: bool,
+struct Inks {
     master: Color,
     slave: Color,
 }
 
-impl Columns {
-    const LABEL: usize = PAIR_LABEL + 2;
-
-    /// The narrowest a side's column is drawn at: a reading, its
-    /// uncertainty and its unit, `167.03 ±0.03 kHz`, with room to spare.
-    const SIDE_MIN: usize = 26;
-
-    fn of(iw: usize, master: Color, slave: Color) -> Self {
-        let side = iw.saturating_sub(Self::LABEL + GAP) / 2;
-        let stacked = side < Self::SIDE_MIN;
-        Self {
-            side: if stacked {
-                iw.saturating_sub(Self::LABEL + 2)
-            } else {
-                side
-            },
-            stacked,
-            master,
-            slave,
-        }
-    }
-
-    fn bar(self) -> usize {
-        self.side.saturating_sub(1).min(BAR_MAX)
-    }
-}
-
-/// One side's cell in a paired row.
+/// One end's cell in a row.
 enum Cell<'a> {
-    /// Held to a limit: the reading, and its bar on the line below.
+    /// Held to a limit: the reading, then its bar.
     Judged(LimitRow<'a>),
     /// A reading with nothing it can be held to yet (a relative offset).
     Plain(Reading<'a>),
     /// Plain text, a count.
     Text(String),
-    /// Nothing on this side, and why, briefly.
+    /// Nothing on this end, and why, briefly.
     Missing(&'static str),
-    /// A trace of the side's newest packets, oldest on the left, in the
-    /// side's colour, with the span it is scaled to.
-    Trend(String, String, Color),
+    /// A trace of the end's newest packets, oldest on the left, with the
+    /// span it is scaled to.
+    Trend(String, String),
 }
 
 impl Cell<'_> {
-    fn spans(&self, theme: &crate::Theme) -> Vec<Span<'static>> {
+    /// The reading's spans, in `ink` where the cell is a trace.
+    fn spans(&self, ink: Color, theme: &crate::Theme) -> Vec<Span<'static>> {
         match self {
             Cell::Judged(row) => {
                 let mut spans = row.reading_spans(theme);
@@ -184,9 +161,9 @@ impl Cell<'_> {
                 format!("— {why}"),
                 Style::default().fg(theme.stale),
             )],
-            Cell::Trend(trace, span, colour) => vec![
-                Span::styled(trace.clone(), Style::default().fg(*colour)),
-                Span::styled(format!("  {span}"), Style::default().fg(theme.label)),
+            Cell::Trend(trace, span) => vec![
+                Span::styled(trace.clone(), Style::default().fg(ink)),
+                Span::styled(format!(" {span}"), Style::default().fg(theme.label)),
             ],
         }
     }
@@ -201,42 +178,63 @@ fn exactly(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// A paired row: the label, the master's cell and the slave's; then, where
-/// either is held to a limit, both bars on a line of their own under them.
-fn pair(
+/// A reading of both ends as two rows, `▶` the master's then `◀` the
+/// slave's, each with its bar after the reading in what `width` leaves (at
+/// most `BAR_MAX`, none under `BAR_MIN`); the label once, on the first row.
+fn side_rows(
     label: &str,
     master: Cell<'_>,
     slave: Cell<'_>,
-    c: Columns,
+    width: usize,
+    inks: Inks,
     theme: &crate::Theme,
-) -> Vec<Line<'static>> {
-    let mut first = vec![
+) -> [Line<'static>; 2] {
+    let bar = width
+        .saturating_sub(LABEL_COLUMN + 2 + READING_W + 1)
+        .min(BAR_MAX);
+    let row = |label: &str, arrow: &str, ink: Color, cell: &Cell<'_>| {
+        let mut spans = vec![
+            crate::ui::chrome::field(label, PAIR_LABEL, theme),
+            Span::raw(" "),
+            Span::styled(format!("{arrow} "), Style::default().fg(ink)),
+        ];
+        match cell {
+            Cell::Judged(limit) if bar >= BAR_MIN => {
+                spans.extend(exactly(cell.spans(ink, theme), READING_W));
+                spans.push(Span::raw(" "));
+                spans.extend(limit.bar_spans(theme, bar));
+            }
+            _ => spans.extend(cell.spans(ink, theme)),
+        }
+        fit(Line::from(spans), width)
+    };
+    [
+        row(label, "▶", inks.master, &master),
+        row("", "◀", inks.slave, &slave),
+    ]
+}
+
+/// A trend of both ends on one row: `▶` the master's trace and span, then
+/// `◀` the slave's, each in its end's ink.
+fn trend_row(
+    label: &str,
+    master: Cell<'_>,
+    slave: Cell<'_>,
+    width: usize,
+    inks: Inks,
+    theme: &crate::Theme,
+) -> Line<'static> {
+    let arrow = |a: &str, ink| Span::styled(format!("{a} "), Style::default().fg(ink));
+    let mut spans = vec![
         crate::ui::chrome::field(label, PAIR_LABEL, theme),
         Span::raw(" "),
+        arrow("▶", inks.master),
     ];
-    if c.stacked {
-        let arrow = |a: &str, colour| Span::styled(a.to_string(), Style::default().fg(colour));
-        first.push(arrow("▶ ", c.master));
-        first.extend(exactly(master.spans(theme), c.side));
-        let mut second = vec![Span::raw(" ".repeat(Columns::LABEL)), arrow("◀ ", c.slave)];
-        second.extend(exactly(slave.spans(theme), c.side));
-        return vec![Line::from(first), Line::from(second)];
-    }
-    first.extend(exactly(master.spans(theme), c.side + GAP));
-    first.extend(exactly(slave.spans(theme), c.side));
-    let mut out = vec![Line::from(first)];
-    let bar = |cell: &Cell<'_>| match cell {
-        Cell::Judged(row) if c.bar() >= 8 => row.bar_spans(theme, c.bar()),
-        _ => Vec::new(),
-    };
-    let (mb, sb) = (bar(&master), bar(&slave));
-    if !mb.is_empty() || !sb.is_empty() {
-        let mut second = vec![Span::raw(" ".repeat(Columns::LABEL))];
-        second.extend(exactly(mb, c.side + GAP));
-        second.extend(exactly(sb, c.side));
-        out.push(Line::from(second));
-    }
-    out
+    spans.extend(master.spans(inks.master, theme));
+    spans.push(Span::raw("   "));
+    spans.push(arrow("◀", inks.slave));
+    spans.extend(slave.spans(inks.slave, theme));
+    fit(Line::from(spans), width)
 }
 
 /// The most braille cells a trend takes, two points to a cell.
@@ -256,14 +254,10 @@ const TREND_GROUP: usize = 4;
 fn trend(
     p: &Piconet,
     direction: Direction,
-    c: Columns,
     places: usize,
     value: impl Fn(&crate::signal::bt::piconet::BtPacket) -> Option<f64>,
 ) -> Cell<'static> {
-    let cells = c.side.saturating_sub(16).min(TREND_CELLS);
-    if cells < 4 {
-        return Cell::Missing("no room for a trend");
-    }
+    let cells = TREND_CELLS;
     let mut values: Vec<f64> = p
         .packets
         .iter()
@@ -289,25 +283,21 @@ fn trend(
             (lo.min(*v), hi.max(*v))
         });
     let data: Vec<f32> = points.iter().map(|v| *v as f32).collect();
-    let colour = match direction {
-        Direction::Master => c.master,
-        Direction::Slave => c.slave,
-    };
     Cell::Trend(
         // Exactly as many cells as there are points for, so the newest is
         // at the right edge.
         crate::ui::widgets::charts::mini_braille_line(&data, points.len().div_ceil(2)),
         format!("{lo:.places$}–{hi:.places$}"),
-        colour,
     )
 }
 
-/// The MODULATION rows: each side's index, df1 and df2/df1 against the BR
-/// band, the same limits and resolutions the Piconets panel holds them to.
+/// The MODULATION section: each end's index, df1 and df2/df1 against the
+/// BR band, the same limits and resolutions the Piconets panel holds them
+/// to; the heading says how many headers they rest on.
 fn modulation_lines(
     p: &Piconet,
-    c: Columns,
-    iw: usize,
+    width: usize,
+    inks: Inks,
     trends: bool,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
@@ -339,59 +329,63 @@ fn modulation_lines(
             _ => Cell::Missing("no alternating bits"),
         }
     };
-    let mut out = pair("Mod index", index(m), index(s), c, theme);
-    out.extend(pair("df1 avg", df1(m), df1(s), c, theme));
-    out.extend(pair("df2/df1", ratio(m), ratio(s), c, theme));
+    let mut out = vec![crate::ui::chrome::section(
+        "modulation",
+        &format!(
+            "{} hdr · BR limits: Core 5.4 Vol 2 A 3.1.1",
+            p.headers.captured
+        ),
+        width,
+        theme,
+    )];
+    out.extend(side_rows(
+        "Mod index",
+        index(m),
+        index(s),
+        width,
+        inks,
+        theme,
+    ));
+    out.extend(side_rows("df1 avg", df1(m), df1(s), width, inks, theme));
+    out.extend(side_rows("df2/df1", ratio(m), ratio(s), width, inks, theme));
     if trends {
         let index =
             |k: &crate::signal::bt::piconet::BtPacket| index_of(&k.deviation).map(|i| i.value());
-        out.extend(pair(
+        out.push(trend_row(
             "Mod trend",
-            trend(p, Direction::Master, c, 3, index),
-            trend(p, Direction::Slave, c, 3, index),
-            c,
+            trend(p, Direction::Master, 3, index),
+            trend(p, Direction::Slave, 3, index),
+            width,
+            inks,
             theme,
         ));
     }
-    // What the readings rest on, every member's, as the Classic view
-    // always said it; and the headers a busy neighbour kept from being
-    // read (`signal::net::measure`), said wherever the figures stand.
-    let d = &p.headers.deviation;
-    out.extend(footnote(
-        &format!(
-            "{} settled and {} alternating bits from {} headers, every member's, \
-             read as the test suite defines them",
-            d.settled.n, d.alternating.n, p.headers.captured
-        ),
-        iw,
-        theme,
-    ));
-    if d.neighbour_busy > 0 {
+    // The headers a busy neighbour kept from being read
+    // (`signal::net::measure`), a warning rather than a footnote.
+    let busy = p.headers.deviation.neighbour_busy;
+    if busy > 0 {
         out.push(quiet(
-            format!(
-                "{} headers not read: the next channel was busy at the time",
-                d.neighbour_busy
-            ),
+            format!("{busy} headers not read: the next channel was busy at the time"),
             theme,
         ));
     }
     out
 }
 
-/// The CARRIER rows: each side's f0, held to its limit only once a
-/// reference makes it absolute, and its worst drift and drift rate.
+/// The CARRIER section: each end's f0, held to its limit only once a
+/// reference makes it absolute (the frame's `[RELATIVE]` says when it is
+/// not), and its worst drift and drift rate.
 fn carrier_lines(
     p: &Piconet,
     state: &SdrMetrics,
-    c: Columns,
-    iw: usize,
+    width: usize,
+    inks: Inks,
     trends: bool,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let (m, s) = (&p.headers.sides.master, &p.headers.sides.slave);
     let now = std::time::Instant::now();
-    let mut relative = false;
-    let mut f0 = |side: &Side| {
+    let f0 = |side: &Side| {
         let (Some(ppm), Some(mhz)) = (side.carrier.f0_ppm.mean(), side.carrier.channel_mhz.mean())
         else {
             return Cell::Missing("not measured");
@@ -399,7 +393,6 @@ fn carrier_lines(
         let (ppm, provenance) = state.radio.corrected_ppm(ppm, now);
         let khz = ppm.scale(mhz.value() / 1e3);
         if provenance == Provenance::Unreferenced {
-            relative = true;
             Cell::Plain(Reading::new(khz, "kHz", F0_RESOLUTION_KHZ))
         } else {
             Cell::Judged(LimitRow::new(
@@ -409,7 +402,6 @@ fn carrier_lines(
             ))
         }
     };
-    let (mf, sf) = (f0(m), f0(s));
     let drift = |side: &Side| match side.carrier.worst_drift_hz {
         Some(d) => Cell::Judged(LimitRow::new(
             "",
@@ -426,41 +418,49 @@ fn carrier_lines(
         )),
         None => Cell::Missing("not measured"),
     };
-    let mut out = pair("f0", mf, sf, c, theme);
-    if relative {
-        out.push(Line::from(vec![
-            Span::raw(" ".repeat(Columns::LABEL)),
-            Span::styled(
-                "relative to our own oscillator".to_string(),
-                Style::default().fg(theme.label),
-            ),
-        ]));
-    }
-    // Each packet's own f0, in kHz of its channel, corrected as the row is.
-    let f0_of = |k: &crate::signal::bt::piconet::BtPacket| {
-        let hz = crate::signal::bt::channel::centre_hz(k.channel)?;
-        let (ppm, _) = state.radio.corrected_ppm(k.f0_ppm?, now);
-        Some(ppm.value() * hz as f64 / 1e9)
-    };
+    let mut out = vec![crate::ui::chrome::section(
+        "carrier",
+        &format!(
+            "{} hdr · BR limits: Core 5.4 Vol 2 A 3.1.3",
+            p.headers.carrier.f0_ppm.n
+        ),
+        width,
+        theme,
+    )];
+    out.extend(side_rows("f0", f0(m), f0(s), width, inks, theme));
     if trends {
-        out.extend(pair(
+        // Each packet's own f0, in kHz of its channel, corrected as the row
+        // is.
+        let f0_of = |k: &crate::signal::bt::piconet::BtPacket| {
+            let hz = crate::signal::bt::channel::centre_hz(k.channel)?;
+            let (ppm, _) = state.radio.corrected_ppm(k.f0_ppm?, now);
+            Some(ppm.value() * hz as f64 / 1e9)
+        };
+        out.push(trend_row(
             "f0 trend",
-            trend(p, Direction::Master, c, 1, f0_of),
-            trend(p, Direction::Slave, c, 1, f0_of),
-            c,
+            trend(p, Direction::Master, 1, f0_of),
+            trend(p, Direction::Slave, 1, f0_of),
+            width,
+            inks,
             theme,
         ));
     }
-    out.extend(pair("Drift worst", drift(m), drift(s), c, theme));
-    out.extend(pair("Rate worst", rate(m), rate(s), c, theme));
-    let n = p.headers.carrier.f0_ppm.n;
-    if n > 0 {
-        out.extend(footnote(
-            &format!("from {n} headers' access code and header, as the test suite defines them"),
-            iw,
-            theme,
-        ));
-    }
+    out.extend(side_rows(
+        "Drift worst",
+        drift(m),
+        drift(s),
+        width,
+        inks,
+        theme,
+    ));
+    out.extend(side_rows(
+        "Rate worst",
+        rate(m),
+        rate(s),
+        width,
+        inks,
+        theme,
+    ));
     out
 }
 
@@ -477,22 +477,21 @@ fn residuals(p: &Piconet, direction: Direction) -> Vec<f64> {
         .collect()
 }
 
-/// The TIMING rows: the piconet's clock, each side's jitter about its own
-/// average, the slave's place against the master's, and the packets of
-/// each side.
+/// The TIMING section: each end's jitter about its own average, the
+/// slave's place against the master's, the residuals' shape, and the
+/// packets of each end.
 fn timing_lines(
     p: &Piconet,
-    iw: usize,
-    c: Columns,
+    width: usize,
+    inks: Inks,
     plots: bool,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
-    let mut out = vec![crate::ui::chrome::section(
-        "timing",
-        "625 us slots: Core 5.4 Vol 2 B 2.2.5",
-        iw,
-        theme,
-    )];
+    let hint = match &p.slots {
+        Some(Ok(f)) => format!("{} hits · 625 us slots: Core 5.4 Vol 2 B 2.2.5", f.hits),
+        _ => "625 us slots: Core 5.4 Vol 2 B 2.2.5".to_string(),
+    };
+    let mut out = vec![crate::ui::chrome::section("timing", &hint, width, theme)];
     match &p.slots {
         None => out.push(quiet("no hit timed yet".to_string(), theme)),
         Some(Err(SlotRefusal::Collecting { have, need })) => out.push(quiet(
@@ -521,12 +520,20 @@ fn timing_lines(
                 Some(s) => Cell::Plain(Reading::new(s.rms_us, "us", JITTER_RESOLUTION_US)),
                 None => Cell::Text(format!("{timed} of {MIN_HITS} timed")),
             };
-            out.extend(pair("Jitter max", jitter(ms), jitter(ss), c, theme));
-            out.extend(pair(
+            out.extend(side_rows(
+                "Jitter max",
+                jitter(ms),
+                jitter(ss),
+                width,
+                inks,
+                theme,
+            ));
+            out.extend(side_rows(
                 "rms",
                 rms(ms, master.len()),
                 rms(ss, slave.len()),
-                c,
+                width,
+                inks,
                 theme,
             ));
             // The grid is every member's, so each side's average carries
@@ -556,36 +563,34 @@ fn timing_lines(
             // Every member's residuals as a shape: the numbers say how wide,
             // the shape whether it is one spread or two, as when a slave
             // answers a little late on every slot and stands as its own hump.
-            let beyond = if plots {
-                let (bars, beyond) = residual_histogram(&f.residuals_us, iw, c.master, theme);
+            if plots {
+                let (bars, beyond) = residual_histogram(&f.residuals_us, width, inks.master, theme);
                 out.extend(bars);
-                beyond
-            } else {
-                0
-            };
-            let span = crate::ui::widgets::timing_fmt::seconds_ms((f.span_us / 1e3) as u64);
-            let beyond = if beyond > 0 {
-                format!(", {beyond} beyond the plot's 1.5")
-            } else {
-                String::new()
-            };
-            out.extend(footnote(
-                &format!(
-                    "residual from the grid, us{beyond}: {} hits over {span}, every member's; \
-                     hits dated to 0.25 us",
-                    f.hits
-                ),
-                iw,
-                theme,
-            ));
+                let span = crate::ui::widgets::timing_fmt::seconds_ms((f.span_us / 1e3) as u64);
+                let beyond = if beyond > 0 {
+                    format!(", {beyond} beyond the plot's 1.5")
+                } else {
+                    String::new()
+                };
+                out.extend(footnote(
+                    &format!(
+                        "residual from the grid, us{beyond}: {} hits over {span}, every \
+                         member's; hits dated to 0.25 us",
+                        f.hits
+                    ),
+                    width,
+                    theme,
+                ));
+            }
         }
     }
     let sides = &p.headers.sides;
-    out.extend(pair(
+    out.extend(side_rows(
         "packets",
         Cell::Text(sides.master.packets.to_string()),
         Cell::Text(sides.slave.packets.to_string()),
-        c,
+        width,
+        inks,
         theme,
     ));
     if sides.unknown.packets > 0 {
@@ -600,33 +605,21 @@ fn timing_lines(
     out
 }
 
-/// The column heads over the pairs, each side in its own ink.
-fn heads(c: Columns) -> Line<'static> {
-    let bold = |col: Color| Style::default().fg(col).add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::raw(" ".repeat(Columns::LABEL))];
-    if c.stacked {
-        spans.push(Span::styled("▶ MASTER", bold(c.master)));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("◀ SLAVE", bold(c.slave)));
-        return Line::from(spans);
-    }
-    let master = c.master;
-    spans.extend(exactly(
-        vec![Span::styled("MASTER ▶", bold(master))],
-        c.side + GAP,
-    ));
-    spans.extend(exactly(
-        vec![Span::styled("◀ SLAVE", bold(c.slave))],
-        c.side,
-    ));
-    Line::from(spans)
+/// Which arrow is which end, once for the whole bench, each in its ink.
+fn legend(inks: Inks) -> Line<'static> {
+    let bold = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("▶ master", bold(inks.master)),
+        Span::raw("   "),
+        Span::styled("◀ slave", bold(inks.slave)),
+    ])
 }
 
-/// The whole bench for one piconet within `budget` rows: what it is and
-/// what it carries, then each section in order while it fits whole. A
-/// section left out is named on a last line, so a short panel says what a
-/// taller one would show rather than stopping mid-section, as the Piconets
-/// panel does.
+/// The whole bench for one piconet within `budget` rows: the legend, then
+/// each section in order while it fits whole. A section left out is named
+/// on a last line, so a short panel says what a taller one would show
+/// rather than stopping mid-section, as the Piconets panel does.
 fn bench(
     p: &Piconet,
     state: &SdrMetrics,
@@ -634,54 +627,34 @@ fn bench(
     budget: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
     // Neither an inquiry nor a page is a piconet: no two ends to set side
     // by side, as the Piconets panel says of them.
     if let Kind::Inquiry(_) | Kind::Paged = p.kind() {
-        out.push(quiet(
-            "not a piconet: no master and slave to set side by side".to_string(),
-            theme,
-        ));
-        return out.into_iter().map(|l| fit(l, iw)).collect();
+        return vec![fit(
+            quiet(
+                "not a piconet: no master and slave to set side by side".to_string(),
+                theme,
+            ),
+            iw,
+        )];
     }
-    // The master in the piconet's own colour, its chip on the hop chart
-    // and in the roster; the slave in the ordinary ink, which no piconet's
-    // colour is, so the two never look alike.
-    let master = state
-        .net
-        .bt_piconets
-        .iter()
-        .position(|q| q.lap == p.lap)
-        .map_or(theme.value_hi, |k| theme.series_color(k));
-    let c = Columns::of(iw, master, theme.value);
+    let inks = Inks {
+        master: state
+            .net
+            .bt_piconets
+            .iter()
+            .position(|q| q.lap == p.lap)
+            .map_or(theme.value_hi, |k| theme.series_color(k)),
+        slave: theme.value,
+    };
+    let mut out = vec![legend(inks)];
 
     // Each section as a whole and without its plots, the trends and the
     // residual shape: a plot is the first thing a short panel gives up, the
     // readings the last.
-    let modulation = |trends| {
-        let mut out = vec![
-            crate::ui::chrome::section(
-                "modulation",
-                "BR limits: Core 5.4 Vol 2 A 3.1.1",
-                iw,
-                theme,
-            ),
-            heads(c),
-        ];
-        out.extend(modulation_lines(p, c, iw, trends, theme));
-        out
-    };
-    let carrier = |trends| {
-        let mut out = vec![crate::ui::chrome::section(
-            "carrier",
-            "BR limits: Core 5.4 Vol 2 A 3.1.3",
-            iw,
-            theme,
-        )];
-        out.extend(carrier_lines(p, state, c, iw, trends, theme));
-        out
-    };
-    let timing = |plots| timing_lines(p, iw, c, plots, theme);
+    let modulation = |trends| modulation_lines(p, iw, inks, trends, theme);
+    let carrier = |trends| carrier_lines(p, state, iw, inks, trends, theme);
+    let timing = |plots| timing_lines(p, iw, inks, plots, theme);
     let sections = [
         ("MODULATION", modulation(true), Some(modulation(false))),
         ("CARRIER", carrier(true), Some(carrier(false))),
@@ -691,8 +664,7 @@ fn bench(
     // The line naming what is left out may wrap on a narrow bench: it is
     // kept whole, so it is given the rows its longest form needs.
     let note = |left: &[&str]| format!("+ {} on a taller panel", left.join(", "));
-    let note_rows = if note(&["MODULATION", "CARRIER", "TIMING", "HEADERS", "plots"]).len() + 1 > iw
-    {
+    let note_rows = if note(&["MODULATION", "CARRIER", "TIMING", "plots"]).len() + 1 > iw {
         2
     } else {
         1
@@ -701,7 +673,7 @@ fn bench(
     let mut plots_left = false;
     for (k, (name, whole, lean)) in sections.into_iter().enumerate() {
         // In order, leaving a row for the line that names what is left out,
-        // unless this is the last section: whole, else without its trend,
+        // unless this is the last section: whole, else without its plots,
         // else not at all, and nothing after a section left out.
         let reserve = if k < last { note_rows } else { 0 };
         let fits = |lines: &Vec<Line<'static>>| out.len() + lines.len() + reserve <= budget;
@@ -887,18 +859,15 @@ mod tests {
         let out = draw(NetBtBenchPanel, 100, 50, &m);
         let text = out.join("\n");
         assert_eq!(text.matches("MODULATION").count(), 1, "{text}");
-        let heads = out.iter().find(|l| l.contains("MASTER ▶")).expect(&text);
-        let (m_at, s_at) = (
-            heads.find("MASTER").unwrap(),
-            heads.find("SLAVE").expect(heads),
+        let at = out
+            .iter()
+            .position(|l| l.contains("Mod index"))
+            .expect(&text);
+        assert!(out[at].contains('▶') && out[at].contains("0.334"), "{text}");
+        assert!(
+            out[at + 1].contains('◀') && out[at + 1].contains("0.318"),
+            "{text}"
         );
-        assert!(m_at < s_at, "{heads}");
-        let index = out.iter().find(|l| l.contains("0.334")).expect(&text);
-        let (a, b) = (
-            index.find("0.334").unwrap(),
-            index.find("0.318").expect(index),
-        );
-        assert!(a < b, "the master on the left: {index}");
     }
 
     /// A side with nothing measured says so in its own column, never a zero.
@@ -908,22 +877,20 @@ mod tests {
         m.net.bt_piconets[0].headers.sides.master.deviation = around(167_000.0);
         let out = draw(NetBtBenchPanel, 100, 50, &m);
         let text = out.join("\n");
-        let heads = out.iter().position(|l| l.contains("MASTER ▶")).unwrap();
-        let slave_at = out[heads].find("◀ SLAVE").unwrap();
-        let slave_column: String = out[heads + 1..heads + 4]
+        let at = out
             .iter()
-            .map(|l| {
-                l.chars()
-                    .skip(out[heads][..slave_at].chars().count())
-                    .collect::<String>()
-            })
-            .collect();
-        assert!(slave_column.contains("not measured"), "{text}");
+            .position(|l| l.contains("Mod index"))
+            .expect(&text);
+        assert!(out[at].contains("0.334"), "the master's still: {text}");
+        let slave = &out[at + 1];
         assert!(
-            !slave_column.contains("0."),
+            slave.contains('◀') && slave.contains("not measured"),
+            "{text}"
+        );
+        assert!(
+            !slave.contains("0."),
             "no figure on the slave's side: {text}"
         );
-        assert!(text.contains("0.334"), "the master's still: {text}");
     }
 
     /// TIMING: the piconet's clock from its grid, each side's jitter about
@@ -959,9 +926,16 @@ mod tests {
         let out = draw(NetBtBenchPanel, 100, 50, &m);
         let text = out.join("\n");
         assert!(text.contains("TIMING"), "{text}");
-        let jitter = out.iter().find(|l| l.contains("Jitter max")).expect(&text);
-        assert_eq!(jitter.matches(" us").count(), 2, "one a side: {jitter}");
-        assert!(text.contains("clock"), "{text}");
+        let at = out
+            .iter()
+            .position(|l| l.contains("Jitter max"))
+            .expect(&text);
+        assert!(out[at].contains('▶') && out[at].contains(" us"), "{text}");
+        assert!(
+            out[at + 1].contains('◀') && out[at + 1].contains(" us"),
+            "{text}"
+        );
+        assert!(!text.contains("│ clock"), "the clock is NET 5's: {text}");
         let offset = out
             .iter()
             .find(|l| l.contains("after the master"))
@@ -972,8 +946,14 @@ mod tests {
             .and_then(|w| w[1..].parse().ok())
             .expect(offset);
         assert!((value - 2.0).abs() < 0.1, "the slave 2 us behind: {offset}");
-        let counts = out.iter().find(|l| l.contains("232")).expect(&text);
-        assert!(counts.contains("180"), "{counts}");
+        let at = out
+            .iter()
+            .position(|l| l.starts_with("│ packets"))
+            .expect(&text);
+        assert!(
+            out[at].contains("180") && out[at + 1].contains("232"),
+            "{text}"
+        );
         assert!(text.contains("2 not yet placed"), "{text}");
     }
 
@@ -1054,8 +1034,7 @@ mod tests {
             row.contains("0.320–0.340"),
             "the span it is scaled to: {row}"
         );
-        let heads = out.iter().find(|l| l.contains("MASTER ▶")).unwrap();
-        let slave_at = heads[..heads.find("◀ SLAVE").unwrap()].chars().count();
+        let slave_at = row[..row.find('◀').expect(row)].chars().count();
         let master = braille(row, 0);
         assert!(master.len() >= 8, "{row}");
         // Rising: the oldest at the bottom dot, the newest at the top.
@@ -1120,7 +1099,7 @@ mod tests {
         let sides = &mut m.net.bt_piconets[0].headers.sides;
         sides.master.deviation = around(167_000.0);
         sides.slave.deviation = around(159_000.0);
-        let out = draw(NetBtBenchPanel, 40, 14, &m);
+        let out = draw(NetBtBenchPanel, 40, 12, &m);
         let text = out.join("\n");
         assert!(text.contains("Mod index"), "{text}");
         assert!(!text.contains("Mod trend"), "{text}");
@@ -1164,19 +1143,70 @@ mod tests {
             dev,
             carrier,
         );
-        let out = draw(NetBtBenchPanel, 100, 80, &m).join("\n");
+        let out = draw(NetBtBenchPanel, 100, 80, &m);
+        let text = out.join("\n");
+        let heading = |name: &str| out.iter().find(|l| l.contains(name)).expect(&text).clone();
+        assert!(heading("MODULATION").contains("1 hdr"), "{text}");
+        assert!(heading("CARRIER").contains("2 hdr"), "{text}");
         assert!(
-            out.contains("4 settled and 2 alternating bits from 1 headers"),
-            "{out}"
+            text.contains("2 headers not read: the next channel was busy"),
+            "{text}"
+        );
+    }
+
+    /// A reading and its bar share a row, one row an end, the master's
+    /// first: no row is a bar alone.
+    #[test]
+    fn a_reading_and_its_bar_share_a_row() {
+        let mut m = heard();
+        let sides = &mut m.net.bt_piconets[0].headers.sides;
+        sides.master.deviation = around(167_000.0);
+        sides.slave.deviation = around(159_000.0);
+        let out = draw(NetBtBenchPanel, 191, 40, &m);
+        let text = out.join("\n");
+        let at = out
+            .iter()
+            .position(|l| l.contains("Mod index"))
+            .expect(&text);
+        assert!(out[at].contains('▶') && out[at].contains("[0.28"), "{text}");
+        assert!(
+            out[at + 1].contains('◀') && out[at + 1].contains("[0.28"),
+            "{text}"
         );
         assert!(
-            out.contains("2 headers not read: the next channel was busy"),
-            "{out}"
+            !out.iter()
+                .any(|l| l.trim_matches(['│', ' ']).starts_with('[')),
+            "a bar alone: {text}"
         );
+        let legend = &out[1];
         assert!(
-            out.contains("from 2 headers' access code and header"),
-            "{out}"
+            legend.contains("▶ master") && legend.contains("◀ slave"),
+            "{legend}"
         );
+    }
+
+    /// The headings say what the readings rest on and the Core section of
+    /// their limits, in the room a footnote under them used to take.
+    #[test]
+    fn the_headings_say_what_they_rest_on() {
+        let mut m = heard();
+        m.net.bt_piconets[0].headers.sides.master.deviation = around(167_000.0);
+        let out = draw(NetBtBenchPanel, 191, 40, &m);
+        let text = out.join("\n");
+        let heading = |name: &str| out.iter().find(|l| l.contains(name)).expect(&text).clone();
+        let m_head = heading("MODULATION");
+        assert!(
+            m_head.contains("hdr") && m_head.contains("3.1.1"),
+            "{m_head}"
+        );
+        let c_head = heading("CARRIER");
+        assert!(
+            c_head.contains("hdr") && c_head.contains("3.1.3"),
+            "{c_head}"
+        );
+        assert!(heading("TIMING").contains("2.2.5"), "{text}");
+        assert!(!text.contains("settled and"), "no footnote row: {text}");
+        assert!(!text.contains("relative to our own oscillator"), "{text}");
     }
 
     /// The residuals as a shape, every member's, with what they rest on:
