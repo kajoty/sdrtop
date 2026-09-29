@@ -157,9 +157,14 @@ pub struct Headers {
     pub sides: Sides,
 }
 
-/// Who sent a packet. The master starts its transmissions in even slots and
-/// the slave in odd ones, both on the master's clock, so the slot's parity
-/// is CLK1, the lowest bit of the CLK1-6 a header is read at.
+/// Who sent a packet, **read from the Core Specification 5.4, Vol 2, Part
+/// B, 2.2.5** on the SIG's own site: "The Central transmission shall always
+/// start at even numbered time slots (CLK1=0) and the Peripheral
+/// transmission shall always start at odd numbered time slots (CLK1=1)."
+/// Both on the master's clock, so the slot's parity is CLK1, the lowest bit
+/// of the CLK1-6 a header is read at. A packet's start is what its access
+/// code dates, so a multi-slot packet running on into the other parity
+/// does not change who sent it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Master,
