@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 MusiThang <viktor.laszlo92@protonmail.com>
 
-//! The MODULATION and CARRIER rows of a classic piconet, drawn for one side.
-//!
-//! **One side, not one piconet.** The Piconets panel draws them for every
-//! member's headers pooled; the Piconet view's bench draws them twice, the
-//! master's and the slave's, under one heading. So the rows take the
-//! accumulator they read (`piconet::Deviation`, `piconet::Carrier`) rather
-//! than the piconet, and the heading, the footnote and the reason a side is
-//! not measured stay with the caller, which knows what it counted.
+//! What the Classic view and the Piconet view say alike about a piconet.
 //!
 //! **One set of limits.** The BR limits and the resolutions a reading must
 //! beat are here once, so a figure is judged alike wherever it is drawn
-//! (rule 5).
+//! (rule 5): the Classic view's summary line, the packet list's cells and
+//! the bench's rows all read them from here.
+//!
+//! **The parts with one owner each.** The slot clock, the residual plot,
+//! the HEADERS account and a piconet's channels as runs are drawn by one
+//! function each, which ever panel shows them.
 
 use ratatui::{
     style::Style,
     text::{Line, Span},
 };
 
-use crate::signal::bt::piconet::{Carrier, Deviation};
+use crate::signal::bt::piconet::{Deviation, Piconet};
 use crate::signal::dsp::uncertainty::Uncertain;
 use crate::state::SdrMetrics;
-use crate::ui::widgets::limit::{Limit, LimitRow, RowWidths};
-use crate::ui::widgets::reading::Reading;
+use crate::ui::widgets::limit::Limit;
 
 /// Label width of a field row, the Piconets panel's detail block's and the
 /// bench's.
@@ -134,104 +131,286 @@ pub(super) fn index_of(dev: &Deviation) -> Option<Uncertain> {
     dev.settled.mean().map(|df1| df1.scale(2.0 / 1e6))
 }
 
-/// The modulation rows of one side against the BR band, in the same
-/// `widgets::limit` rows the BLE packet detail uses, so the two protocols'
-/// transmitter quality reads alike: the index, df1, and df2/df1 once there
-/// are alternating bits (a line saying so until then). `None` while there
-/// are too few settled readings to measure; the caller says why, in its
-/// own counts.
-pub(super) fn modulation_rows(
-    dev: &Deviation,
-    iw: usize,
-    theme: &crate::Theme,
-) -> Option<Vec<Line<'static>>> {
-    let df1 = dev.settled.mean()?;
-    let index = index_of(dev)?;
-    let mut rows = vec![
-        LimitRow::new(
-            "Mod index",
-            Reading::new(index, "", INDEX_RESOLUTION),
-            BR_INDEX,
-        ),
-        LimitRow::new(
-            "df1 avg",
-            Reading::new(df1.scale(0.001), "kHz", DELTA_F1_RESOLUTION_KHZ),
-            BR_DELTA_F1_KHZ,
-        ),
-    ];
-    let ratio = dev.alternating.mean().map(|df2| df2.ratio(&df1));
-    if let Some(r) = ratio {
-        rows.push(LimitRow::new(
-            "df2/df1",
-            Reading::new(r, "", RATIO_RESOLUTION),
-            BR_RATIO,
-        ));
+/// The channels a piconet was heard on, as runs: `2-5, 17, 40-41`.
+pub(super) fn channel_runs(mask: u128) -> String {
+    let mut runs = Vec::new();
+    let mut ch = 0u8;
+    while ch < 79 {
+        if mask & (1 << ch) == 0 {
+            ch += 1;
+            continue;
+        }
+        let start = ch;
+        while ch + 1 < 79 && mask & (1 << (ch + 1)) != 0 {
+            ch += 1;
+        }
+        runs.push(if start == ch {
+            start.to_string()
+        } else {
+            format!("{start}-{ch}")
+        });
+        ch += 1;
     }
-    let w = RowWidths::fit_within(&rows, iw);
-    let mut out: Vec<Line<'static>> = rows.iter().map(|r| Line::from(r.spans(theme, w))).collect();
-    if ratio.is_none() {
-        out.push(Line::from(Span::styled(
-            " df2/df1: fewer than two alternating bits yet".to_string(),
-            Style::default().fg(theme.stale),
-        )));
-    }
-    Some(out)
+    runs.join(", ")
 }
 
-/// The carrier rows of one side: f0, and the worst header's drift and
-/// drift rate, because the limits are on every packet. f0 is judged
-/// against its limit only once a reference makes it absolute; until then
-/// it is a plain field, relative to our own oscillator, as the clock row
-/// is. `None` before two headers with enough blocks; the caller says so.
-pub(super) fn carrier_rows(
-    c: &Carrier,
+/// The residual plot's reach either side of the grid, µs: past the 1 µs
+/// limit, so a residual beyond it shows as one.
+const PLOT_US: f64 = 1.5;
+/// Its height in rows of eighth blocks.
+const PLOT_ROWS: usize = 3;
+
+/// Where each hit sat against the grid:
+/// residuals from −[`PLOT_US`] to +[`PLOT_US`] in bars of the piconet's
+/// own colour, the specification's ±1 µs (2.2.5) as `┊` rules in the
+/// warning ink, zero as a dim one, and a tick and label row under them. The
+/// numbers say how wide the spread is; the shape says whether it is one
+/// spread or two, as when a peripheral answers a little late on every slot
+/// and stands as its own hump. Returns the lines, empty where the width
+/// cannot hold a readable plot, and how many residuals fell beyond it.
+pub(super) fn residual_histogram(
+    residuals: &[f32],
+    iw: usize,
+    colour: ratatui::style::Color,
+    theme: &crate::Theme,
+) -> (Vec<Line<'static>>, usize) {
+    const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let cols = iw.saturating_sub(4);
+    let beyond = residuals
+        .iter()
+        .filter(|r| (r.abs() as f64) >= PLOT_US)
+        .count();
+    if cols < 15 {
+        return (Vec::new(), beyond);
+    }
+    let col_of = |x: f64| {
+        (((x + PLOT_US) / (2.0 * PLOT_US)) * cols as f64)
+            .floor()
+            .clamp(0.0, cols as f64 - 1.0) as usize
+    };
+    let mut bins = vec![0u32; cols];
+    for &r in residuals.iter().filter(|r| (r.abs() as f64) < PLOT_US) {
+        bins[col_of(r as f64)] += 1;
+    }
+    let most = bins.iter().copied().max().unwrap_or(0).max(1);
+    let limits = [col_of(-1.0), col_of(1.0)];
+    let zero = col_of(0.0);
+    let mut out = Vec::with_capacity(PLOT_ROWS + 2);
+    for row in 0..PLOT_ROWS {
+        let base = (PLOT_ROWS - 1 - row) * 8;
+        let mut spans = vec![Span::raw("  ")];
+        for (c, &n) in bins.iter().enumerate() {
+            let fill = ((n as f64 / most as f64 * (PLOT_ROWS * 8) as f64).round() as usize)
+                .saturating_sub(base)
+                .min(8);
+            spans.push(if fill > 0 {
+                Span::styled(EIGHTHS[fill].to_string(), Style::default().fg(colour))
+            } else if limits.contains(&c) {
+                Span::styled("\u{250a}", Style::default().fg(theme.status_warn))
+            } else if c == zero {
+                Span::styled("\u{250a}", Style::default().fg(theme.border_dim))
+            } else {
+                Span::raw(" ")
+            });
+        }
+        out.push(Line::from(spans));
+    }
+    let ticks: String = (0..cols)
+        .map(|c| {
+            if limits.contains(&c) || c == zero {
+                '\u{2534}'
+            } else {
+                '\u{2500}'
+            }
+        })
+        .collect();
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(ticks, Style::default().fg(theme.border_dim)),
+    ]));
+    let mut labels = vec![' '; cols];
+    for (c, text) in [(limits[0], "-1"), (zero, "0"), (limits[1], "+1")] {
+        let at = c.saturating_sub(text.len() / 2).min(cols - text.len());
+        for (i, ch) in text.chars().enumerate() {
+            labels[at + i] = ch;
+        }
+    }
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            labels.into_iter().collect::<String>(),
+            Style::default().fg(theme.label),
+        ),
+    ]));
+    (out, beyond)
+}
+
+/// What the piconet's headers say, under its own heading, marked as the
+/// port it is: the header decode is `libbtbb`'s, checked on the air
+/// against two devices whose addresses were read off them
+/// (`signal::bt::header`, rule 1).
+///
+/// **Read only under one UAP.** Before the UAP is one value the heading
+/// says so and how many headers are waiting; no type is guessed from a
+/// candidate (rule 2). A header that did not decode under the resolved UAP
+/// is counted beside the ones that did, because a rising count is how a
+/// wrong resolution would show.
+pub(super) fn header_lines(
+    p: &Piconet,
     state: &SdrMetrics,
     iw: usize,
     theme: &crate::Theme,
-) -> Option<Vec<Line<'static>>> {
-    let (Some(f0), Some(mhz)) = (c.f0_ppm.mean(), c.channel_mhz.mean()) else {
-        return None;
+) -> Vec<Line<'static>> {
+    use crate::signal::bt::header::PacketType;
+    let h = &p.headers;
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            crate::ui::chrome::field(label, LABEL_W, theme),
+            Span::styled(value, Style::default().fg(theme.value)),
+        ])
     };
-    let now = std::time::Instant::now();
-    let (ppm, provenance) = state.radio.corrected_ppm(f0, now);
-    let khz = ppm.scale(mhz.value() / 1e3);
-    let judged = provenance != crate::state::Provenance::Unreferenced;
-    let mut rows = Vec::new();
-    if judged {
-        rows.push(LimitRow::new(
-            "f0",
-            Reading::new(khz, "kHz", F0_RESOLUTION_KHZ),
-            F0_LIMIT_KHZ,
+    let mut out = vec![crate::ui::chrome::section(
+        "headers",
+        "libbtbb port, checked on air",
+        iw,
+        theme,
+    )];
+    if h.captured == 0 {
+        out.push(field(
+            "captured",
+            "none yet: no header followed a hit".to_string(),
+        ));
+        return out;
+    }
+    let uap = match state.net.bt_uap.get(&p.lap).map(|u| u.as_slice()) {
+        Some([one]) => *one,
+        other => {
+            let n = other.map_or(0, |u| u.len());
+            out.push(field(
+                "captured",
+                format!(
+                    "{}, not read: UAP not resolved ({n} candidates)",
+                    h.captured
+                ),
+            ));
+            out.push(field("clock", clock_text(h.clock_hypotheses)));
+            return out;
+        }
+    };
+    let mut read = format!("{} of {} captured", h.decoded, h.captured);
+    if h.undecoded > 0 {
+        read.push_str(&format!(
+            ", {} did not decode under {}",
+            h.undecoded,
+            state.net.show_uap(uap)
         ));
     }
-    if let Some(d) = c.worst_drift_hz {
-        rows.push(LimitRow::new(
-            "Drift worst",
-            Reading::new(d.scale(0.001), "kHz", DRIFT_RESOLUTION_KHZ),
-            DRIFT_LIMIT_KHZ,
-        ));
+    out.push(field("read", read));
+    let mut mix: Vec<(u32, u8)> = (0..16u8)
+        .map(|c| (h.types[c as usize], c))
+        .filter(|(n, _)| *n > 0)
+        .collect();
+    mix.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let room = iw.saturating_sub(LABEL_W + 1);
+    let types = if mix.is_empty() {
+        "-".to_string()
+    } else {
+        mix.iter()
+            .map(|(n, c)| format!("{} {n}", PacketType::from_code(*c).shown()))
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ")
+    };
+    for (i, chunk) in crate::ui::chrome::wrap(&types, room, 2)
+        .into_iter()
+        .enumerate()
+    {
+        out.push(field(if i == 0 { "types" } else { "" }, chunk));
     }
-    if let Some(r) = c.worst_rate_hz_per_us {
-        rows.push(LimitRow::new(
-            "Rate worst",
-            Reading::new(r, "Hz/us", DRIFT_RATE_RESOLUTION),
-            DRIFT_RATE_LIMIT,
-        ));
+    let addrs: Vec<String> = (0..8u8)
+        .filter(|a| h.lt_addrs & (1 << a) != 0)
+        .map(|a| {
+            if a == 0 {
+                "0 (broadcast)".to_string()
+            } else {
+                a.to_string()
+            }
+        })
+        .collect();
+    out.push(field(
+        "LT_ADDR",
+        if addrs.is_empty() {
+            "-".to_string()
+        } else {
+            addrs.join(", ")
+        },
+    ));
+    out.push(field("clock", clock_text(h.clock_hypotheses)));
+    out
+}
+
+/// The CLK1-6 hunt, in words: the whitening every header is read through
+/// depends on it.
+fn clock_text(hypotheses: u8) -> String {
+    match hypotheses {
+        0 => "CLK1-6 not tracked yet".to_string(),
+        1 => "CLK1-6 found (1 of 64 hypotheses left)".to_string(),
+        n => format!("CLK1-6: {n} of 64 hypotheses left"),
     }
-    let w = RowWidths::fit_within(&rows, iw);
-    let mut out: Vec<Line<'static>> = rows.iter().map(|r| Line::from(r.spans(theme, w))).collect();
-    if !judged {
-        out.push(Line::from(vec![
-            crate::ui::chrome::field("f0", LABEL_W, theme),
-            Span::styled(
-                Reading::new(khz, "kHz", F0_RESOLUTION_KHZ).text(),
-                Style::default().fg(theme.value),
-            ),
-            Span::styled(
-                "  relative to our own oscillator".to_string(),
-                Style::default().fg(theme.label),
-            ),
-        ]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The residuals as a shape**: each lands in its column, the
+    /// ±1 µs limits and zero are ruled and labelled, and a residual past
+    /// the plot is counted rather than dropped.
+    #[test]
+    fn the_residual_histogram_places_each_hit_and_the_limits() {
+        let theme = crate::Theme::sdr();
+        let colour = theme.series_color(1);
+        // 40 columns across 3 us: 0.075 us each.
+        let (lines, beyond) =
+            residual_histogram(&[0.0, 0.01, 0.02, 0.9, -0.5, 2.0], 44, colour, &theme);
+        assert_eq!(beyond, 1);
+        assert_eq!(lines.len(), PLOT_ROWS + 2);
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        // The tallest bar (three residuals near zero) reaches the top row.
+        let top = text(&lines[0]);
+        assert_eq!(top.chars().nth(2 + 20), Some('\u{2588}'), "{top:?}");
+        // Limits ruled at -1 and +1 (columns 6 and 33), labelled below.
+        assert_eq!(top.chars().nth(2 + 6), Some('\u{250a}'), "{top:?}");
+        assert_eq!(top.chars().nth(2 + 33), Some('\u{250a}'), "{top:?}");
+        let labels = text(&lines[PLOT_ROWS + 1]);
+        assert!(labels.contains("-1") && labels.contains("+1"), "{labels:?}");
+        // The limit rules are in the warning ink, the bars in the colour.
+        let limit_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "\u{250a}")
+            .unwrap();
+        assert_eq!(limit_span.style.fg, Some(theme.status_warn));
+        let bar = lines[2]
+            .spans
+            .iter()
+            .find(|s| s.content != " " && s.content != "\u{250a}" && s.content != "  ")
+            .unwrap();
+        assert_eq!(bar.style.fg, Some(colour));
+        // Too narrow for a readable plot: none, and still the count.
+        assert_eq!(
+            residual_histogram(&[3.0], 16, colour, &theme),
+            (Vec::new(), 1)
+        );
     }
-    Some(out)
+
+    #[test]
+    fn channel_runs_join_neighbours() {
+        assert_eq!(channel_runs(0), "");
+        assert_eq!(channel_runs(0b1111 << 2 | 1 << 17 | 1 << 78), "2-5, 17, 78");
+    }
 }

@@ -32,6 +32,9 @@ pub(in crate::app::input) fn try_set_preset(
     let mut m = metrics(state);
     if engine.has_preset(name) {
         let from_census = engine.is_panel_visible("net_census");
+        // The Classic view's piconet, kept past the focus ending below: the
+        // Piconet view is that piconet's, whichever key opened it.
+        let piconet = m.net.bt_view.selected;
         engine.set_preset(name);
         m.push_log(format!("Preset: {}", name));
         if from_census && engine.is_panel_visible("net_ble_packets") {
@@ -43,6 +46,10 @@ pub(in crate::app::input) fn try_set_preset(
             .is_some_and(|p| !engine.is_panel_visible(p))
         {
             super::view::end_focus(engine, &mut m);
+        }
+        if engine.is_panel_visible("net_bt_packets") && piconet.is_some() {
+            m.net.bt_view.selected = piconet;
+            m.net.packets_view = Default::default();
         }
     } else {
         m.push_log(format!("Preset '{}' not yet available", name));

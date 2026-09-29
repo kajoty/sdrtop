@@ -222,6 +222,16 @@ pub(super) fn net_bt_piconets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyActio
     match key.code {
         KeyCode::Up => m.net.bt_view.move_by(&order, -1),
         KeyCode::Down => m.net.bt_view.move_by(&order, 1),
+        // The selected piconet, packet by packet: the Piconet view opens on
+        // it (`global::presets::try_set_preset` carries the selection).
+        KeyCode::Enter => {
+            if m.net.bt_view.cursor(&order).is_none() {
+                m.push_log("Piconets: select a piconet first (↑↓)");
+                return KeyAction::Continue;
+            }
+            drop(m);
+            return global::presets::try_set_preset(ctx.engine, ctx.state, "net_piconet");
+        }
         _ => {
             drop(m);
             return global::handle(key, ctx);
@@ -1136,6 +1146,47 @@ mod tests {
         };
         assert_eq!(step("net_bt"), Some(2_444_000_000));
         assert_eq!(step("net_piconet"), step("net_bt"));
+    }
+
+    /// `Enter` on the Classic view's roster opens the Piconet view on the
+    /// piconet selected there, the selection carried as it is.
+    #[test]
+    fn enter_opens_the_piconet_view() {
+        let (mut engine, keys, state) = focused_on("net_bt", "net_bt_piconets");
+        crate::signal::bt::piconet::observe(
+            &mut metrics(&state).net.bt_piconets,
+            0xc3_d318,
+            73,
+            Instant::now(),
+        );
+        key(&mut engine, &keys, &state, KeyCode::Down);
+        assert_eq!(metrics(&state).net.bt_view.selected, Some(0xc3_d318));
+        key(&mut engine, &keys, &state, KeyCode::Enter);
+        assert_eq!(engine.active_preset(), "net_piconet");
+        assert_eq!(metrics(&state).net.bt_view.selected, Some(0xc3_d318));
+
+        // Nothing selected: nothing to open, and the log says so.
+        let (mut engine, keys, state) = focused_on("net_bt", "net_bt_piconets");
+        key(&mut engine, &keys, &state, KeyCode::Enter);
+        assert_eq!(engine.active_preset(), "net_bt");
+        assert!(metrics(&state)
+            .ui
+            .log
+            .iter()
+            .any(|l| l.text.contains("select a piconet")));
+    }
+
+    /// The Classic view's selection carries into the Piconet view however
+    /// the view is changed, as the census's carries into the BLE list: the
+    /// Piconet view is the selected piconet's, and arriving on nothing
+    /// because a focus ended on the way would be arriving at the wrong view.
+    #[test]
+    fn the_classic_selection_carries_into_the_piconet_view() {
+        let (mut engine, _keys, state) = focused_on("net_bt", "net_bt_piconets");
+        metrics(&state).net.bt_view.selected = Some(0xc3_d318);
+        super::global::presets::try_set_preset(&mut engine, &state, "net_piconet");
+        assert_eq!(engine.active_preset(), "net_piconet");
+        assert_eq!(metrics(&state).net.bt_view.selected, Some(0xc3_d318));
     }
 
     /// **The one selection that outlives its focus**: a census device chosen,

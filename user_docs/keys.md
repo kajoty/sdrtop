@@ -372,7 +372,7 @@ each panel's numbers mean is on [the NET page](net.md).
 | `u` | Band Census | `NET 3` | `↑↓` select · `S` sort by the next column · `R` reverse · `T` trust as frequency reference, or let it go |
 | `v` | BLE Advertising | `NET 4` | `↑↓` select a packet · `Enter` only this address, or all again · `H` hold the list, or let it run |
 | `b` | Classic Bluetooth Hops | `NET 5` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
-| `c` | Piconets | `NET 5` | `↑↓` select a piconet |
+| `c` | Piconets | `NET 5` | `↑↓` select a piconet · `Enter` packet by packet, on NET 6 |
 | `c` | Bench | `NET 6` | `← →` the previous or next piconet |
 | `v` | Packets | `NET 6` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
 

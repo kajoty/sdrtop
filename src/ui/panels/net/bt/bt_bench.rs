@@ -34,10 +34,10 @@ use ratatui::{
 use super::bt_packets::selected;
 use super::bt_piconets::{silence, uap_text};
 use super::sections::{
-    clock_of, index_of, BR_DELTA_F1_KHZ, BR_INDEX, BR_RATIO, CLOCK_LIMIT_PPM, CLOCK_RESOLUTION_PPM,
-    DELTA_F1_RESOLUTION_KHZ, DRIFT_LIMIT_KHZ, DRIFT_RATE_LIMIT, DRIFT_RATE_RESOLUTION,
-    DRIFT_RESOLUTION_KHZ, F0_LIMIT_KHZ, F0_RESOLUTION_KHZ, INDEX_RESOLUTION, JITTER_LIMIT_US,
-    JITTER_RESOLUTION_US, RATIO_RESOLUTION,
+    channel_runs, clock_of, header_lines, index_of, residual_histogram, BR_DELTA_F1_KHZ, BR_INDEX,
+    BR_RATIO, CLOCK_LIMIT_PPM, CLOCK_RESOLUTION_PPM, DELTA_F1_RESOLUTION_KHZ, DRIFT_LIMIT_KHZ,
+    DRIFT_RATE_LIMIT, DRIFT_RATE_RESOLUTION, DRIFT_RESOLUTION_KHZ, F0_LIMIT_KHZ, F0_RESOLUTION_KHZ,
+    INDEX_RESOLUTION, JITTER_LIMIT_US, JITTER_RESOLUTION_US, RATIO_RESOLUTION,
 };
 use crate::signal::bt::header::PacketType;
 use crate::signal::bt::piconet::{Direction, HeaderRead, Kind, PayloadVerdict, Piconet, Side};
@@ -81,6 +81,19 @@ fn quiet(text: String, theme: &crate::Theme) -> Line<'static> {
         format!(" {text}"),
         Style::default().fg(theme.stale),
     ))
+}
+
+/// A note under a section: what its readings rest on, in the label ink.
+fn footnote(text: &str, iw: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
+    crate::ui::chrome::wrap(text, iw.saturating_sub(1), 2)
+        .into_iter()
+        .map(|chunk| {
+            Line::from(Span::styled(
+                format!(" {chunk}"),
+                Style::default().fg(theme.label),
+            ))
+        })
+        .collect()
 }
 
 /// A field row across the whole bench: its label, a value, and what the
@@ -386,6 +399,7 @@ fn trend(
 fn modulation_lines(
     p: &Piconet,
     c: Columns,
+    iw: usize,
     trends: bool,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
@@ -420,18 +434,39 @@ fn modulation_lines(
     let mut out = pair("Mod index", index(m), index(s), c, theme);
     out.extend(pair("df1 avg", df1(m), df1(s), c, theme));
     out.extend(pair("df2/df1", ratio(m), ratio(s), c, theme));
-    if !trends {
-        return out;
+    if trends {
+        let index =
+            |k: &crate::signal::bt::piconet::BtPacket| index_of(&k.deviation).map(|i| i.value());
+        out.extend(pair(
+            "Mod trend",
+            trend(p, Direction::Master, c, 3, index),
+            trend(p, Direction::Slave, c, 3, index),
+            c,
+            theme,
+        ));
     }
-    let index =
-        |k: &crate::signal::bt::piconet::BtPacket| index_of(&k.deviation).map(|i| i.value());
-    out.extend(pair(
-        "Mod trend",
-        trend(p, Direction::Master, c, 3, index),
-        trend(p, Direction::Slave, c, 3, index),
-        c,
+    // What the readings rest on, every member's, as the Classic view
+    // always said it; and the headers a busy neighbour kept from being
+    // read (`signal::net::measure`), said wherever the figures stand.
+    let d = &p.headers.deviation;
+    out.extend(footnote(
+        &format!(
+            "{} settled and {} alternating bits from {} headers, every member's, \
+             read as the test suite defines them",
+            d.settled.n, d.alternating.n, p.headers.captured
+        ),
+        iw,
         theme,
     ));
+    if d.neighbour_busy > 0 {
+        out.push(quiet(
+            format!(
+                "{} headers not read: the next channel was busy at the time",
+                d.neighbour_busy
+            ),
+            theme,
+        ));
+    }
     out
 }
 
@@ -441,6 +476,7 @@ fn carrier_lines(
     p: &Piconet,
     state: &SdrMetrics,
     c: Columns,
+    iw: usize,
     trends: bool,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
@@ -509,6 +545,14 @@ fn carrier_lines(
     }
     out.extend(pair("Drift worst", drift(m), drift(s), c, theme));
     out.extend(pair("Rate worst", rate(m), rate(s), c, theme));
+    let n = p.headers.carrier.f0_ppm.n;
+    if n > 0 {
+        out.extend(footnote(
+            &format!("from {n} headers' access code and header, as the test suite defines them"),
+            iw,
+            theme,
+        ));
+    }
     out
 }
 
@@ -533,6 +577,7 @@ fn timing_lines(
     state: &SdrMetrics,
     iw: usize,
     c: Columns,
+    plots: bool,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let mut out = vec![crate::ui::chrome::section(
@@ -622,6 +667,31 @@ fn timing_lines(
                     theme,
                 ));
             }
+            // Every member's residuals as a shape: the numbers say how wide,
+            // the shape whether it is one spread or two, as when a slave
+            // answers a little late on every slot and stands as its own hump.
+            let beyond = if plots {
+                let (bars, beyond) = residual_histogram(&f.residuals_us, iw, c.master, theme);
+                out.extend(bars);
+                beyond
+            } else {
+                0
+            };
+            let span = crate::ui::widgets::timing_fmt::seconds_ms((f.span_us / 1e3) as u64);
+            let beyond = if beyond > 0 {
+                format!(", {beyond} beyond the plot's 1.5")
+            } else {
+                String::new()
+            };
+            out.extend(footnote(
+                &format!(
+                    "residual from the grid, us{beyond}: {} hits over {span}, every member's; \
+                     hits dated to 0.25 us",
+                    f.hits
+                ),
+                iw,
+                theme,
+            ));
         }
     }
     let sides = &p.headers.sides;
@@ -701,9 +771,28 @@ fn bench(
     // Narrow, one row of it: the types are the most sent first, so what a
     // row leaves off is the rarest.
     out.extend(traffic_lines(p, iw, if c.stacked { 1 } else { 2 }, theme));
+    // Of 79, not of the channels watched now: in SURVEY a piconet was heard
+    // wherever the survey stood at the time.
+    let runs = format!(
+        "{} of 79: {}",
+        p.channels_hit(),
+        channel_runs(p.channel_mask())
+    );
+    for (i, chunk) in crate::ui::chrome::wrap(&runs, iw.saturating_sub(Columns::LABEL), 2)
+        .into_iter()
+        .enumerate()
+    {
+        out.push(field(
+            if i == 0 { "channels" } else { "" },
+            chunk,
+            "",
+            theme,
+        ));
+    }
 
-    // Each section as a whole and without its trend: a trend is the first
-    // thing a short panel gives up, the readings the last.
+    // Each section as a whole and without its plots, the trends and the
+    // residual shape: a plot is the first thing a short panel gives up, the
+    // readings the last.
     let modulation = |trends| {
         let mut out = vec![
             crate::ui::chrome::section(
@@ -714,7 +803,7 @@ fn bench(
             ),
             heads(c),
         ];
-        out.extend(modulation_lines(p, c, trends, theme));
+        out.extend(modulation_lines(p, c, iw, trends, theme));
         out
     };
     let carrier = |trends| {
@@ -724,26 +813,28 @@ fn bench(
             iw,
             theme,
         )];
-        out.extend(carrier_lines(p, state, c, trends, theme));
+        out.extend(carrier_lines(p, state, c, iw, trends, theme));
         out
     };
-    let timing = timing_lines(p, state, iw, c, theme);
+    let timing = |plots| timing_lines(p, state, iw, c, plots, theme);
     let sections = [
         ("MODULATION", modulation(true), Some(modulation(false))),
         ("CARRIER", carrier(true), Some(carrier(false))),
-        ("TIMING", timing, None),
+        ("TIMING", timing(true), Some(timing(false))),
+        ("HEADERS", header_lines(p, state, iw, theme), None),
     ];
     let last = sections.len() - 1;
     // The line naming what is left out may wrap on a narrow bench: it is
     // kept whole, so it is given the rows its longest form needs.
     let note = |left: &[&str]| format!("+ {} on a taller panel", left.join(", "));
-    let note_rows = if note(&["MODULATION", "CARRIER", "TIMING", "trends"]).len() + 1 > iw {
+    let note_rows = if note(&["MODULATION", "CARRIER", "TIMING", "HEADERS", "plots"]).len() + 1 > iw
+    {
         2
     } else {
         1
     };
     let mut left_out = Vec::new();
-    let mut trends_left = false;
+    let mut plots_left = false;
     for (k, (name, whole, lean)) in sections.into_iter().enumerate() {
         // In order, leaving a row for the line that names what is left out,
         // unless this is the last section: whole, else without its trend,
@@ -756,13 +847,13 @@ fn bench(
             out.extend(whole);
         } else if let Some(lean) = lean.filter(|l| fits(l)) {
             out.extend(lean);
-            trends_left = true;
+            plots_left = true;
         } else {
             left_out.push(name);
         }
     }
-    if trends_left {
-        left_out.push("trends");
+    if plots_left {
+        left_out.push("plots");
     }
     if !left_out.is_empty() {
         let room = budget.saturating_sub(out.len()).min(note_rows);
@@ -1177,7 +1268,7 @@ mod tests {
             tall.contains("TIMING") && !tall.contains("taller panel"),
             "{tall}"
         );
-        let out = draw(NetBtBenchPanel, 100, 14, &m);
+        let out = draw(NetBtBenchPanel, 100, 18, &m);
         let text = out.join("\n");
         assert!(text.contains("MODULATION"), "{text}");
         assert!(!text.contains("├╴ TIMING"), "{text}");
@@ -1186,18 +1277,21 @@ mod tests {
             .rev()
             .find(|l| !l.trim_matches(['│', ' ', '╰', '─', '╯']).is_empty())
             .unwrap();
-        assert!(last.contains("TIMING on a taller panel"), "{text}");
+        assert!(
+            last.contains("TIMING") && last.contains("on a taller panel"),
+            "{text}"
+        );
     }
 
     /// Short and narrow, a section keeps its readings and gives up its
     /// trend first, and the last line says the trends are on a taller panel.
     #[test]
-    fn short_it_keeps_the_readings_before_the_trends() {
+    fn short_it_keeps_the_readings_before_the_plots() {
         let mut m = heard();
         let sides = &mut m.net.bt_piconets[0].headers.sides;
         sides.master.deviation = around(167_000.0);
         sides.slave.deviation = around(159_000.0);
-        let out = draw(NetBtBenchPanel, 40, 14, &m);
+        let out = draw(NetBtBenchPanel, 40, 17, &m);
         let text = out.join("\n");
         assert!(text.contains("Mod index"), "{text}");
         assert!(!text.contains("Mod trend"), "{text}");
@@ -1210,6 +1304,196 @@ mod tests {
             .map(|l| l.trim_matches(['│', ' ']).to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(note.contains("trends on a taller panel"), "whole: {text}");
+        assert!(note.contains("plots on a taller panel"), "whole: {text}");
+    }
+
+    /// **Headers are read only under one UAP**: before, the section says
+    /// how many wait and why; after, the read and the undecoded counts (a
+    /// rising undecoded count is how a wrong UAP would show), the session's
+    /// type mix and LT_ADDRs, and the clock hunt, under a heading that says
+    /// it is a port.
+    #[test]
+    fn headers_are_read_only_once_the_uap_is_one_value() {
+        use crate::signal::bt::piconet::observe_header;
+        let mut m = heard();
+        m.net.bt_uap.insert(LAP, vec![0x4c, 0x9a]);
+        let at = |m: &SdrMetrics| draw(NetBtBenchPanel, 100, 80, m).join("\n");
+        assert!(at(&m).contains("none yet"), "{}", at(&m));
+
+        observe_header(
+            &mut m.net.bt_piconets,
+            LAP,
+            HeaderRead::Unresolved,
+            2,
+            Default::default(),
+            Default::default(),
+        );
+        let out = at(&m);
+        assert!(
+            out.contains("1, not read: UAP not resolved (2 candidates)"),
+            "{out}"
+        );
+
+        m.net.bt_uap.insert(LAP, vec![0x4c]);
+        let read = |t, a| {
+            HeaderRead::Decoded(Header {
+                lt_addr: a,
+                packet_type: t,
+                flags: 0,
+                hec: 0,
+                clk6: 0,
+            })
+        };
+        for (t, a) in [
+            (PacketType::Poll, 1),
+            (PacketType::Poll, 1),
+            (PacketType::Null, 0),
+            (PacketType::Dh1, 2),
+            (PacketType::Poll, 2),
+        ] {
+            observe_header(
+                &mut m.net.bt_piconets,
+                LAP,
+                read(t, a),
+                1,
+                Default::default(),
+                Default::default(),
+            );
+        }
+        observe_header(
+            &mut m.net.bt_piconets,
+            LAP,
+            HeaderRead::Undecoded,
+            1,
+            Default::default(),
+            Default::default(),
+        );
+        let out = at(&m);
+        assert!(
+            out.contains("HEADERS") && out.contains("checked on air"),
+            "{out}"
+        );
+        assert!(
+            out.contains("5 of 7 captured, 1 did not decode under 0x4c"),
+            "{out}"
+        );
+        assert!(
+            out.contains("POLL 3 \u{00b7} NULL 1 \u{00b7} DH1/2-DH1 1"),
+            "{out}"
+        );
+        assert!(out.contains("0 (broadcast), 1, 2"), "{out}");
+        assert!(out.contains("CLK1-6 found"), "{out}");
+    }
+
+    /// What every reading rests on is said under it, as it was on the
+    /// Classic view: the bits and headers the modulation is read from, the
+    /// headers a busy neighbour kept from being read, and the headers the
+    /// carrier is read from.
+    #[test]
+    fn the_readings_say_what_they_rest_on() {
+        use crate::signal::bt::piconet::observe_header;
+        use crate::signal::dsp::deviation::Sums;
+        let mut m = heard();
+        let dev = Deviation {
+            settled: Sums::of(&[158_000.0, 160_000.0, 162_000.0, 160_000.0]),
+            alternating: Sums::of(&[149_000.0, 151_000.0]),
+            neighbour_busy: 2,
+        };
+        let carrier = Carrier {
+            f0_ppm: Sums::of(&[4.0, 6.0]),
+            channel_mhz: Sums::of(&[2441.0, 2441.0]),
+            worst_drift_hz: None,
+            worst_rate_hz_per_us: None,
+        };
+        observe_header(
+            &mut m.net.bt_piconets,
+            LAP,
+            HeaderRead::Unresolved,
+            32,
+            dev,
+            carrier,
+        );
+        let out = draw(NetBtBenchPanel, 100, 80, &m).join("\n");
+        assert!(
+            out.contains("4 settled and 2 alternating bits from 1 headers"),
+            "{out}"
+        );
+        assert!(
+            out.contains("2 headers not read: the next channel was busy"),
+            "{out}"
+        );
+        assert!(
+            out.contains("from 2 headers' access code and header"),
+            "{out}"
+        );
+    }
+
+    /// The piconet's clock from its slot grid: a reading relative to our
+    /// own oscillator with no reference, and corrected once a reference
+    /// makes it absolute.
+    #[test]
+    fn the_piconet_clock_is_relative_until_a_reference_judges_it() {
+        let mut m = heard();
+        let times: Vec<f64> = (0..40u32)
+            .map(|k| f64::from(k * 5) * crate::signal::bt::slots::SLOT_US * (1.0 + 6e-6))
+            .collect();
+        m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
+        let out = draw(NetBtBenchPanel, 100, 80, &m);
+        let clock = out
+            .iter()
+            .find(|l| l.starts_with("│ clock "))
+            .unwrap()
+            .clone();
+        // Slots 6 ppm long: a clock 6 ppm slow.
+        assert!(
+            clock.contains("-6") && clock.contains("relative to our own oscillator"),
+            "{clock}"
+        );
+
+        m.radio.reference = Some(crate::state::FrequencyReference {
+            ppm: 2.0,
+            sigma_ppm: 0.1,
+            provenance: crate::state::Provenance::Traceable,
+            source: "WWV 10 MHz".to_string(),
+            at: std::time::Instant::now(),
+            efficiency: None,
+            trusted: None,
+        });
+        let out = draw(NetBtBenchPanel, 100, 80, &m);
+        let clock = out.iter().find(|l| l.starts_with("│ clock ")).unwrap();
+        assert!(
+            clock.contains("-4") && !clock.contains("relative"),
+            "corrected: {clock}"
+        );
+    }
+
+    /// The residuals as a shape, every member's, with what they rest on:
+    /// the plot that shows a slave answering late as a hump of its own.
+    #[test]
+    fn the_grid_residuals_are_plotted_with_what_they_rest_on() {
+        let mut m = heard();
+        let times: Vec<f64> = (0..60u32)
+            .map(|k| f64::from(k) * 1e6 + if k % 2 == 0 { 0.0 } else { 0.3 })
+            .collect();
+        m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
+        let out = draw(NetBtBenchPanel, 100, 80, &m).join("\n");
+        assert!(out.contains("residual from the grid"), "{out}");
+        assert!(out.contains("60 hits over"), "{out}");
+        assert!(out.contains("every member's"), "{out}");
+        assert!(
+            out.contains('\u{2588}') || out.contains('\u{2584}'),
+            "a bar drawn: {out}"
+        );
+    }
+
+    /// Where the piconet was heard, of all 79, as runs.
+    #[test]
+    fn the_channels_it_was_heard_on_are_runs() {
+        let mut m = heard();
+        for ch in [2u8, 3, 4, 5, 17] {
+            observe(&mut m.net.bt_piconets, LAP, ch, Instant::now());
+        }
+        let out = draw(NetBtBenchPanel, 100, 80, &m).join("\n");
+        assert!(out.contains("6 of 79: 2-5, 17, 73"), "{out}");
     }
 }

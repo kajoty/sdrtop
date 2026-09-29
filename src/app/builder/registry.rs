@@ -494,9 +494,12 @@ mod tests {
         let rendered = net_panels_with_one_device(crate::state::AddressDisplay::Full);
         let mut checked = 0;
         for (name, text, chrome) in &rendered {
-            // A ppm, or the packet list's f0 in kHz: an offset either way,
-            // corrected by the reference where there is one.
-            let prints_ppm = text.contains(" ppm") || text.contains("f0 kHz");
+            // A ppm, or an f0 in kHz (the packet list's column, the Classic
+            // view's summary line): an offset either way, corrected by the
+            // reference where there is one.
+            let prints_ppm = text.contains(" ppm")
+                || text.contains("f0 kHz")
+                || (text.contains("f0 ") && text.contains(" kHz"));
             let declares = chrome.offsets;
             if prints_ppm || declares {
                 checked += 1;

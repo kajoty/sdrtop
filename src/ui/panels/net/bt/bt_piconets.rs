@@ -26,13 +26,11 @@ use ratatui::{
 };
 
 use super::sections::{
-    self, CLOCK_LIMIT_PPM, CLOCK_RESOLUTION_PPM, JITTER_LIMIT_US, JITTER_RESOLUTION_US, LABEL_W,
+    self, channel_runs, F0_RESOLUTION_KHZ, INDEX_RESOLUTION, JITTER_RESOLUTION_US, LABEL_W,
 };
 use crate::signal::bt::piconet::{ordered, Inquiry, Kind, Piconet, DCI};
-use crate::signal::dsp::uncertainty::Uncertain;
 use crate::state::SdrMetrics;
 use crate::ui::panel::{FeedSpan, Panel, PanelChrome, Staleness};
-use crate::ui::widgets::limit::{LimitRow, RowWidths};
 use crate::ui::widgets::reading::Reading;
 use crate::ui::widgets::table::{
     columns_that_fit, grow_to_contents, header, row, viewport_start, Align, Column, Sort,
@@ -227,29 +225,6 @@ fn pace_text(p: &Piconet) -> Option<String> {
     })
 }
 
-/// The channels a piconet was heard on, as runs: `2-5, 17, 40-41`.
-fn channel_runs(mask: u128) -> String {
-    let mut runs = Vec::new();
-    let mut ch = 0u8;
-    while ch < 79 {
-        if mask & (1 << ch) == 0 {
-            ch += 1;
-            continue;
-        }
-        let start = ch;
-        while ch + 1 < 79 && mask & (1 << (ch + 1)) != 0 {
-            ch += 1;
-        }
-        runs.push(if start == ch {
-            start.to_string()
-        } else {
-            format!("{start}-{ch}")
-        });
-        ch += 1;
-    }
-    runs.join(", ")
-}
-
 fn detail(
     p: &Piconet,
     state: &SdrMetrics,
@@ -331,11 +306,86 @@ fn detail(
     out
 }
 
-/// The selected piconet's detail within `budget` rows: its core block, or
-/// nothing where even that does not fit (the table's rows come first, as
-/// the census's do), then each section in order while it fits whole. A
-/// section left out is named on a last line, so a short panel says what a
-/// taller one would show rather than stopping mid-sentence.
+/// A piconet summed up: its LAP, its UAP in words, its readings on one
+/// line, and where the rest of it is. The sections themselves are the
+/// Piconet view's bench, one side each, so this view stays the overview it
+/// is: who is here, and where they hop.
+///
+/// **The readings every member's, pooled**, as the Classic view always
+/// showed them: the index and f0 from every header, and the rms of every
+/// member's residuals from the slot grid, which is not a jitter: the two
+/// sides' offset from each other is in it (the bench has each side's). Each to the places its uncertainty gives it, and a dash until it
+/// can be stated; the ± is the bench's, where there is room for it.
+fn summary(p: &Piconet, state: &SdrMetrics, iw: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            crate::ui::chrome::field(label, LABEL_W, theme),
+            Span::styled(value, Style::default().fg(theme.value)),
+        ])
+    };
+    let mut out = vec![
+        crate::ui::chrome::section("piconet", "", iw, theme),
+        field(
+            "LAP",
+            format!("{}  the master's", state.net.show_lap(p.lap)),
+        ),
+    ];
+    let uap = uap_sentence(state.net.bt_uap.get(&p.lap), &state.net);
+    for (i, chunk) in crate::ui::chrome::wrap(&uap, iw.saturating_sub(LABEL_W + 1), 2)
+        .into_iter()
+        .enumerate()
+    {
+        out.push(field(if i == 0 { "UAP" } else { "" }, chunk));
+    }
+    let value = |r: Option<Reading>| {
+        r.and_then(|r| r.value_text())
+            .unwrap_or_else(|| "—".to_string())
+    };
+    let h = &p.headers;
+    let index =
+        value(sections::index_of(&h.deviation).map(|i| Reading::new(i, "", INDEX_RESOLUTION)));
+    let f0 = value(
+        h.carrier
+            .f0_ppm
+            .mean()
+            .zip(h.carrier.channel_mhz.mean())
+            .map(|(ppm, mhz)| {
+                let (ppm, _) = state.radio.corrected_ppm(ppm, std::time::Instant::now());
+                Reading::new(ppm.scale(mhz.value() / 1e3), "kHz", F0_RESOLUTION_KHZ)
+            }),
+    );
+    let rms = value(
+        p.slots
+            .as_ref()
+            .and_then(|s| s.as_ref().ok())
+            .map(|f| Reading::new(f.rms_us, "us", JITTER_RESOLUTION_US)),
+    );
+    let dot = || Span::styled(" · ".to_string(), Style::default().fg(theme.label));
+    let unit = |u: &str| Span::styled(u.to_string(), Style::default().fg(theme.label));
+    let ink = |t: String| Span::styled(t, Style::default().fg(theme.value));
+    out.push(Line::from(vec![
+        unit(" index "),
+        ink(index),
+        dot(),
+        unit("f0 "),
+        ink(f0),
+        unit(" kHz"),
+        dot(),
+        unit("grid rms "),
+        ink(rms),
+        unit(" us"),
+    ]));
+    out.push(Line::from(Span::styled(
+        " Enter: packet by packet, on NET 6".to_string(),
+        Style::default().fg(theme.label),
+    )));
+    out
+}
+
+/// The selected LAP's detail within `budget` rows, or nothing where it does
+/// not fit (the table's rows come first, as the census's do): a piconet's
+/// summary, or an inquiry's or a page's account, which has nowhere else to
+/// be, since neither is a piconet the Piconet view could open.
 fn detail_within(
     p: &Piconet,
     state: &SdrMetrics,
@@ -344,491 +394,35 @@ fn detail_within(
     budget: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
-    let mut out = detail(p, state, now, iw, theme);
-    if out.len() > budget {
-        return Vec::new();
-    }
-    // Neither an inquiry nor a page is a piconet, so the sections below
-    // would read a piconet that is not there: said once, and not drawn.
-    let not_a_piconet = match p.kind() {
-        Kind::Inquiry(_) => Some(format!(
+    let text = match p.kind() {
+        Kind::Piconet => {
+            let out = summary(p, state, iw, theme);
+            return if out.len() > budget { Vec::new() } else { out };
+        }
+        Kind::Inquiry(_) => format!(
             "UAP fixed at the DCI, {DCI:#04x}. Every device inquiring sends this code, \
              so there is no one clock, modulation or header stream to read"
-        )),
-        Kind::Paged => Some(format!(
+        ),
+        Kind::Paged => format!(
             "ID packets only: no header after any of {} hits. A page is a caller's \
              ID packets, not a piconet, so there is no clock, modulation or header \
              stream of one to read",
             p.hits
-        )),
-        Kind::Piconet => None,
-    };
-    if let Some(text) = not_a_piconet {
-        for chunk in crate::ui::chrome::wrap(&text, iw.saturating_sub(1), 3) {
-            if out.len() < budget {
-                out.push(Line::from(Span::styled(
-                    format!(" {chunk}"),
-                    Style::default().fg(theme.label),
-                )));
-            }
-        }
-        return out;
-    }
-    let sections = [
-        ("MODULATION", modulation_lines(p, iw, theme)),
-        ("CARRIER", carrier_lines(p, state, iw, theme)),
-        ("TIMING", timing_lines(p, state, iw, theme)),
-        ("HEADERS", header_lines(p, state, iw, theme)),
-    ];
-    let last = sections.len() - 1;
-    let mut left_out = Vec::new();
-    for (k, (name, lines)) in sections.into_iter().enumerate() {
-        // Whole, in order, and leaving a row for the line that names what
-        // is left out, unless this is the last section.
-        let reserve = usize::from(k < last);
-        if left_out.is_empty() && out.len() + lines.len() + reserve <= budget {
-            out.extend(lines);
-        } else {
-            left_out.push(name);
-        }
-    }
-    if !left_out.is_empty() && out.len() < budget {
-        out.push(Line::from(Span::styled(
-            format!(" + {} on a taller panel", left_out.join(", ")),
-            Style::default().fg(theme.label),
-        )));
-    }
-    out
-}
-
-/// The MODULATION section (net-ux-polish-plan 6.4): the piconet's BR
-/// modulation index, read from the trailer and header symbols of every
-/// header captured on its LAP (`piconet::Deviation`), as the test suite
-/// defines them (`signal::net::measure`), against the BR band,
-/// in the same `widgets::limit` rows the BLE packet detail uses, so the two
-/// protocols' transmitter quality reads alike. The header's FEC repeats
-/// each bit three times, so settled bits are plentiful there, and the
-/// alternating ones come mostly from the sync word and trailer.
-fn modulation_lines(p: &Piconet, iw: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
-    let d = p.headers.deviation;
-    let mut out = vec![crate::ui::chrome::section(
-        "modulation",
-        "BR limits: Core 5.4 Vol 2 A 3.1.1",
-        iw,
-        theme,
-    )];
-    let quiet = |text: &str| {
-        Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default().fg(theme.stale),
-        ))
-    };
-    // Headers a busy neighbour kept from being read (`signal::net::
-    // measure`), said wherever the figures stand or fail to.
-    let busy = (d.neighbour_busy > 0).then(|| {
-        quiet(&format!(
-            "{} headers not read: the next channel was busy at the time",
-            d.neighbour_busy
-        ))
-    });
-    let Some(rows) = sections::modulation_rows(&d, iw, theme) else {
-        out.push(quiet(&format!(
-            "not measured: {} settled bits in {} headers, two needed",
-            d.settled.n, p.headers.captured
-        )));
-        out.extend(busy);
-        return out;
-    };
-    out.extend(rows);
-    for chunk in crate::ui::chrome::wrap(
-        &format!(
-            "{} settled and {} alternating bits from {} headers, every member's, \
-             read as the test suite defines them",
-            d.settled.n, d.alternating.n, p.headers.captured
         ),
-        iw.saturating_sub(1),
-        2,
-    ) {
-        out.push(Line::from(Span::styled(
-            format!(" {chunk}"),
-            Style::default().fg(theme.label),
-        )));
+    };
+    let mut out = detail(p, state, now, iw, theme);
+    if out.len() > budget {
+        return Vec::new();
     }
-    out.extend(busy);
-    out
-}
-
-/// The CARRIER section: the piconet's initial carrier and drift as the test
-/// suites define them (`piconet::Carrier`, `signal::net::measure`), every
-/// member's headers pooled. f0 is the mean over headers, relative to our
-/// own oscillator until a reference makes it absolute, as the clock row
-/// is; the drift and its rate are the worst header's, because the limits
-/// are on every packet.
-fn carrier_lines(
-    p: &Piconet,
-    state: &SdrMetrics,
-    iw: usize,
-    theme: &crate::Theme,
-) -> Vec<Line<'static>> {
-    let c = p.headers.carrier;
-    let mut out = vec![crate::ui::chrome::section(
-        "carrier",
-        "BR limits: Core 5.4 Vol 2 A 3.1.3",
-        iw,
-        theme,
-    )];
-    let quiet = |text: &str| {
-        Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default().fg(theme.stale),
-        ))
-    };
-    let Some(rows) = sections::carrier_rows(&c, state, iw, theme) else {
-        out.push(quiet("not measured: two headers with enough blocks needed"));
-        return out;
-    };
-    out.extend(rows);
-    for chunk in crate::ui::chrome::wrap(
-        &format!(
-            "from {} headers' access code and header, as the test suite defines them",
-            c.f0_ppm.n
-        ),
-        iw.saturating_sub(1),
-        2,
-    ) {
-        out.push(Line::from(Span::styled(
-            format!(" {chunk}"),
-            Style::default().fg(theme.label),
-        )));
-    }
-    out
-}
-
-/// The TIMING section (net-ux-polish-plan 6.5): each access code's offset
-/// from the piconet's own fitted 625 µs grid (`signal::bt::slots`). The
-/// largest against the specification's 1 µs, the root mean square as a
-/// reading, and what they rest on: how many hits over how long. Refused
-/// below `signal::bt::slots::MIN_HITS` hits and when the hits line up on no grid
-/// beyond chance; never a figure from three points.
-///
-/// **Every member's packets, and our own resolution in it.** A LAP is the
-/// piconet, so slaves' transmissions are on the grid too, timed from what
-/// they received; and a hit is dated to a quarter symbol, 0.25 µs, which a
-/// residual includes.
-fn timing_lines(
-    p: &Piconet,
-    state: &SdrMetrics,
-    iw: usize,
-    theme: &crate::Theme,
-) -> Vec<Line<'static>> {
-    use crate::signal::bt::slots::SlotRefusal;
-    let mut out = vec![crate::ui::chrome::section(
-        "timing",
-        "625 us slots: Core 5.4 Vol 2 B 2.2.5",
-        iw,
-        theme,
-    )];
-    let quiet = |text: String| {
-        Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default().fg(theme.stale),
-        ))
-    };
-    let f = match &p.slots {
-        None => {
-            out.push(quiet("no hit timed yet".to_string()));
-            return out;
-        }
-        Some(Err(SlotRefusal::Collecting { have, need })) => {
-            out.push(quiet(format!(
-                "collecting: {have} of {need} hits to fit a slot grid"
-            )));
-            return out;
-        }
-        Some(Err(SlotRefusal::NoGrid { hits })) => {
-            out.push(quiet(format!(
-                "no slot grid: {hits} hits do not line up at 625 us beyond chance"
-            )));
-            return out;
-        }
-        Some(Ok(f)) => f,
-    };
-    let rows = vec![LimitRow::new(
-        "Jitter max",
-        Reading::new(Uncertain::exact(f.max_us), "us", f64::INFINITY),
-        JITTER_LIMIT_US,
-    )];
-    // The piconet's own clock, the classic twin of the census's crystal
-    // error: its slots run `rate_ppm` long on our clock, so its clock runs
-    // that much slow, less our own oscillator's error, which a reference
-    // takes out exactly as it does for a BLE offset (`corrected_ppm`: the
-    // radio's LO and its sample clock come from one crystal). Held against
-    // 2.2.5's 20 ppm only when a reference makes it absolute; without one
-    // it is a reading, and the frame's [RELATIVE] says what it is worth.
-    let (clock, judged) = sections::clock_of(f, state);
-    let mut rows = rows;
-    if judged {
-        rows.push(LimitRow::new(
-            "Clock",
-            Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM),
-            CLOCK_LIMIT_PPM,
-        ));
-    }
-    let w = RowWidths::fit_within(&rows, iw);
-    out.extend(rows.iter().map(|r| Line::from(r.spans(theme, w))));
-    if !judged {
-        out.push(Line::from(vec![
-            crate::ui::chrome::field("clock", LABEL_W, theme),
-            Span::styled(
-                Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM).text(),
-                Style::default().fg(theme.value),
-            ),
-            Span::styled(
-                "  relative to our own oscillator".to_string(),
+    for chunk in crate::ui::chrome::wrap(&text, iw.saturating_sub(1), 3) {
+        if out.len() < budget {
+            out.push(Line::from(Span::styled(
+                format!(" {chunk}"),
                 Style::default().fg(theme.label),
-            ),
-        ]));
-    }
-    out.push(Line::from(vec![
-        crate::ui::chrome::field("rms", LABEL_W, theme),
-        Span::styled(
-            Reading::new(f.rms_us, "us", JITTER_RESOLUTION_US).text(),
-            Style::default().fg(theme.value),
-        ),
-    ]));
-    // The piconet's own colour, as on the hop panel and its roster chip.
-    let colour = state
-        .net
-        .bt_piconets
-        .iter()
-        .position(|q| q.lap == p.lap)
-        .map_or(theme.value_hi, |k| theme.series_color(k));
-    let (bars, beyond) = residual_histogram(&f.residuals_us, iw, colour, theme);
-    out.extend(bars);
-    let span = crate::ui::widgets::timing_fmt::seconds_ms((f.span_us / 1e3) as u64);
-    let beyond = if beyond > 0 {
-        format!(", {beyond} beyond the plot's 1.5")
-    } else {
-        String::new()
-    };
-    for chunk in crate::ui::chrome::wrap(
-        &format!(
-            "residual from the grid, us{beyond}: {} hits over {span}, every member's; hits dated to 0.25 us",
-            f.hits
-        ),
-        iw.saturating_sub(1),
-        2,
-    ) {
-        out.push(Line::from(Span::styled(
-            format!(" {chunk}"),
-            Style::default().fg(theme.label),
-        )));
+            )));
+        }
     }
     out
-}
-
-/// The residual plot's reach either side of the grid, µs: past the 1 µs
-/// limit, so a residual beyond it shows as one.
-const PLOT_US: f64 = 1.5;
-/// Its height in rows of eighth blocks.
-const PLOT_ROWS: usize = 3;
-
-/// Where each hit sat against the grid (net-ux-polish-plan 6.5.b):
-/// residuals from −[`PLOT_US`] to +[`PLOT_US`] in bars of the piconet's
-/// own colour, the specification's ±1 µs (2.2.5) as `┊` rules in the
-/// warning ink, zero as a dim one, and a tick and label row under them. The
-/// numbers say how wide the spread is; the shape says whether it is one
-/// spread or two, as when a peripheral answers a little late on every slot
-/// and stands as its own hump. Returns the lines, empty where the width
-/// cannot hold a readable plot, and how many residuals fell beyond it.
-fn residual_histogram(
-    residuals: &[f32],
-    iw: usize,
-    colour: ratatui::style::Color,
-    theme: &crate::Theme,
-) -> (Vec<Line<'static>>, usize) {
-    const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let cols = iw.saturating_sub(4);
-    let beyond = residuals
-        .iter()
-        .filter(|r| (r.abs() as f64) >= PLOT_US)
-        .count();
-    if cols < 15 {
-        return (Vec::new(), beyond);
-    }
-    let col_of = |x: f64| {
-        (((x + PLOT_US) / (2.0 * PLOT_US)) * cols as f64)
-            .floor()
-            .clamp(0.0, cols as f64 - 1.0) as usize
-    };
-    let mut bins = vec![0u32; cols];
-    for &r in residuals.iter().filter(|r| (r.abs() as f64) < PLOT_US) {
-        bins[col_of(r as f64)] += 1;
-    }
-    let most = bins.iter().copied().max().unwrap_or(0).max(1);
-    let limits = [col_of(-1.0), col_of(1.0)];
-    let zero = col_of(0.0);
-    let mut out = Vec::with_capacity(PLOT_ROWS + 2);
-    for row in 0..PLOT_ROWS {
-        let base = (PLOT_ROWS - 1 - row) * 8;
-        let mut spans = vec![Span::raw("  ")];
-        for (c, &n) in bins.iter().enumerate() {
-            let fill = ((n as f64 / most as f64 * (PLOT_ROWS * 8) as f64).round() as usize)
-                .saturating_sub(base)
-                .min(8);
-            spans.push(if fill > 0 {
-                Span::styled(EIGHTHS[fill].to_string(), Style::default().fg(colour))
-            } else if limits.contains(&c) {
-                Span::styled("\u{250a}", Style::default().fg(theme.status_warn))
-            } else if c == zero {
-                Span::styled("\u{250a}", Style::default().fg(theme.border_dim))
-            } else {
-                Span::raw(" ")
-            });
-        }
-        out.push(Line::from(spans));
-    }
-    let ticks: String = (0..cols)
-        .map(|c| {
-            if limits.contains(&c) || c == zero {
-                '\u{2534}'
-            } else {
-                '\u{2500}'
-            }
-        })
-        .collect();
-    out.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(ticks, Style::default().fg(theme.border_dim)),
-    ]));
-    let mut labels = vec![' '; cols];
-    for (c, text) in [(limits[0], "-1"), (zero, "0"), (limits[1], "+1")] {
-        let at = c.saturating_sub(text.len() / 2).min(cols - text.len());
-        for (i, ch) in text.chars().enumerate() {
-            labels[at + i] = ch;
-        }
-    }
-    out.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            labels.into_iter().collect::<String>(),
-            Style::default().fg(theme.label),
-        ),
-    ]));
-    (out, beyond)
-}
-
-/// What the piconet's headers say (net-ux-polish-plan 6.3), under its own
-/// heading, marked as the port it is: the header decode is `libbtbb`'s,
-/// read from its source and never yet checked against a classic
-/// transmitter on the air (`signal::bt::header`, rule 1).
-///
-/// **Read only under one UAP.** Before the UAP is one value the heading
-/// says so and how many headers are waiting; no type is guessed from a
-/// candidate (rule 2). A header that did not decode under the resolved UAP
-/// is counted beside the ones that did, because a rising count is how a
-/// wrong resolution would show.
-fn header_lines(
-    p: &Piconet,
-    state: &SdrMetrics,
-    iw: usize,
-    theme: &crate::Theme,
-) -> Vec<Line<'static>> {
-    use crate::signal::bt::header::PacketType;
-    let h = &p.headers;
-    let field = |label: &str, value: String| {
-        Line::from(vec![
-            crate::ui::chrome::field(label, LABEL_W, theme),
-            Span::styled(value, Style::default().fg(theme.value)),
-        ])
-    };
-    let mut out = vec![crate::ui::chrome::section(
-        "headers",
-        "libbtbb port, checked on air",
-        iw,
-        theme,
-    )];
-    if h.captured == 0 {
-        out.push(field(
-            "captured",
-            "none yet: no header followed a hit".to_string(),
-        ));
-        return out;
-    }
-    let uap = match state.net.bt_uap.get(&p.lap).map(|u| u.as_slice()) {
-        Some([one]) => *one,
-        other => {
-            let n = other.map_or(0, |u| u.len());
-            out.push(field(
-                "captured",
-                format!(
-                    "{}, not read: UAP not resolved ({n} candidates)",
-                    h.captured
-                ),
-            ));
-            out.push(field("clock", clock_text(h.clock_hypotheses)));
-            return out;
-        }
-    };
-    let mut read = format!("{} of {} captured", h.decoded, h.captured);
-    if h.undecoded > 0 {
-        read.push_str(&format!(
-            ", {} did not decode under {}",
-            h.undecoded,
-            state.net.show_uap(uap)
-        ));
-    }
-    out.push(field("read", read));
-    let mut mix: Vec<(u32, u8)> = (0..16u8)
-        .map(|c| (h.types[c as usize], c))
-        .filter(|(n, _)| *n > 0)
-        .collect();
-    mix.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let room = iw.saturating_sub(LABEL_W + 1);
-    let types = if mix.is_empty() {
-        "-".to_string()
-    } else {
-        mix.iter()
-            .map(|(n, c)| format!("{} {n}", PacketType::from_code(*c).shown()))
-            .collect::<Vec<_>>()
-            .join(" \u{00b7} ")
-    };
-    for (i, chunk) in crate::ui::chrome::wrap(&types, room, 2)
-        .into_iter()
-        .enumerate()
-    {
-        out.push(field(if i == 0 { "types" } else { "" }, chunk));
-    }
-    let addrs: Vec<String> = (0..8u8)
-        .filter(|a| h.lt_addrs & (1 << a) != 0)
-        .map(|a| {
-            if a == 0 {
-                "0 (broadcast)".to_string()
-            } else {
-                a.to_string()
-            }
-        })
-        .collect();
-    out.push(field(
-        "LT_ADDR",
-        if addrs.is_empty() {
-            "-".to_string()
-        } else {
-            addrs.join(", ")
-        },
-    ));
-    out.push(field("clock", clock_text(h.clock_hypotheses)));
-    out
-}
-
-/// The CLK1-6 hunt, in words: the whitening every header is read through
-/// depends on it.
-fn clock_text(hypotheses: u8) -> String {
-    match hypotheses {
-        0 => "CLK1-6 not tracked yet".to_string(),
-        1 => "CLK1-6 found (1 of 64 hypotheses left)".to_string(),
-        n => format!("CLK1-6: {n} of 64 hypotheses left"),
-    }
 }
 
 impl Panel for NetBtPiconetsPanel {
@@ -847,7 +441,10 @@ impl Panel for NetBtPiconetsPanel {
     }
 
     fn focus_bindings(&self) -> &'static [(&'static str, &'static str)] {
-        &[("↑↓", "select a piconet")]
+        &[
+            ("↑↓", "select a piconet"),
+            ("Enter", "packet by packet, on NET 6"),
+        ]
     }
 
     fn chrome(&self, state: &SdrMetrics) -> PanelChrome {
@@ -1066,40 +663,6 @@ mod tests {
         );
     }
 
-    /// The piconet's clock error, from its slot grid: a reading relative to
-    /// our own oscillator with no reference, and held against 2.2.5's 20 ppm
-    /// once a reference makes it absolute, corrected by it.
-    #[test]
-    fn the_piconet_clock_is_relative_until_a_reference_judges_it() {
-        let mut m = heard();
-        let lap = 0x123456;
-        let times: Vec<f64> = (0..40u32)
-            .map(|k| f64::from(k * 5) * crate::signal::bt::slots::SLOT_US * (1.0 + 6e-6))
-            .collect();
-        let p = m.net.bt_piconets.iter_mut().find(|p| p.lap == lap).unwrap();
-        p.slots = Some(crate::signal::bt::slots::fit(&times));
-        m.net.bt_view.selected = Some(lap);
-        let text = draw(NetBtPiconetsPanel, 80, 40, &m).join("\n");
-        // Slots 6 ppm long: a clock 6 ppm slow.
-        assert!(text.contains("clock    -6"), "{text}");
-        assert!(text.contains("relative to our own oscillator"), "{text}");
-        assert!(text.contains("[RELATIVE]"), "{text}");
-
-        m.radio.reference = Some(crate::state::FrequencyReference {
-            ppm: 2.0,
-            sigma_ppm: 0.1,
-            provenance: crate::state::Provenance::Traceable,
-            source: "WWV 10 MHz".to_string(),
-            at: std::time::Instant::now(),
-            efficiency: None,
-            trusted: None,
-        });
-        let text = draw(NetBtPiconetsPanel, 80, 40, &m).join("\n");
-        assert!(text.contains("Clock"), "{text}");
-        assert!(text.contains("-4"), "corrected by the reference: {text}");
-        assert!(text.contains("-20") && text.contains("20"), "{text}");
-    }
-
     /// The sort mark stands on the column the rows are ordered by, LAST,
     /// whatever columns are added before it.
     #[test]
@@ -1165,21 +728,6 @@ mod tests {
         assert!(row.contains("0x21"), "{row}");
     }
 
-    /// The selected piconet spelled out: the channels as runs, and the
-    /// UAP's state in words.
-    #[test]
-    fn the_selected_piconet_is_spelled_out() {
-        let mut m = heard();
-        m.net.bt_view.selected = Some(0x5a3c71);
-        let out = draw(NetBtPiconetsPanel, 60, 16, &m).join("\n");
-        assert!(out.contains("PICONET"), "{out}");
-        assert!(out.contains("5 of 79: 2-5, 17"), "{out}");
-        assert!(out.contains("2 candidates (0x4c, 0x9a)"), "{out}");
-
-        let none = draw(NetBtPiconetsPanel, 60, 16, &heard()).join("\n");
-        assert!(!none.contains("PICONET"), "{none}");
-    }
-
     /// **A first header leaves 32 candidates**, seen on the air: the cell
     /// holds `32 left` whole, and the detail says how many rather than
     /// listing a wall of values.
@@ -1211,260 +759,6 @@ mod tests {
         assert_eq!(block, 5, "{}", out.join("\n"));
     }
 
-    /// **Headers are read only under one UAP** (6.3): before, the block
-    /// says how many wait and why; after, the type mix (most first), the
-    /// LT_ADDRs, and the clock, under a heading that says it is a port.
-    #[test]
-    fn headers_are_read_only_once_the_uap_is_one_value() {
-        use crate::signal::bt::header::{Header, PacketType};
-        use crate::signal::bt::piconet::{observe_header, HeaderRead};
-        let mut m = heard();
-        m.net.bt_view.selected = Some(0x5a3c71);
-        let out = draw(NetBtPiconetsPanel, 70, 30, &m).join("\n");
-        assert!(out.contains("none yet"), "{out}");
-
-        observe_header(
-            &mut m.net.bt_piconets,
-            0x5a3c71,
-            HeaderRead::Unresolved,
-            2,
-            Default::default(),
-            Default::default(),
-        );
-        let out = draw(NetBtPiconetsPanel, 70, 30, &m).join("\n");
-        assert!(
-            out.contains("1, not read: UAP not resolved (2 candidates)"),
-            "{out}"
-        );
-        assert!(!out.contains("types"), "{out}");
-
-        m.net.bt_uap.insert(0x5a3c71, vec![0x4c]);
-        let header = |t, a| Header {
-            lt_addr: a,
-            packet_type: t,
-            flags: 0,
-            hec: 0,
-            clk6: 0,
-        };
-        for (t, a) in [
-            (PacketType::Poll, 1),
-            (PacketType::Poll, 1),
-            (PacketType::Null, 0),
-            (PacketType::Dh1, 2),
-            (PacketType::Poll, 2),
-        ] {
-            observe_header(
-                &mut m.net.bt_piconets,
-                0x5a3c71,
-                HeaderRead::Decoded(header(t, a)),
-                1,
-                Default::default(),
-                Default::default(),
-            );
-        }
-        observe_header(
-            &mut m.net.bt_piconets,
-            0x5a3c71,
-            HeaderRead::Undecoded,
-            1,
-            Default::default(),
-            Default::default(),
-        );
-        let out = draw(NetBtPiconetsPanel, 70, 30, &m).join("\n");
-        assert!(out.contains("HEADERS"), "{out}");
-        assert!(out.contains("checked on air"), "{out}");
-        assert!(
-            out.contains("5 of 7 captured, 1 did not decode under 0x4c"),
-            "{out}"
-        );
-        assert!(
-            out.contains("POLL 3 \u{00b7} NULL 1 \u{00b7} DH1/2-DH1 1"),
-            "{out}"
-        );
-        assert!(out.contains("0 (broadcast), 1, 2"), "{out}");
-        assert!(out.contains("CLK1-6 found"), "{out}");
-    }
-
-    /// **The BR modulation index against the BR band** (6.4): refused
-    /// until two settled bits, then the index, delta-f1 and, once two
-    /// alternating bits are in, the ratio, in the limit rows BLE uses.
-    #[test]
-    fn the_modulation_index_is_read_against_the_br_band() {
-        use crate::signal::bt::piconet::{observe_header, Deviation, HeaderRead};
-        use crate::signal::dsp::deviation::Sums;
-        let mut m = heard();
-        m.net.bt_view.selected = Some(0x5a3c71);
-        let out = draw(NetBtPiconetsPanel, 80, 40, &m).join("\n");
-        assert!(out.contains("MODULATION"), "{out}");
-        assert!(
-            out.contains("not measured: 0 settled bits in 0 headers"),
-            "{out}"
-        );
-
-        // 160 kHz settled, h = 0.32; alternating at 150 kHz, ratio ~0.94.
-        let dev = Deviation {
-            settled: Sums::of(&[158_000.0, 160_000.0, 162_000.0, 160_000.0]),
-            alternating: Sums::of(&[149_000.0, 151_000.0]),
-            neighbour_busy: 2,
-        };
-        // Two headers' carrier: f0 +4 and +6 ppm on 2441 MHz (about
-        // +12 kHz), the worse drift 12 kHz, the steeper rate -60 Hz/us.
-        let carrier = crate::signal::bt::piconet::Carrier {
-            f0_ppm: Sums::of(&[4.0, 6.0]),
-            channel_mhz: Sums::of(&[2441.0, 2441.0]),
-            worst_drift_hz: Some(Uncertain::from_sigma(12_000.0, 800.0)),
-            worst_rate_hz_per_us: Some(Uncertain::from_sigma(-60.0, 10.0)),
-        };
-        observe_header(
-            &mut m.net.bt_piconets,
-            0x5a3c71,
-            HeaderRead::Unresolved,
-            32,
-            dev,
-            carrier,
-        );
-        let out = draw(NetBtPiconetsPanel, 80, 40, &m).join("\n");
-        assert!(out.contains("Mod index"), "{out}");
-        assert!(out.contains("0.32"), "{out}");
-        assert!(out.contains("0.28"), "the band is drawn: {out}");
-        assert!(out.contains("df2/df1"), "{out}");
-        assert!(
-            out.contains("4 settled and 2 alternating bits from 1 headers"),
-            "{out}"
-        );
-        assert!(out.contains("Core 5.4 Vol 2 A 3.1.1"), "{out}");
-        // The carrier: no reference, so f0 is a reading, not a verdict; the
-        // worst drift and rate against their limits.
-        assert!(out.contains("Core 5.4 Vol 2 A 3.1.3"), "{out}");
-        assert!(out.contains("relative to our own oscillator"), "{out}");
-        assert!(out.contains("Drift worst"), "{out}");
-        assert!(out.contains("12.0"), "{out}");
-        assert!(out.contains("Rate worst"), "{out}");
-        assert!(
-            out.contains("test suite defines them"),
-            "said how it was read: {out}"
-        );
-        assert!(
-            out.contains("2 headers not read: the next channel was busy"),
-            "{out}"
-        );
-    }
-
-    /// **Slot jitter against the specification's 1 µs** (6.5): refused
-    /// while collecting and when no grid is found, then the largest
-    /// residual against the limit, the rms beside it, and what they rest on.
-    #[test]
-    fn slot_jitter_is_shown_against_the_one_microsecond_limit() {
-        use crate::signal::bt::slots::{SlotFit, SlotRefusal};
-        let mut m = heard();
-        m.net.bt_view.selected = Some(0x5a3c71);
-        let at = |m: &SdrMetrics| draw(NetBtPiconetsPanel, 80, 50, m).join("\n");
-        assert!(at(&m).contains("no hit timed yet"), "{}", at(&m));
-
-        let set = |m: &mut SdrMetrics, s| m.net.bt_piconets[0].slots = Some(s);
-        set(&mut m, Err(SlotRefusal::Collecting { have: 5, need: 8 }));
-        assert!(at(&m).contains("collecting: 5 of 8 hits"), "{}", at(&m));
-        set(&mut m, Err(SlotRefusal::NoGrid { hits: 30 }));
-        assert!(at(&m).contains("30 hits do not line up"), "{}", at(&m));
-
-        set(
-            &mut m,
-            Ok(SlotFit {
-                hits: 60,
-                span_us: 60e6,
-                rate_ppm: 12.0,
-                rate_sigma_ppm: 0.1,
-                rms_us: Uncertain::from_sigma(0.31, 0.03),
-                max_us: 0.82,
-                residuals_us: vec![0.0; 60],
-                model: crate::signal::bt::slots::Model {
-                    t0_us: 0.0,
-                    period_us: 625.0,
-                    offset_us: 0.0,
-                    mean_x: 0.0,
-                    mean_y: 0.0,
-                    slope: 0.0,
-                },
-            }),
-        );
-        let out = at(&m);
-        assert!(out.contains("TIMING"), "{out}");
-        assert!(out.contains("Jitter max"), "{out}");
-        assert!(out.contains("0.82"), "{out}");
-        assert!(out.contains("0.31"), "{out}");
-        assert!(out.contains("60 hits over 60 s"), "{out}");
-        assert!(out.contains("residual from the grid"), "{out}");
-        assert!(out.contains("Core 5.4 Vol 2 B 2.2.5"), "{out}");
-    }
-
-    /// **A short panel keeps what fits and names the rest**: the core
-    /// block and the sections that fit whole, then one line saying which
-    /// a taller panel would show.
-    #[test]
-    fn a_short_panel_keeps_whole_sections_and_names_the_rest() {
-        let mut m = heard();
-        m.net.bt_view.selected = Some(0x5a3c71);
-        let out = draw(NetBtPiconetsPanel, 60, 16, &m).join("\n");
-        assert!(out.contains("PICONET"), "{out}");
-        assert!(out.contains("on a taller panel"), "{out}");
-        assert!(out.contains("HEADERS on a taller panel"), "{out}");
-        let tall = draw(NetBtPiconetsPanel, 60, 60, &m).join("\n");
-        assert!(!tall.contains("taller panel"), "{tall}");
-        assert!(tall.contains("HEADERS"), "{tall}");
-    }
-
-    /// **The residuals as a shape** (6.5.b): each lands in its column, the
-    /// ±1 µs limits and zero are ruled and labelled, and a residual past
-    /// the plot is counted rather than dropped.
-    #[test]
-    fn the_residual_histogram_places_each_hit_and_the_limits() {
-        let theme = crate::Theme::sdr();
-        let colour = theme.series_color(1);
-        // 40 columns across 3 us: 0.075 us each.
-        let (lines, beyond) =
-            residual_histogram(&[0.0, 0.01, 0.02, 0.9, -0.5, 2.0], 44, colour, &theme);
-        assert_eq!(beyond, 1);
-        assert_eq!(lines.len(), PLOT_ROWS + 2);
-        let text = |l: &Line| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        };
-        // The tallest bar (three residuals near zero) reaches the top row.
-        let top = text(&lines[0]);
-        assert_eq!(top.chars().nth(2 + 20), Some('\u{2588}'), "{top:?}");
-        // Limits ruled at -1 and +1 (columns 6 and 33), labelled below.
-        assert_eq!(top.chars().nth(2 + 6), Some('\u{250a}'), "{top:?}");
-        assert_eq!(top.chars().nth(2 + 33), Some('\u{250a}'), "{top:?}");
-        let labels = text(&lines[PLOT_ROWS + 1]);
-        assert!(labels.contains("-1") && labels.contains("+1"), "{labels:?}");
-        // The limit rules are in the warning ink, the bars in the colour.
-        let limit_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.content == "\u{250a}")
-            .unwrap();
-        assert_eq!(limit_span.style.fg, Some(theme.status_warn));
-        let bar = lines[2]
-            .spans
-            .iter()
-            .find(|s| s.content != " " && s.content != "\u{250a}" && s.content != "  ")
-            .unwrap();
-        assert_eq!(bar.style.fg, Some(colour));
-        // Too narrow for a readable plot: none, and still the count.
-        assert_eq!(
-            residual_histogram(&[3.0], 16, colour, &theme),
-            (Vec::new(), 1)
-        );
-    }
-
-    #[test]
-    fn channel_runs_join_neighbours() {
-        assert_eq!(channel_runs(0), "");
-        assert_eq!(channel_runs(0b1111 << 2 | 1 << 17 | 1 << 78), "2-5, 17, 78");
-    }
-
     #[test]
     fn it_fits_every_size_the_layout_can_hand_it() {
         let mut m = heard();
@@ -1478,5 +772,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **The selected piconet, summed up**: its LAP, its UAP in words, its
+    /// readings on one line, and where the rest of it is. The sections live
+    /// on NET 6's bench, one side each.
+    #[test]
+    fn the_selected_piconet_is_summed_up_and_points_at_net_6() {
+        let mut m = heard();
+        m.net.bt_view.selected = Some(0x5a3c71);
+        let out = draw(NetBtPiconetsPanel, 60, 30, &m);
+        let text = out.join("\n");
+        let head = out.iter().position(|l| l.contains("PICONET")).expect(&text);
+        let hint = out
+            .iter()
+            .position(|l| l.contains("Enter: packet by packet"))
+            .expect(&text);
+        assert!(
+            hint - head <= 5,
+            "three fields, the UAP on two rows at most, and the hint: {text}"
+        );
+        assert!(text.contains("the master's"), "{text}");
+        assert!(text.contains("2 candidates (0x4c, 0x9a)"), "{text}");
+        for gone in ["MODULATION", "CARRIER", "TIMING", "HEADERS"] {
+            assert!(!text.contains(gone), "{gone}: {text}");
+        }
+        let none = draw(NetBtPiconetsPanel, 60, 16, &heard()).join("\n");
+        assert!(!none.contains("PICONET"), "{none}");
+    }
+
+    /// The readings on one line, every member's pooled as the Classic view
+    /// always showed them: the index, f0, and the rms from the slot grid,
+    /// each dashed until it can be stated.
+    #[test]
+    fn the_summary_reads_on_one_line() {
+        use crate::signal::bt::piconet::{observe_header, Deviation, HeaderRead};
+        use crate::signal::dsp::deviation::Sums;
+        let mut m = heard();
+        m.net.bt_view.selected = Some(0x5a3c71);
+        let line = |m: &SdrMetrics| {
+            draw(NetBtPiconetsPanel, 70, 30, m)
+                .into_iter()
+                .find(|l| l.contains("index"))
+                .unwrap_or_default()
+        };
+        let empty = line(&m);
+        assert!(
+            empty.contains("index —") && empty.contains("f0 —"),
+            "{empty}"
+        );
+
+        let dev = Deviation {
+            settled: Sums::of(&[158_000.0, 160_000.0, 162_000.0, 160_000.0]),
+            alternating: Sums::default(),
+            neighbour_busy: 0,
+        };
+        let carrier = crate::signal::bt::piconet::Carrier {
+            f0_ppm: Sums::of(&[4.0, 6.0]),
+            channel_mhz: Sums::of(&[2441.0, 2441.0]),
+            worst_drift_hz: None,
+            worst_rate_hz_per_us: None,
+        };
+        observe_header(
+            &mut m.net.bt_piconets,
+            0x5a3c71,
+            HeaderRead::Unresolved,
+            32,
+            dev,
+            carrier,
+        );
+        let times: Vec<f64> = (0..40u32)
+            .map(|k| f64::from(k * 5) * crate::signal::bt::slots::SLOT_US)
+            .collect();
+        let p = m
+            .net
+            .bt_piconets
+            .iter_mut()
+            .find(|p| p.lap == 0x5a3c71)
+            .unwrap();
+        p.slots = Some(crate::signal::bt::slots::fit(&times));
+        let full = line(&m);
+        assert!(full.contains("index 0.32"), "{full}");
+        assert!(full.contains("f0 12.2 kHz"), "{full}");
+        assert!(full.contains("grid rms"), "{full}");
     }
 }
