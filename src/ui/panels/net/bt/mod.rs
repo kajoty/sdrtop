@@ -6,6 +6,7 @@
 //! here - the two protocols share nothing above `signal::net::worker`, and
 //! the panel layer keeps the same split.
 
+pub mod bt_bench;
 pub mod bt_hops;
 pub mod bt_packets;
 pub mod bt_piconets;

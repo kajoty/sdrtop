@@ -342,7 +342,7 @@ fn start(p: &Piconet, view: &crate::state::PacketsView) -> Option<usize> {
 }
 
 /// The selected piconet, if the roster still has it.
-fn selected(state: &SdrMetrics) -> Option<&Piconet> {
+pub(super) fn selected(state: &SdrMetrics) -> Option<&Piconet> {
     let roster = ordered(&state.net.bt_piconets);
     let laps: Vec<u32> = roster.iter().map(|p| p.lap).collect();
     state.net.bt_view.cursor(&laps).map(|i| roster[i])

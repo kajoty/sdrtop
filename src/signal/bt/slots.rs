@@ -122,6 +122,46 @@ impl SlotFit {
     }
 }
 
+/// One group of residuals read on its own, a piconet's master's or a
+/// slave's: where it sits against the grid on average, and its jitter about
+/// that average, which is how 2.2.5 states jitter ("from the average
+/// timing"). A slave answers from what it received, so its average may sit
+/// off the master's grid by its turnaround, and that is an offset, not
+/// jitter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spread {
+    pub hits: usize,
+    /// The average residual, µs, with its standard error.
+    pub mean_us: Uncertain,
+    /// The root mean square about that average, µs, with its standard
+    /// error.
+    pub rms_us: Uncertain,
+    /// The largest deviation from that average, µs.
+    pub max_us: f64,
+}
+
+/// `residuals`' spread about their own average, or `None` below
+/// [`MIN_HITS`], where a spread would be a handful of points.
+pub fn spread(residuals: &[f64]) -> Option<Spread> {
+    let n = residuals.len();
+    if n < MIN_HITS {
+        return None;
+    }
+    let nf = n as f64;
+    let mean = residuals.iter().sum::<f64>() / nf;
+    let dof = nf - 1.0;
+    let rms = (residuals.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / dof).sqrt();
+    let max = residuals
+        .iter()
+        .fold(0.0f64, |m, e| m.max((e - mean).abs()));
+    Some(Spread {
+        hits: n,
+        mean_us: Uncertain::from_sigma(mean, rms / nf.sqrt()),
+        rms_us: Uncertain::from_sigma(rms, rms / (2.0 * dof).sqrt()),
+        max_us: max,
+    })
+}
+
 /// Why there is no fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotRefusal {
@@ -457,6 +497,27 @@ mod tests {
         assert_eq!(
             fit(&piconet(5, 0.0, 1.0, 0.1, 4)),
             Err(SlotRefusal::Collecting { have: 5, need: 8 })
+        );
+    }
+
+    /// One group's spread is about its own average, as 2.2.5 states
+    /// jitter: a side sitting 3 us off the grid is 3 us off, not 3 us of
+    /// jitter, and says where it sits apart from how it scatters.
+    #[test]
+    fn a_groups_spread_is_about_its_own_average() {
+        let steady: Vec<f64> = (0..20)
+            .map(|k| 3.0 + if k % 2 == 0 { 0.2 } else { -0.2 })
+            .collect();
+        let s = spread(&steady).unwrap();
+        assert_eq!(s.hits, 20);
+        assert!((s.mean_us.value() - 3.0).abs() < 1e-9, "{s:?}");
+        assert!((s.max_us - 0.2).abs() < 1e-9, "{s:?}");
+        let rms = s.rms_us.value();
+        assert!((rms - 0.2 * (20.0f64 / 19.0).sqrt()).abs() < 1e-9, "{s:?}");
+        assert!(s.rms_us.sigma() > 0.0 && s.mean_us.sigma() > 0.0);
+        assert!(
+            spread(&steady[..MIN_HITS - 1]).is_none(),
+            "too few to state a spread"
         );
     }
 }

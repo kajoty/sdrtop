@@ -25,12 +25,14 @@ use ratatui::{
     Frame,
 };
 
-use super::sections::{self, LABEL_W};
+use super::sections::{
+    self, CLOCK_LIMIT_PPM, CLOCK_RESOLUTION_PPM, JITTER_LIMIT_US, JITTER_RESOLUTION_US, LABEL_W,
+};
 use crate::signal::bt::piconet::{ordered, Inquiry, Kind, Piconet, DCI};
 use crate::signal::dsp::uncertainty::Uncertain;
 use crate::state::SdrMetrics;
 use crate::ui::panel::{FeedSpan, Panel, PanelChrome, Staleness};
-use crate::ui::widgets::limit::{Limit, LimitRow, RowWidths};
+use crate::ui::widgets::limit::{LimitRow, RowWidths};
 use crate::ui::widgets::reading::Reading;
 use crate::ui::widgets::table::{
     columns_that_fit, grow_to_contents, header, row, viewport_start, Align, Column, Sort,
@@ -502,27 +504,6 @@ fn carrier_lines(
     out
 }
 
-/// Slot jitter's limit, **read from the Core Specification 5.4, Vol 2,
-/// Part B, 2.2.5**: "The instantaneous timing shall not deviate more than
-/// 1 μs from the average timing."
-const JITTER_LIMIT_US: Limit = Limit::Max(1.0);
-
-/// A jitter reading must beat this before it prints: a quarter of the
-/// limit, which a few dozen hits reach.
-const JITTER_RESOLUTION_US: f64 = 0.25;
-
-/// The slot clock's limit, **read from the Core Specification 5.4, Vol 2,
-/// Part B, 2.2.5**: "the average timing of packet transmission shall not
-/// drift faster than 20 ppm relative to the ideal slot timing of 625 μs".
-const CLOCK_LIMIT_PPM: Limit = Limit::Band {
-    low: -20.0,
-    high: 20.0,
-};
-
-/// A clock reading must beat this before it prints: a twentieth of the
-/// limit, which a minute of hits passes by far.
-const CLOCK_RESOLUTION_PPM: f64 = 1.0;
-
 /// The TIMING section (net-ux-polish-plan 6.5): each access code's offset
 /// from the piconet's own fitted 625 µs grid (`signal::bt::slots`). The
 /// largest against the specification's 1 µs, the root mean square as a
@@ -584,10 +565,7 @@ fn timing_lines(
     // radio's LO and its sample clock come from one crystal). Held against
     // 2.2.5's 20 ppm only when a reference makes it absolute; without one
     // it is a reading, and the frame's [RELATIVE] says what it is worth.
-    let now = std::time::Instant::now();
-    let raw = Uncertain::from_sigma(-f.rate_ppm, f.rate_sigma_ppm);
-    let (clock, provenance) = state.radio.corrected_ppm(raw, now);
-    let judged = provenance != crate::state::Provenance::Unreferenced;
+    let (clock, judged) = sections::clock_of(f, state);
     let mut rows = rows;
     if judged {
         rows.push(LimitRow::new(

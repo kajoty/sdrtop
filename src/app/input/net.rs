@@ -278,13 +278,35 @@ pub(super) fn net_bt_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction
             };
         }
         KeyCode::End => *view = Default::default(),
-        KeyCode::Left | KeyCode::Right => {
-            if !order.is_empty() {
-                let delta = if key.code == KeyCode::Left { -1 } else { 1 };
-                m.net.bt_view.move_by(&order, delta);
-                m.net.packets_view = Default::default();
-            }
+        KeyCode::Left | KeyCode::Right => step_piconet(&mut m, &order, key.code == KeyCode::Right),
+        _ => {
+            drop(m);
+            return global::handle(key, ctx);
         }
+    }
+    KeyAction::Continue
+}
+
+/// `← →` in the Piconet view, the list's or the bench's: the previous or
+/// next piconet in the roster's order, the list starting afresh on it. With
+/// none heard, nothing, rather than a cleared selection.
+fn step_piconet(m: &mut SdrMetrics, order: &[u32], forward: bool) {
+    if !order.is_empty() {
+        m.net.bt_view.move_by(order, if forward { 1 } else { -1 });
+        m.net.packets_view = Default::default();
+    }
+}
+
+/// The Piconet view's bench: `← →` step through the piconets as the list
+/// does, so either panel focused moves the view.
+pub(super) fn net_bt_bench(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
+    let mut m = metrics(ctx.state);
+    let order: Vec<u32> = crate::signal::bt::piconet::ordered(&m.net.bt_piconets)
+        .iter()
+        .map(|p| p.lap)
+        .collect();
+    match key.code {
+        KeyCode::Left | KeyCode::Right => step_piconet(&mut m, &order, key.code == KeyCode::Right),
         _ => {
             drop(m);
             return global::handle(key, ctx);

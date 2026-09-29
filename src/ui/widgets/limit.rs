@@ -222,6 +222,29 @@ impl<'a> LimitRow<'a> {
         }
     }
 
+    /// The reading alone, value then uncertainty and unit, as the row
+    /// prints them: for a bench that sets two readings side by side and
+    /// draws their bars on a line of their own.
+    pub(crate) fn reading_spans(&self, theme: &Theme) -> Vec<Span<'static>> {
+        let ((value, ink), rest) = self.split();
+        vec![
+            Span::styled(value, Style::default().fg(ink.colour(theme))),
+            Span::styled(
+                format!(" {rest}"),
+                Style::default().fg(Ink::Dim.colour(theme)),
+            ),
+        ]
+    }
+
+    /// The bar alone, `width` columns including its gutters, as the row
+    /// draws it.
+    pub(crate) fn bar_spans(&self, theme: &Theme, width: usize) -> Vec<Span<'static>> {
+        self.bar(width)
+            .into_iter()
+            .map(|(s, ink)| Span::styled(s, Style::default().fg(ink.colour(theme))))
+            .collect()
+    }
+
     /// The colour a table cell of this reading wears when it is not safely
     /// inside its limit: the row's own amber or red. `None` inside by more
     /// than the uncertainty, or with no value to judge, so a table keeps its
@@ -718,5 +741,25 @@ mod tests {
             None,
             "no value, no verdict"
         );
+    }
+
+    /// The reading and the bar taken apart are the row's own pieces, so a
+    /// bench that lays them out differently still says what the row says.
+    #[test]
+    fn the_pieces_taken_apart_are_the_rows() {
+        let theme = crate::Theme::sdr();
+        let text = |spans: Vec<Span<'static>>| {
+            spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let row = mod_index(0.502);
+        let w = widths(30);
+        let whole = row.text(w);
+        assert_eq!(text(row.reading_spans(&theme)), "0.502 ±0.006");
+        let bar = text(row.bar_spans(&theme, 30));
+        assert_eq!(bar.chars().count(), 30);
+        assert!(whole.contains(&bar), "{whole}\n{bar}");
     }
 }

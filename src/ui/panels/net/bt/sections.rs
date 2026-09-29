@@ -90,6 +90,43 @@ pub(super) const F0_RESOLUTION_KHZ: f64 = 10.0;
 pub(super) const DRIFT_RESOLUTION_KHZ: f64 = 10.0;
 pub(super) const DRIFT_RATE_RESOLUTION: f64 = 80.0;
 
+/// Slot jitter's limit, **read from the Core Specification 5.4, Vol 2,
+/// Part B, 2.2.5**: "The instantaneous timing shall not deviate more than
+/// 1 μs from the average timing."
+pub(super) const JITTER_LIMIT_US: Limit = Limit::Max(1.0);
+
+/// A jitter reading must beat this before it prints: a quarter of the
+/// limit, which a few dozen hits reach.
+pub(super) const JITTER_RESOLUTION_US: f64 = 0.25;
+
+/// The slot clock's limit, **read from the Core Specification 5.4, Vol 2,
+/// Part B, 2.2.5**: "the average timing of packet transmission shall not
+/// drift faster than 20 ppm relative to the ideal slot timing of 625 μs".
+pub(super) const CLOCK_LIMIT_PPM: Limit = Limit::Band {
+    low: -20.0,
+    high: 20.0,
+};
+
+/// A clock reading must beat this before it prints: a twentieth of the
+/// limit, which a minute of hits passes by far.
+pub(super) const CLOCK_RESOLUTION_PPM: f64 = 1.0;
+
+/// A piconet's slot clock from its fitted grid, the classic twin of the
+/// census's crystal error: its slots run `rate_ppm` long on our clock, so
+/// its clock runs that much slow, less our own oscillator's error, which a
+/// reference takes out exactly as it does for a BLE offset
+/// (`corrected_ppm`: the radio's LO and its sample clock come from one
+/// crystal). With whether it is judged: only a reference makes it absolute,
+/// and without one it is a reading, which the frame's [RELATIVE] says.
+pub(super) fn clock_of(
+    f: &crate::signal::bt::slots::SlotFit,
+    state: &SdrMetrics,
+) -> (Uncertain, bool) {
+    let raw = Uncertain::from_sigma(-f.rate_ppm, f.rate_sigma_ppm);
+    let (clock, provenance) = state.radio.corrected_ppm(raw, std::time::Instant::now());
+    (clock, provenance != crate::state::Provenance::Unreferenced)
+}
+
 /// The modulation index a side's (or one packet's) settled readings give,
 /// with its uncertainty: `h = 2 * df1 / 1 Msym/s`. `None` with fewer than
 /// two readings.

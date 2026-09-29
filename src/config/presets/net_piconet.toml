@@ -3,7 +3,8 @@
 # selection is the section's, `NetState::bt_view`) and lists its packets,
 # newest first, each with who sent it, its header, its own modulation and
 # carrier readings, its place on the piconet's slot grid, and what became
-# of its payload. The classic receiver runs here exactly as on the Classic
+# of its payload; and beside the list, the bench: the master's and the
+# slave's own figures side by side. The classic receiver runs here exactly as on the Classic
 # view (`signal::net::lock::CLASSIC_VIEWS`), so the two views read one
 # stream of hits.
 
@@ -15,6 +16,7 @@ blurb   = "one piconet, packet by packet"
 panels = [
     { name = "header",         position = "top", height = 5 },
     { name = "net_bt_packets", position = "body" },
+    { name = "net_bt_bench",   position = "right", width_pct = 40 },
     { name = "log",            position = "bottom", height = 5 },
     { name = "footer",         position = "bottom" },
 ]

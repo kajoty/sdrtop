@@ -85,6 +85,8 @@ pub(in crate::app::input) const NO_POSITION: &[&str] = &[
     "signal_characterization",
     "fm_demod",
     "net_capability",
+    // Its arrows choose the piconet, which is what the view is of.
+    "net_bt_bench",
     // Its keys tune, cycle the lead card and recall; the gain stage it once
     // picked is a mode every section has now, not a Rail position.
     "command_rail",

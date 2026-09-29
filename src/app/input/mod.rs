@@ -194,6 +194,7 @@ fn handle_normal(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
         Some("net_census") => net::net_census(key, ctx),
         Some("net_bt_piconets") => net::net_bt_piconets(key, ctx),
         Some("net_bt_packets") => net::net_bt_packets(key, ctx),
+        Some("net_bt_bench") => net::net_bt_bench(key, ctx),
         Some("net_bt_hops") => net::net_bt_hops(key, ctx),
         Some("net_ble_packets") => net::net_ble_packets(key, ctx),
         Some("net_capability") => net::net_capability(key, ctx),

@@ -373,6 +373,7 @@ each panel's numbers mean is on [the NET page](net.md).
 | `v` | BLE Advertising | `NET 4` | `↑↓` select a packet · `Enter` only this address, or all again · `H` hold the list, or let it run |
 | `b` | Classic Bluetooth Hops | `NET 5` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
 | `c` | Piconets | `NET 5` | `↑↓` select a piconet |
+| `c` | Bench | `NET 6` | `← →` the previous or next piconet |
 | `v` | Packets | `NET 6` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
 
 `T` in the Census asks how far the trusted device's crystal can be off, in
