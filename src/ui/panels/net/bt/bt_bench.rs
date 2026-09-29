@@ -115,6 +115,14 @@ const READING_W: usize = 18;
 /// into a line nobody reads end to end.
 const BAR_MAX: usize = 32;
 
+/// The narrowest a section's column is drawn at.
+const COLUMN_MIN: usize = 46;
+
+/// How many columns `iw` holds, at most `sections`.
+fn columns_for(iw: usize, sections: usize) -> usize {
+    ((iw + 1) / (COLUMN_MIN + 1)).clamp(1, sections)
+}
+
 /// The narrowest bar worth drawing.
 const BAR_MIN: usize = 10;
 
@@ -255,9 +263,14 @@ fn trend(
     p: &Piconet,
     direction: Direction,
     places: usize,
+    width: usize,
     value: impl Fn(&crate::signal::bt::piconet::BtPacket) -> Option<f64>,
 ) -> Cell<'static> {
-    let cells = TREND_CELLS;
+    // Two ends on one row: each gets half of what the label and arrows
+    // leave, less its span's text.
+    let cells = (width.saturating_sub(LABEL_COLUMN + 7) / 2)
+        .saturating_sub(12)
+        .clamp(4, TREND_CELLS);
     let mut values: Vec<f64> = p
         .packets
         .iter()
@@ -353,8 +366,8 @@ fn modulation_lines(
             |k: &crate::signal::bt::piconet::BtPacket| index_of(&k.deviation).map(|i| i.value());
         out.push(trend_row(
             "Mod trend",
-            trend(p, Direction::Master, 3, index),
-            trend(p, Direction::Slave, 3, index),
+            trend(p, Direction::Master, 3, width, index),
+            trend(p, Direction::Slave, 3, width, index),
             width,
             inks,
             theme,
@@ -438,8 +451,8 @@ fn carrier_lines(
         };
         out.push(trend_row(
             "f0 trend",
-            trend(p, Direction::Master, 1, f0_of),
-            trend(p, Direction::Slave, 1, f0_of),
+            trend(p, Direction::Master, 1, width, f0_of),
+            trend(p, Direction::Slave, 1, width, f0_of),
             width,
             inks,
             theme,
@@ -553,9 +566,9 @@ fn timing_lines(
                     "offset",
                     signed,
                     if d >= 0.0 {
-                        "  the slave's packets after the master's"
+                        "  the slave after the master"
                     } else {
-                        "  the slave's packets before the master's"
+                        "  the slave before the master"
                     },
                     theme,
                 ));
@@ -647,53 +660,67 @@ fn bench(
             .map_or(theme.value_hi, |k| theme.series_color(k)),
         slave: theme.value,
     };
-    let mut out = vec![legend(inks)];
-
-    // Each section as a whole and without its plots, the trends and the
-    // residual shape: a plot is the first thing a short panel gives up, the
-    // readings the last.
-    let modulation = |trends| modulation_lines(p, iw, inks, trends, theme);
-    let carrier = |trends| carrier_lines(p, state, iw, inks, trends, theme);
-    let timing = |plots| timing_lines(p, iw, inks, plots, theme);
-    let sections = [
-        ("MODULATION", modulation(true), Some(modulation(false))),
-        ("CARRIER", carrier(true), Some(carrier(false))),
-        ("TIMING", timing(true), Some(timing(false))),
-    ];
-    let last = sections.len() - 1;
-    // The line naming what is left out may wrap on a narrow bench: it is
-    // kept whole, so it is given the rows its longest form needs.
-    let note = |left: &[&str]| format!("+ {} on a taller panel", left.join(", "));
-    let note_rows = if note(&["MODULATION", "CARRIER", "TIMING", "plots"]).len() + 1 > iw {
-        2
-    } else {
-        1
-    };
-    let mut left_out = Vec::new();
+    // The sections side by side, as many as the width holds, in order;
+    // the rest are named on the last row.
+    let n = columns_for(iw, 3);
+    let widths: Vec<usize> = (0..n).map(|k| (iw.saturating_sub(n - 1) + k) / n).collect();
+    let names = ["MODULATION", "CARRIER", "TIMING"];
+    // The legend first and a row for the note last; each column has the
+    // rest, and keeps its section whole, else without its plots, else what
+    // fits from the top.
+    // A narrow bench's note may need two rows.
+    let note_rows = if iw < 60 { 2 } else { 1 };
+    let rows = budget.saturating_sub(1 + note_rows);
     let mut plots_left = false;
-    for (k, (name, whole, lean)) in sections.into_iter().enumerate() {
-        // In order, leaving a row for the line that names what is left out,
-        // unless this is the last section: whole, else without its plots,
-        // else not at all, and nothing after a section left out.
-        let reserve = if k < last { note_rows } else { 0 };
-        let fits = |lines: &Vec<Line<'static>>| out.len() + lines.len() + reserve <= budget;
-        if !left_out.is_empty() {
-            left_out.push(name);
-        } else if fits(&whole) {
-            out.extend(whole);
-        } else if let Some(lean) = lean.filter(|l| fits(l)) {
-            out.extend(lean);
+    let mut cut = false;
+    let columns: Vec<Vec<Line<'static>>> = widths
+        .iter()
+        .enumerate()
+        .map(|(k, &w)| {
+            let build = |plots: bool| match k {
+                0 => modulation_lines(p, w, inks, plots, theme),
+                1 => carrier_lines(p, state, w, inks, plots, theme),
+                _ => timing_lines(p, w, inks, plots, theme),
+            };
+            let whole = build(true);
+            if whole.len() <= rows {
+                return whole;
+            }
             plots_left = true;
-        } else {
-            left_out.push(name);
+            let mut lean = build(false);
+            if lean.len() > rows {
+                cut = true;
+                lean.truncate(rows);
+            }
+            lean
+        })
+        .collect();
+    let rule = Span::styled("│".to_string(), Style::default().fg(theme.border_dim));
+    let height = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = vec![legend(inks)];
+    for r in 0..height {
+        let mut spans = Vec::new();
+        for (k, column) in columns.iter().enumerate() {
+            if k > 0 {
+                spans.push(rule.clone());
+            }
+            let line = column.get(r).cloned().unwrap_or_default();
+            spans.extend(exactly(fit(line, widths[k]).spans, widths[k]));
         }
+        out.push(Line::from(spans));
     }
-    if plots_left {
-        left_out.push("plots");
+    let mut notes = Vec::new();
+    if n < names.len() {
+        notes.push(format!("+ {} on a wider panel", names[n..].join(", ")));
     }
-    if !left_out.is_empty() {
-        let room = budget.saturating_sub(out.len()).min(note_rows);
-        for chunk in crate::ui::chrome::wrap(&note(&left_out), iw.saturating_sub(1), room) {
+    if cut {
+        notes.push("the rest on a taller panel".to_string());
+    } else if plots_left {
+        notes.push("plots on a taller panel".to_string());
+    }
+    if !notes.is_empty() && out.len() < budget {
+        let room = budget - out.len();
+        for chunk in crate::ui::chrome::wrap(&notes.join("; "), iw.saturating_sub(1), room) {
             out.push(Line::from(Span::styled(
                 format!(" {chunk}"),
                 Style::default().fg(theme.label),
@@ -923,7 +950,7 @@ mod tests {
         sides.master.packets = 180;
         sides.slave.packets = 232;
         sides.unknown.packets = 2;
-        let out = draw(NetBtBenchPanel, 100, 50, &m);
+        let out = draw(NetBtBenchPanel, 191, 50, &m);
         let text = out.join("\n");
         assert!(text.contains("TIMING"), "{text}");
         let at = out
@@ -948,7 +975,7 @@ mod tests {
         assert!((value - 2.0).abs() < 0.1, "the slave 2 us behind: {offset}");
         let at = out
             .iter()
-            .position(|l| l.starts_with("│ packets"))
+            .position(|l| l.contains("│ packets"))
             .expect(&text);
         assert!(
             out[at].contains("180") && out[at + 1].contains("232"),
@@ -1024,19 +1051,26 @@ mod tests {
             Direction::Slave,
             1,
             20,
-            |k| 159_000.0 + (k % 2) as f32 * 400.0,
+            |k| 159_000.0 + k as f32 * 100.0,
             |k| -12.0 - k as f64 * 0.1,
         );
-        let out = draw(NetBtBenchPanel, 100, 60, &m);
+        let out = draw(NetBtBenchPanel, 191, 60, &m);
         let text = out.join("\n");
         let row = out.iter().find(|l| l.contains("Mod trend")).expect(&text);
+        // The span of the drawn points, each the mean of a few packets.
+        let span = row
+            .split_whitespace()
+            .find(|w| w.starts_with("0.3") && w.contains('–'))
+            .expect(row);
+        let (lo, hi) = span.split_once('–').expect(span);
+        let (lo, hi): (f64, f64) = (lo.parse().unwrap(), hi.parse().unwrap());
         assert!(
-            row.contains("0.320–0.340"),
-            "the span it is scaled to: {row}"
+            (lo - 0.320).abs() < 0.002 && (hi - 0.340).abs() < 0.002,
+            "{row}"
         );
         let slave_at = row[..row.find('◀').expect(row)].chars().count();
         let master = braille(row, 0);
-        assert!(master.len() >= 8, "{row}");
+        assert!(master.len() >= 4, "{row}");
         // Rising: the oldest at the bottom dot, the newest at the top.
         assert_ne!(master[0] & 0x40, 0, "{row}");
         assert_ne!(master[master.len() - 1] & 0x08, 0, "{row}");
@@ -1063,32 +1097,20 @@ mod tests {
         assert!(!out[master].contains("0.318"), "{text}");
     }
 
-    /// Shorter than every section, they give way from the bottom, TIMING
-    /// first, and the last line names what a taller panel would show.
+    /// Shorter than its sections, a column keeps what fits from the top
+    /// and the last row says a taller panel would show the rest.
     #[test]
     fn short_it_gives_way() {
         let mut m = heard();
         let sides = &mut m.net.bt_piconets[0].headers.sides;
         sides.master.deviation = around(167_000.0);
         sides.slave.deviation = around(159_000.0);
-        let tall = draw(NetBtBenchPanel, 100, 60, &m).join("\n");
-        assert!(
-            tall.contains("TIMING") && !tall.contains("taller panel"),
-            "{tall}"
-        );
-        let out = draw(NetBtBenchPanel, 100, 18, &m);
+        let tall = draw(NetBtBenchPanel, 191, 60, &m).join("\n");
+        assert!(!tall.contains("taller panel"), "{tall}");
+        let out = draw(NetBtBenchPanel, 191, 9, &m);
         let text = out.join("\n");
-        assert!(text.contains("MODULATION"), "{text}");
-        assert!(!text.contains("├╴ TIMING"), "{text}");
-        let last = out
-            .iter()
-            .rev()
-            .find(|l| !l.trim_matches(['│', ' ', '╰', '─', '╯']).is_empty())
-            .unwrap();
-        assert!(
-            last.contains("TIMING") && last.contains("on a taller panel"),
-            "{text}"
-        );
+        assert!(text.contains("Mod index"), "{text}");
+        assert!(text.contains("on a taller panel"), "{text}");
     }
 
     /// Short and narrow, a section keeps its readings and gives up its
@@ -1218,7 +1240,7 @@ mod tests {
             .map(|k| f64::from(k) * 1e6 + if k % 2 == 0 { 0.0 } else { 0.3 })
             .collect();
         m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
-        let out = draw(NetBtBenchPanel, 100, 80, &m).join("\n");
+        let out = draw(NetBtBenchPanel, 191, 80, &m).join("\n");
         assert!(out.contains("residual from the grid"), "{out}");
         assert!(out.contains("60 hits over"), "{out}");
         assert!(out.contains("every member's"), "{out}");
@@ -1275,5 +1297,122 @@ mod tests {
             .find(|l| l.contains("Bench [C]"))
             .expect("the bench");
         assert!(bench.starts_with('╭') && bench.ends_with('╮'), "{bench}");
+    }
+
+    /// The pieces of each row between the column rules, frame stripped.
+    fn columns_of(row: &str) -> Vec<String> {
+        let inner: String = row
+            .chars()
+            .skip(1)
+            .take(row.chars().count().saturating_sub(2))
+            .collect();
+        inner.split('│').map(|p| p.to_string()).collect()
+    }
+
+    fn both_read() -> SdrMetrics {
+        let mut m = heard();
+        let sides = &mut m.net.bt_piconets[0].headers.sides;
+        sides.master.deviation = around(167_000.0);
+        sides.slave.deviation = around(159_000.0);
+        m
+    }
+
+    /// At 191 the three sections stand side by side, in order, headed on
+    /// one row.
+    #[test]
+    fn at_191_the_three_sections_stand_side_by_side() {
+        let out = draw(NetBtBenchPanel, 191, 30, &both_read());
+        let text = out.join("\n");
+        let heads = out.iter().find(|l| l.contains("MODULATION")).expect(&text);
+        let (a, b, c) = (
+            heads.find("MODULATION").unwrap(),
+            heads.find("CARRIER").expect(heads),
+            heads.find("TIMING").expect(heads),
+        );
+        assert!(a < b && b < c, "{heads}");
+        let index = out.iter().find(|l| l.contains("Mod index")).expect(&text);
+        assert!(
+            index.contains("f0") && index.contains("no hit timed yet"),
+            "{index}"
+        );
+    }
+
+    /// Narrower, as many sections as fit, in order, and the rest named.
+    #[test]
+    fn narrower_the_columns_give_way_and_say_so() {
+        let m = both_read();
+        let two = draw(NetBtBenchPanel, 100, 30, &m).join("\n");
+        assert!(
+            two.contains("MODULATION") && two.contains("CARRIER"),
+            "{two}"
+        );
+        assert!(!two.contains("├╴ TIMING"), "{two}");
+        assert!(two.contains("+ TIMING on a wider panel"), "{two}");
+        let one = draw(NetBtBenchPanel, 50, 30, &m).join("\n");
+        assert!(!one.contains("├╴ CARRIER"), "{one}");
+        assert!(one.contains("+ CARRIER, TIMING on a wider panel"), "{one}");
+    }
+
+    /// No row runs out of its column, at any width.
+    #[test]
+    fn no_row_is_wider_than_its_column() {
+        let m = both_read();
+        for w in [120u16, 191, 240] {
+            let out = draw(NetBtBenchPanel, w, 40, &m);
+            let widths: Vec<usize> = {
+                let heads = out.iter().find(|l| l.contains("MODULATION")).unwrap();
+                columns_of(heads)
+                    .iter()
+                    .map(|p| p.chars().count())
+                    .collect()
+            };
+            for row in out
+                .iter()
+                .skip(2)
+                .filter(|l| l.contains('│') && l.chars().count() == w as usize)
+            {
+                let pieces = columns_of(row);
+                if pieces.len() != widths.len() {
+                    continue; // the legend and the note span the bench
+                }
+                for (piece, width) in pieces.iter().zip(&widths) {
+                    assert_eq!(piece.chars().count(), *width, "{w}: {row}");
+                }
+            }
+        }
+    }
+
+    /// An inquiry code is not a piconet here either: one line, no columns.
+    #[test]
+    fn an_inquiry_code_is_not_a_piconet_here_either() {
+        let mut m = heard();
+        observe(&mut m.net.bt_piconets, 0x9E_8B33, 40, Instant::now());
+        m.net.bt_view.selected = Some(0x9E_8B33);
+        let text = draw(NetBtBenchPanel, 191, 30, &m).join("\n");
+        assert!(text.contains("not a piconet"), "{text}");
+        assert!(!text.contains("MODULATION"), "{text}");
+    }
+
+    /// On the laptop's own terminal the Bench view shows every section.
+    #[test]
+    fn at_191_by_41_net_7_shows_every_section() {
+        let (engine, _) =
+            crate::app::App::build_ui("net_bench", &std::collections::HashMap::new(), None, true);
+        let mut m = both_read();
+        m.ui.active_preset = "net_bench".to_string();
+        let theme = crate::Theme::sdr();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(191, 41)).unwrap();
+        t.draw(|f| engine.draw(f, &m, &theme)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: String = (0..41)
+            .map(|y| (0..191).map(|x| buf.get(x, y).symbol()).collect::<String>() + "\n")
+            .collect();
+        for name in ["MODULATION", "CARRIER", "TIMING"] {
+            assert!(text.contains(name), "{name}: {text}");
+        }
+        assert!(
+            !text.contains("wider panel") && !text.contains("taller panel"),
+            "{text}"
+        );
     }
 }
