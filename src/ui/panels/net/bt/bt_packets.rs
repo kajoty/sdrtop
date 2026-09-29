@@ -31,7 +31,9 @@
 //!
 //! **The payload's verdict in exact words.** `✗ CRC` says the check failed
 //! and nothing about why: an encrypted payload and a damaged capture fail
-//! alike, and the air alone cannot tell them apart.
+//! alike, and the air alone cannot tell them apart. A payload left
+//! unchecked says why (`payload::Unchecked`), and never "PSK": whether a
+//! link has gone EDR is not something one packet can show.
 
 use ratatui::{
     layout::Rect,
@@ -627,7 +629,7 @@ mod tests {
                     8,
                     Some(header(10, 1, 0b001)),
                     Some(Direction::Master),
-                    PayloadVerdict::NotRead("PSK"),
+                    PayloadVerdict::NotRead("FEC failed"),
                 ),
             ],
         );
@@ -652,7 +654,7 @@ mod tests {
         assert!(line("POLL").contains('—'), "no payload: {text}");
         assert!(line("DM1 ").contains("✓ CRC"), "{text}");
         assert!(line("DH1/2-DH1").contains("✗ CRC"), "{text}");
-        assert!(line("DM3/2-DH3").contains("· PSK"), "{text}");
+        assert!(line("DM3/2-DH3").contains("· FEC failed"), "{text}");
         assert!(!text.contains("encrypt"), "a failed CRC claims no cause");
     }
 
@@ -899,7 +901,7 @@ mod tests {
                     0,
                     Some(header(10, 1, 0)),
                     Some(Direction::Master),
-                    PayloadVerdict::NotRead("PSK"),
+                    PayloadVerdict::NotRead("FEC failed"),
                 ),
                 packet(
                     3,

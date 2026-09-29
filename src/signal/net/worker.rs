@@ -867,9 +867,11 @@ impl NetWorker {
                         match (read, read_at) {
                             (HeaderRead::Decoded(h), Some((uap, clk6))) => match h.packet_type {
                                 PacketType::Null | PacketType::Poll => PayloadVerdict::NoPayload,
-                                t => match payload::verify_crc(&hit.payload_raw, clk6, t, uap) {
-                                    Some(ok) => PayloadVerdict::Crc(ok),
-                                    None => PayloadVerdict::NotRead("PSK"),
+                                t => match payload::check_crc(&hit.payload_raw, clk6, t, uap) {
+                                    Ok(ok) => PayloadVerdict::Crc(ok),
+                                    // Why, in the list's words: never "PSK",
+                                    // which would be a guess about the link.
+                                    Err(why) => PayloadVerdict::NotRead(why.words()),
                                 },
                             },
                             _ => PayloadVerdict::NotRead("clock not known"),

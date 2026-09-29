@@ -190,7 +190,8 @@ pub enum PayloadVerdict {
     /// Checked: the CRC passed (`true`) or failed. A failure says nothing
     /// about why: an encrypted payload and a damaged capture fail alike.
     Crc(bool),
-    /// Not read, and why ("PSK", "clock not known").
+    /// Not read, and why, in the list's words ("FEC failed", "cut short",
+    /// "clock not known": `payload::Unchecked::words`).
     NotRead(&'static str),
 }
 

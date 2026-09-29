@@ -557,7 +557,16 @@ The payload column, word for word:
 - **`✗ CRC`**: read, and its CRC failed. It does not say why. An encrypted
   payload fails exactly like a damaged one, and the air alone cannot tell
   them apart, so the screen does not pretend to.
-- **`· PSK`**: an EDR payload, which sdrtop cannot read yet.
+- **`· FEC failed`**: a DM payload whose error-correcting code could not be
+  undone. A damaged capture does that, and so does a payload that was never
+  basic rate: an EDR packet read as its basic-rate twin (the `2-DH3` of a
+  `DM3/2-DH3`) comes out here or as `✗ CRC`, and the packet alone cannot say
+  which it was.
+- **`· cut short`**: the capture ended before the packet did, at the edge of
+  a block or a block the feed lost.
+- **`· type not read`**: a type sdrtop has no payload reader for (voice
+  packets, FHS).
+- **`· bad length`**: a payload header whose length cannot hold a CRC.
 - **`· clock not known`**: the header was not read at one clock, so there is
   no whitening to undo.
 

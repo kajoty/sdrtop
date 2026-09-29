@@ -221,6 +221,36 @@ pub(crate) fn crcgen(bits: &[bool], uap: u8) -> u16 {
     reg
 }
 
+/// Why a payload's CRC could not be checked. The reasons mean different
+/// things on the air, so they are kept apart rather than folded into one
+/// "not read".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unchecked {
+    /// A type sdrtop has no payload reader for (HV, DV, EV, FHS, AUX1).
+    NoReader,
+    /// The capture ended before the length the payload's own header claims:
+    /// the window, a block edge, or a block the feed lost.
+    CutShort,
+    /// A rate 2/3 codeword the FEC cannot place: a damaged capture, or a
+    /// payload that is not basic rate at all, which the header alone cannot
+    /// tell apart.
+    FecFailed,
+    /// A payload header whose length cannot hold a CRC.
+    BadLength,
+}
+
+impl Unchecked {
+    /// The words the packet list prints.
+    pub fn words(self) -> &'static str {
+        match self {
+            Unchecked::NoReader => "type not read",
+            Unchecked::CutShort => "cut short",
+            Unchecked::FecFailed => "FEC failed",
+            Unchecked::BadLength => "bad length",
+        }
+    }
+}
+
 /// Check a captured payload region's own CRC-16 against a specific
 /// CLK1-6/UAP guess, dewhitening as it goes - the header/payload's shared
 /// whitening stream, continued from bit [`HEADER_BITS`] rather than
@@ -231,47 +261,53 @@ pub(crate) fn crcgen(bits: &[bool], uap: u8) -> u16 {
 /// happened to capture - this function reads only as much of it as the
 /// payload header itself says the packet actually is.
 ///
-/// Returns `None` when nothing here can render a verdict at all: an
-/// unsupported packet type, a `raw` shorter than the length the payload's
-/// own header claims (not enough was captured yet to check), or a codeword
-/// the rate 2/3 FEC cannot correct (the capture is damaged).
-/// `Some(true)`/`Some(false)` is the actual CRC verdict once one is
-/// possible - never invented when the data to compute it is simply
-/// missing, `POLICY.md` rule 2's own "what cannot be asked is refused, not
-/// answered".
+/// `Ok(true)`/`Ok(false)` is the actual CRC verdict once one is possible;
+/// where none is, the reason ([`Unchecked`]), never a verdict invented when
+/// the data to compute it is missing (`POLICY.md` rule 2).
+pub fn check_crc(
+    raw: &[bool],
+    clk6: u8,
+    packet_type: header::PacketType,
+    uap: u8,
+) -> Result<bool, Unchecked> {
+    let header_bits_len = payload_header_bits(packet_type).ok_or(Unchecked::NoReader)?;
+    let max_len = max_payload_length(packet_type).ok_or(Unchecked::NoReader)?;
+    // Data bits out of the raw capture: as they are, or through the FEC.
+    // A codeword the FEC cannot place is no verdict, not a failed CRC: it
+    // says the capture is damaged, whichever UAP is being tried.
+    let data = |bits: usize| -> Result<Vec<bool>, Unchecked> {
+        let raw_bits = raw_bits_for(packet_type, bits);
+        if raw.len() < raw_bits {
+            return Err(Unchecked::CutShort);
+        }
+        if fec23_protected(packet_type) {
+            unfec23(&raw[..raw_bits], bits).ok_or(Unchecked::FecFailed)
+        } else {
+            Ok(raw[..bits].to_vec())
+        }
+    };
+    let dewhitened_header = header::unwhiten_at(&data(header_bits_len)?, clk6, HEADER_BITS);
+    let payload_header = decode_payload_header(&dewhitened_header).ok_or(Unchecked::BadLength)?;
+    let payload_length = payload_header.payload_length.min(max_len);
+    let total_bits = payload_length * 8;
+    if total_bits < 16 {
+        return Err(Unchecked::BadLength);
+    }
+    let dewhitened = header::unwhiten_at(&data(total_bits)?, clk6, HEADER_BITS);
+    let received = header::pack_bits(&dewhitened[total_bits - 16..total_bits]);
+    let computed = crcgen(&dewhitened[..total_bits - 16], uap);
+    Ok(received == computed)
+}
+
+/// [`check_crc`]'s verdict, or `None` whatever the reason: for a caller
+/// that only needs to know whether the CRC passed, as the UAP tie-break.
 pub fn verify_crc(
     raw: &[bool],
     clk6: u8,
     packet_type: header::PacketType,
     uap: u8,
 ) -> Option<bool> {
-    let header_bits_len = payload_header_bits(packet_type)?;
-    let max_len = max_payload_length(packet_type)?;
-    // Data bits out of the raw capture: as they are, or through the FEC.
-    // A codeword the FEC cannot place is no verdict, not a failed CRC: it
-    // says the capture is damaged, whichever UAP is being tried.
-    let data = |bits: usize| -> Option<Vec<bool>> {
-        let raw_bits = raw_bits_for(packet_type, bits);
-        if raw.len() < raw_bits {
-            return None;
-        }
-        if fec23_protected(packet_type) {
-            unfec23(&raw[..raw_bits], bits)
-        } else {
-            Some(raw[..bits].to_vec())
-        }
-    };
-    let dewhitened_header = header::unwhiten_at(&data(header_bits_len)?, clk6, HEADER_BITS);
-    let payload_header = decode_payload_header(&dewhitened_header)?;
-    let payload_length = payload_header.payload_length.min(max_len);
-    let total_bits = payload_length * 8;
-    if total_bits < 16 {
-        return None;
-    }
-    let dewhitened = header::unwhiten_at(&data(total_bits)?, clk6, HEADER_BITS);
-    let received = header::pack_bits(&dewhitened[total_bits - 16..total_bits]);
-    let computed = crcgen(&dewhitened[..total_bits - 16], uap);
-    Some(received == computed)
+    check_crc(raw, clk6, packet_type, uap).ok()
 }
 
 /// Break [`super::header::PiconetClock`]'s own measured two-candidate
@@ -486,6 +522,39 @@ mod tests {
         assert_eq!(verify_crc(&two, 5, PacketType::Dm3, 0x21), None);
         let short = &payload[..payload.len() - 1];
         assert_eq!(verify_crc(short, 5, PacketType::Dm3, 0x21), None);
+    }
+
+    /// A payload left unchecked says why, because the reasons mean
+    /// different things on the air: a codeword the FEC cannot place (a
+    /// damaged capture, or a payload that is not basic rate at all), a
+    /// capture that ended before the packet did, and a type with no reader.
+    /// None of them is "PSK": that is a guess about the link, not a
+    /// reading of the packet.
+    #[test]
+    fn an_unchecked_payload_says_why() {
+        let (_, payload) = synthetic_packet(PacketType::Dm3, 5, 0x21, &[0x42; 40]);
+        assert_eq!(check_crc(&payload, 5, PacketType::Dm3, 0x21), Ok(true));
+        let mut two = payload.clone();
+        two[31] = !two[31];
+        two[33] = !two[33];
+        assert_eq!(
+            check_crc(&two, 5, PacketType::Dm3, 0x21),
+            Err(Unchecked::FecFailed)
+        );
+        let short = &payload[..payload.len() - 1];
+        assert_eq!(
+            check_crc(short, 5, PacketType::Dm3, 0x21),
+            Err(Unchecked::CutShort)
+        );
+        assert_eq!(
+            check_crc(&payload, 5, PacketType::Hv3, 0x21),
+            Err(Unchecked::NoReader)
+        );
+        assert_eq!(
+            verify_crc(short, 5, PacketType::Dm3, 0x21),
+            None,
+            "the old form"
+        );
     }
 
     /// The tie breaks on a DM packet as it does on a DH one.
