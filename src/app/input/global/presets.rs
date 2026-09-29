@@ -47,7 +47,9 @@ pub(in crate::app::input) fn try_set_preset(
         {
             super::view::end_focus(engine, &mut m);
         }
-        if engine.is_panel_visible("net_bt_packets") && piconet.is_some() {
+        let piconet_view =
+            engine.is_panel_visible("net_bt_packets") || engine.is_panel_visible("net_bt_bench");
+        if piconet_view && piconet.is_some() {
             m.net.bt_view.selected = piconet;
             m.net.packets_view = Default::default();
         }

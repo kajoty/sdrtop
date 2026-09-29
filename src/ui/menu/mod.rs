@@ -436,9 +436,9 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("NET"), "{all}");
-        assert!(all.contains("6 views"), "{all}");
+        assert!(all.contains("7 views"), "{all}");
         // A letter two views' panels share is one key, named once.
-        let heading = all.lines().find(|l| l.contains("6 views")).unwrap();
+        let heading = all.lines().find(|l| l.contains("7 views")).unwrap();
         let vs = heading
             .split(|c: char| !c.is_alphanumeric())
             .filter(|w| *w == "v")
@@ -499,7 +499,7 @@ mod tests {
         assert!(block < radio, "the section's block comes first");
 
         let views = draw(110, 30, &at(net, 0)).join("\n");
-        let heading = views.lines().find(|l| l.contains("6 views")).unwrap();
+        let heading = views.lines().find(|l| l.contains("7 views")).unwrap();
         for key in ['v', 'c', 'b', 'u'] {
             assert!(heading.contains(&format!(" {key}")), "{key}: {heading}");
         }

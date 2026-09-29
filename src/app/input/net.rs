@@ -1187,6 +1187,13 @@ mod tests {
         super::global::presets::try_set_preset(&mut engine, &state, "net_piconet");
         assert_eq!(engine.active_preset(), "net_piconet");
         assert_eq!(metrics(&state).net.bt_view.selected, Some(0xc3_d318));
+
+        // And into the Bench, from either.
+        let (mut engine, _keys, state) = focused_on("net_bt", "net_bt_piconets");
+        metrics(&state).net.bt_view.selected = Some(0xc3_d318);
+        super::global::presets::try_set_preset(&mut engine, &state, "net_bench");
+        assert_eq!(engine.active_preset(), "net_bench");
+        assert_eq!(metrics(&state).net.bt_view.selected, Some(0xc3_d318));
     }
 
     /// **The one selection that outlives its focus**: a census device chosen,

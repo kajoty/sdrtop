@@ -2359,6 +2359,16 @@ mod tests {
         assert_eq!(m.net.bt_hops.len(), 1);
     }
 
+    /// The Bench view listens too: it reads the same receiver's packets.
+    #[test]
+    fn the_bench_view_runs_the_classic_receiver() {
+        let (bytes, tuned) = access_code_only(0x0044_5566);
+        let state = run_classic("net_bench", tuned, bytes);
+        let m = state.lock().unwrap();
+        assert!(m.net.bt_refused.is_none(), "{:?}", m.net.bt_refused);
+        assert_eq!(m.net.bt_hops.len(), 1);
+    }
+
     /// A header read at one clock is a packet with its direction, which is
     /// that clock's slot parity, and its payload's verdict: this DH1's CRC
     /// checks out.

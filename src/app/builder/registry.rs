@@ -608,6 +608,13 @@ mod tests {
             .collect();
         m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
         m.net.bt_view.selected = Some(lap);
+        // Its master's carrier, so the bench shows an f0 in kHz.
+        m.net.bt_piconets[0].headers.sides.master.carrier = crate::signal::bt::piconet::Carrier {
+            f0_ppm: crate::signal::dsp::deviation::Sums::of(&[4.0, 6.0]),
+            channel_mhz: crate::signal::dsp::deviation::Sums::of(&[2441.0, 2441.0]),
+            worst_drift_hz: None,
+            worst_rate_hz_per_us: None,
+        };
         // And one packet of it, so the packet list draws its table.
         crate::signal::bt::piconet::observe_packet(
             &mut m.net.bt_piconets,

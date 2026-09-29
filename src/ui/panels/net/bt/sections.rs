@@ -124,6 +124,22 @@ pub(super) fn clock_of(
     (clock, provenance != crate::state::Provenance::Unreferenced)
 }
 
+/// Where a referenced slot clock stands against 2.2.5's 20 ppm, in words:
+/// outside, at the edge within twice its uncertainty, or inside.
+pub(super) fn clock_verdict(clock: Uncertain) -> &'static str {
+    let Limit::Band { low, high } = CLOCK_LIMIT_PPM else {
+        return "";
+    };
+    let (v, s) = (clock.value(), clock.sigma());
+    if v < low || v > high {
+        "outside the 20 ppm limit"
+    } else if v - 2.0 * s < low || v + 2.0 * s > high {
+        "at the edge of the 20 ppm limit"
+    } else {
+        "inside the 20 ppm limit"
+    }
+}
+
 /// The modulation index a side's (or one packet's) settled readings give,
 /// with its uncertainty: `h = 2 * df1 / 1 Msym/s`. `None` with fewer than
 /// two readings.

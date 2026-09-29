@@ -32,15 +32,13 @@ use ratatui::{
 };
 
 use super::bt_packets::selected;
-use super::bt_piconets::{silence, uap_text};
+use super::bt_piconets::silence;
 use super::sections::{
-    channel_runs, clock_of, header_lines, index_of, residual_histogram, BR_DELTA_F1_KHZ, BR_INDEX,
-    BR_RATIO, CLOCK_LIMIT_PPM, CLOCK_RESOLUTION_PPM, DELTA_F1_RESOLUTION_KHZ, DRIFT_LIMIT_KHZ,
-    DRIFT_RATE_LIMIT, DRIFT_RATE_RESOLUTION, DRIFT_RESOLUTION_KHZ, F0_LIMIT_KHZ, F0_RESOLUTION_KHZ,
-    INDEX_RESOLUTION, JITTER_LIMIT_US, JITTER_RESOLUTION_US, RATIO_RESOLUTION,
+    index_of, residual_histogram, BR_DELTA_F1_KHZ, BR_INDEX, BR_RATIO, DELTA_F1_RESOLUTION_KHZ,
+    DRIFT_LIMIT_KHZ, DRIFT_RATE_LIMIT, DRIFT_RATE_RESOLUTION, DRIFT_RESOLUTION_KHZ, F0_LIMIT_KHZ,
+    F0_RESOLUTION_KHZ, INDEX_RESOLUTION, JITTER_LIMIT_US, JITTER_RESOLUTION_US, RATIO_RESOLUTION,
 };
-use crate::signal::bt::header::PacketType;
-use crate::signal::bt::piconet::{Direction, HeaderRead, Kind, Piconet, Side};
+use crate::signal::bt::piconet::{Direction, Kind, Piconet, Side};
 use crate::signal::bt::slots::{spread, SlotRefusal, Spread, MIN_HITS};
 use crate::signal::dsp::uncertainty::Uncertain;
 use crate::state::{Provenance, SdrMetrics};
@@ -239,78 +237,6 @@ fn pair(
         out.push(Line::from(second));
     }
     out
-}
-
-/// What the UAP rests on: one value only a payload's CRC can choose (a
-/// header leaves two, `header::PiconetClock`), the CRCs that pass under it
-/// in the packets kept, or how far the narrowing got.
-fn uap_lines(
-    p: &Piconet,
-    state: &SdrMetrics,
-    iw: usize,
-    theme: &crate::Theme,
-) -> Vec<Line<'static>> {
-    let net = &state.net;
-    let full = super::sections::uap_account(p, net);
-    // Narrow, a resolved UAP's short form: still what the value rests on.
-    let text = match net.bt_uap.get(&p.lap).map(|u| u.as_slice()) {
-        Some([_]) if full.chars().count() + Columns::LABEL > iw => {
-            format!("{}, by a payload CRC", uap_text(p.lap, net))
-        }
-        _ => full,
-    };
-    // Two rows where one is too narrow: what the value rests on is the
-    // point of the line, and cut short it would say less than it knows.
-    crate::ui::chrome::wrap(&text, iw.saturating_sub(Columns::LABEL), 2)
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| field(if i == 0 { "UAP" } else { "" }, chunk, "", theme))
-        .collect()
-}
-
-/// The link's addresses and packet types in the packets kept, the most
-/// sent first: `LT_ADDR 1 · POLL 262 · NULL 258 · DM3/2-DH3 20`.
-fn traffic_lines(p: &Piconet, iw: usize, rows: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
-    let mut addrs: Vec<u8> = Vec::new();
-    let mut types: Vec<(String, u64)> = Vec::new();
-    for k in &p.packets {
-        let Some(HeaderRead::Decoded(h)) = k.header else {
-            continue;
-        };
-        if !addrs.contains(&h.lt_addr) {
-            addrs.push(h.lt_addr);
-        }
-        let name = PacketType::from_code(h.packet_type.code()).shown();
-        match types.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, c)) => *c += 1,
-            None => types.push((name, 1)),
-        }
-    }
-    if addrs.is_empty() {
-        return vec![quiet("no header read at one clock yet".to_string(), theme)];
-    }
-    addrs.sort_unstable();
-    types.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut text = format!(
-        "LT_ADDR {}",
-        addrs
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    for (name, count) in types {
-        text.push_str(&format!(" · {name} {count}"));
-    }
-    crate::ui::chrome::wrap(&text, iw.saturating_sub(1), rows)
-        .into_iter()
-        .map(|chunk| {
-            Line::from(Span::styled(
-                format!(" {chunk}"),
-                Style::default().fg(theme.value),
-            ))
-        })
-        .collect()
 }
 
 /// The most braille cells a trend takes, two points to a cell.
@@ -556,7 +482,6 @@ fn residuals(p: &Piconet, direction: Direction) -> Vec<f64> {
 /// each side.
 fn timing_lines(
     p: &Piconet,
-    state: &SdrMetrics,
     iw: usize,
     c: Columns,
     plots: bool,
@@ -579,27 +504,6 @@ fn timing_lines(
             theme,
         )),
         Some(Ok(f)) => {
-            let (clock, judged) = clock_of(f, state);
-            let mut line = vec![
-                crate::ui::chrome::field("clock", PAIR_LABEL, theme),
-                Span::raw(" "),
-            ];
-            if judged {
-                let row = LimitRow::new(
-                    "",
-                    Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM),
-                    CLOCK_LIMIT_PPM,
-                );
-                line.extend(Cell::Judged(row).spans(theme));
-            } else {
-                line.extend(Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM).spans(theme));
-                line.push(Span::styled(
-                    "  relative to our own oscillator".to_string(),
-                    Style::default().fg(theme.label),
-                ));
-            }
-            out.push(Line::from(line));
-
             let (master, slave) = (
                 residuals(p, Direction::Master),
                 residuals(p, Direction::Slave),
@@ -730,7 +634,7 @@ fn bench(
     budget: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
-    let mut out = uap_lines(p, state, iw, theme);
+    let mut out: Vec<Line<'static>> = Vec::new();
     // Neither an inquiry nor a page is a piconet: no two ends to set side
     // by side, as the Piconets panel says of them.
     if let Kind::Inquiry(_) | Kind::Paged = p.kind() {
@@ -750,27 +654,6 @@ fn bench(
         .position(|q| q.lap == p.lap)
         .map_or(theme.value_hi, |k| theme.series_color(k));
     let c = Columns::of(iw, master, theme.value);
-    // Narrow, one row of it: the types are the most sent first, so what a
-    // row leaves off is the rarest.
-    out.extend(traffic_lines(p, iw, if c.stacked { 1 } else { 2 }, theme));
-    // Of 79, not of the channels watched now: in SURVEY a piconet was heard
-    // wherever the survey stood at the time.
-    let runs = format!(
-        "{} of 79: {}",
-        p.channels_hit(),
-        channel_runs(p.channel_mask())
-    );
-    for (i, chunk) in crate::ui::chrome::wrap(&runs, iw.saturating_sub(Columns::LABEL), 2)
-        .into_iter()
-        .enumerate()
-    {
-        out.push(field(
-            if i == 0 { "channels" } else { "" },
-            chunk,
-            "",
-            theme,
-        ));
-    }
 
     // Each section as a whole and without its plots, the trends and the
     // residual shape: a plot is the first thing a short panel gives up, the
@@ -798,12 +681,11 @@ fn bench(
         out.extend(carrier_lines(p, state, c, iw, trends, theme));
         out
     };
-    let timing = |plots| timing_lines(p, state, iw, c, plots, theme);
+    let timing = |plots| timing_lines(p, iw, c, plots, theme);
     let sections = [
         ("MODULATION", modulation(true), Some(modulation(false))),
         ("CARRIER", carrier(true), Some(carrier(false))),
         ("TIMING", timing(true), Some(timing(false))),
-        ("HEADERS", header_lines(p, state, iw, theme), None),
     ];
     let last = sections.len() - 1;
     // The line naming what is left out may wrap on a narrow bench: it is
@@ -1017,14 +899,6 @@ mod tests {
             index.find("0.318").expect(index),
         );
         assert!(a < b, "the master on the left: {index}");
-        let types = out.iter().find(|l| l.contains("LT_ADDR")).expect(&text);
-        assert!(types.contains("LT_ADDR 1"), "{types}");
-        assert!(types.contains("POLL 2"), "{types}");
-        assert!(types.contains("NULL 1"), "{types}");
-        assert!(
-            types.find("POLL").unwrap() < types.find("NULL").unwrap(),
-            "most first"
-        );
     }
 
     /// A side with nothing measured says so in its own column, never a zero.
@@ -1050,33 +924,6 @@ mod tests {
             "no figure on the slave's side: {text}"
         );
         assert!(text.contains("0.334"), "the master's still: {text}");
-    }
-
-    /// The UAP line says what the value rests on: one value only a payload's
-    /// CRC can choose, and two is where an encrypted link stays.
-    #[test]
-    fn the_uap_line_says_how_it_was_reached() {
-        let mut m = heard();
-        observe_packet(
-            &mut m.net.bt_piconets,
-            LAP,
-            packet(0.0, 3, Direction::Slave, PayloadVerdict::Crc(true)),
-        );
-        let text = draw(NetBtBenchPanel, 100, 50, &m).join("\n");
-        assert!(text.contains("0x67, resolved by a payload CRC"), "{text}");
-        assert!(text.contains("1 CRC passes under it"), "{text}");
-
-        m.net.bt_uap.insert(LAP, vec![0x67, 0x9a]);
-        let text = draw(NetBtBenchPanel, 100, 50, &m).join("\n");
-        assert!(
-            text.contains("2 candidates (0x67, 0x9a): only a payload CRC chooses"),
-            "{text}"
-        );
-
-        m.net.bt_uap.insert(LAP, vec![0x67]);
-        m.net.address_display = crate::state::AddressDisplay::Masked;
-        let text = draw(NetBtBenchPanel, 100, 50, &m).join("\n");
-        assert!(!text.contains("0x67"), "{text}");
     }
 
     /// TIMING: the piconet's clock from its grid, each side's jitter about
@@ -1273,7 +1120,7 @@ mod tests {
         let sides = &mut m.net.bt_piconets[0].headers.sides;
         sides.master.deviation = around(167_000.0);
         sides.slave.deviation = around(159_000.0);
-        let out = draw(NetBtBenchPanel, 40, 17, &m);
+        let out = draw(NetBtBenchPanel, 40, 14, &m);
         let text = out.join("\n");
         assert!(text.contains("Mod index"), "{text}");
         assert!(!text.contains("Mod trend"), "{text}");
@@ -1351,14 +1198,52 @@ mod tests {
         );
     }
 
-    /// Where the piconet was heard, of all 79, as runs.
+    /// The whole piconet's facts are the Classic view's now: the bench has
+    /// only each end's.
     #[test]
-    fn the_channels_it_was_heard_on_are_runs() {
+    fn the_whole_piconet_facts_are_net_5s() {
         let mut m = heard();
-        for ch in [2u8, 3, 4, 5, 17] {
-            observe(&mut m.net.bt_piconets, LAP, ch, Instant::now());
+        m.net.bt_piconets[0].headers.sides.master.deviation = around(167_000.0);
+        let text = draw(NetBtBenchPanel, 100, 40, &m).join("\n");
+        for gone in ["UAP", "LT_ADDR", "channels", "HEADERS", "│ clock "] {
+            assert!(!text.contains(gone), "{gone}: {text}");
         }
-        let out = draw(NetBtBenchPanel, 100, 80, &m).join("\n");
-        assert!(out.contains("6 of 79: 2-5, 17, 73"), "{out}");
+        assert!(text.contains("MODULATION"), "{text}");
+    }
+
+    /// One screen, one job: the Piconet view is its packet list, the whole
+    /// screen, and the Bench view its bench.
+    #[test]
+    fn each_view_has_its_screen() {
+        let screen = |preset: &str| {
+            let (engine, _) =
+                crate::app::App::build_ui(preset, &std::collections::HashMap::new(), None, true);
+            let mut m = heard();
+            m.ui.active_preset = preset.to_string();
+            let theme = crate::Theme::sdr();
+            let mut t =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(191, 41)).unwrap();
+            t.draw(|f| engine.draw(f, &m, &theme)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..41)
+                .map(|y| (0..191).map(|x| buf.get(x, y).symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let six = screen("net_piconet");
+        let packets = six
+            .iter()
+            .find(|l| l.contains("Packets [V]"))
+            .expect("the list");
+        assert!(
+            packets.ends_with('╮'),
+            "the list spans the width: {packets}"
+        );
+        assert!(!six.join("\n").contains("Bench [C]"), "no bench on NET 6");
+        let seven = screen("net_bench");
+        let bench = seven
+            .iter()
+            .find(|l| l.contains("Bench [C]"))
+            .expect("the bench");
+        assert!(bench.starts_with('╭') && bench.ends_with('╮'), "{bench}");
     }
 }

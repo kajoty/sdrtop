@@ -41,7 +41,7 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
     let on = streaming
         && match preset {
             "net_ble" | "net_census" => net.ble_channel.is_some(),
-            "net_bt" | "net_piconet" => !net.bt_channels_watched.is_empty(),
+            "net_bt" | "net_piconet" | "net_bench" => !net.bt_channels_watched.is_empty(),
             _ => m.ui.active_preset == preset,
         };
     let quiet = |text: String| Live {
@@ -121,6 +121,39 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
                 .count();
             Some(said(
                 format!("{piconets} piconets heard, {resolved} UAP resolved"),
+                net.bt_refused.as_ref(),
+            ))
+        }
+        "net_bench" => {
+            let laps: Vec<u32> = crate::signal::bt::piconet::ordered(&net.bt_piconets)
+                .iter()
+                .map(|p| p.lap)
+                .collect();
+            let Some(p) = net
+                .bt_view
+                .cursor(&laps)
+                .and_then(|i| net.bt_piconets.iter().find(|p| p.lap == laps[i]))
+            else {
+                return Some(said(
+                    "no piconet selected".to_string(),
+                    net.bt_refused.as_ref(),
+                ));
+            };
+            // Each end's index, as the bench prints it; a dash for an end
+            // not read yet.
+            let index = |d: &crate::signal::bt::piconet::Deviation| {
+                d.settled.mean().map_or("—".to_string(), |df1| {
+                    format!("{:.3}", df1.value() * 2.0 / 1e6)
+                })
+            };
+            let s = &p.headers.sides;
+            Some(said(
+                format!(
+                    "{}: index {} master · {} slave",
+                    net.show_lap(p.lap),
+                    index(&s.master.deviation),
+                    index(&s.slave.deviation)
+                ),
                 net.bt_refused.as_ref(),
             ))
         }
@@ -219,7 +252,7 @@ mod tests {
         if streaming {
             match preset {
                 "net_ble" | "net_census" => m.net.ble_channel = Some(37),
-                "net_bt" | "net_piconet" => m.net.bt_channels_watched = vec![10, 11],
+                "net_bt" | "net_piconet" | "net_bench" => m.net.bt_channels_watched = vec![10, 11],
                 _ => {}
             }
         }
@@ -352,6 +385,31 @@ mod tests {
         let l = line("net_piconet", &m, now).unwrap();
         assert!(!l.running);
         assert!(l.text.ends_with("; not listening now"), "{}", l.text);
+    }
+
+    /// NET 7's line: the piconet it would show and each end's index, as the
+    /// address mode shows it; a dash for an end not read yet.
+    #[test]
+    fn the_bench_view_has_a_live_line() {
+        use crate::signal::bt::piconet::Deviation;
+        let mut m = at("net_bench", true);
+        let now = Instant::now();
+        assert_eq!(
+            line("net_bench", &m, now).unwrap().text,
+            "no piconet selected"
+        );
+        crate::signal::bt::piconet::observe(&mut m.net.bt_piconets, 0xc3_d318, 10, now);
+        m.net.bt_view.selected = Some(0xc3_d318);
+        m.net.bt_piconets[0].headers.sides.master.deviation =
+            Deviation::from_readings(&[155_000.0, 155_500.0, 156_000.0], &[]);
+        let l = line("net_bench", &m, now).unwrap();
+        assert_eq!(l.text, "0xc3d318: index 0.311 master · — slave");
+        assert!(l.running);
+        m.net.bt_channels_watched.clear();
+        assert!(line("net_bench", &m, now)
+            .unwrap()
+            .text
+            .ends_with("; not listening now"));
     }
 
     #[test]

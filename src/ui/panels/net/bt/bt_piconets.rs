@@ -423,7 +423,11 @@ fn clock_row(p: &Piconet, state: &SdrMetrics) -> String {
             format!(
                 "{}{} · grid rms {} · {} hits over {span}",
                 Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM).text(),
-                if judged { "" } else { ", relative" },
+                if judged {
+                    format!(", {}", sections::clock_verdict(clock))
+                } else {
+                    ", relative".to_string()
+                },
                 Reading::new(f.rms_us, "us", JITTER_RESOLUTION_US).text(),
                 f.hits
             )
@@ -1109,6 +1113,9 @@ mod tests {
             clock.contains("-4") && !clock.contains("relative"),
             "corrected: {clock}"
         );
+        // And held against 2.2.5's 20 ppm, as the bench held it before the
+        // clock moved here.
+        assert!(clock.contains("inside the 20 ppm limit"), "{clock}");
     }
 
     /// On the laptop's own terminal, 191 x 41 with the header, the log and
