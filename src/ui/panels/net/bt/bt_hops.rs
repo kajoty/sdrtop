@@ -91,18 +91,25 @@ fn colour_index(state: &SdrMetrics) -> HashMap<u32, usize> {
         .collect()
 }
 
-/// The channels bar column `c` of `cols` covers: one each where 79 fit,
-/// otherwise ranges in proportion, one or two channels wide, so the bars
-/// fill the width and no channel is dropped. (Whole multiples first halved
-/// the zone on a panel a few columns short of 79.)
+/// The channels bar column `c` of `cols` covers, so the bars fill the
+/// width whatever it is and no channel is dropped: below 79 columns, ranges
+/// in proportion, one or two channels wide; from 79 up, exactly one, each
+/// channel one column or one more wide, spread evenly across the band.
+/// (Whole multiples first halved the zone on a panel a few columns short of
+/// 79; one column a channel left a quarter of a wide panel empty.)
 fn channels_of(c: usize, cols: usize) -> std::ops::Range<usize> {
-    let cols = cols.clamp(1, CHANNELS);
-    c * CHANNELS / cols..(c + 1) * CHANNELS / cols
+    let cols = cols.max(1);
+    if cols >= CHANNELS {
+        let ch = (c * CHANNELS / cols).min(CHANNELS - 1);
+        ch..ch + 1
+    } else {
+        c * CHANNELS / cols..(c + 1) * CHANNELS / cols
+    }
 }
 
-/// The column channel `ch` falls in.
+/// The first column channel `ch` falls in.
 fn column_of(ch: usize, cols: usize) -> usize {
-    let cols = cols.clamp(1, CHANNELS);
+    let cols = cols.max(1);
     (0..cols)
         .find(|&c| channels_of(c, cols).contains(&ch))
         .unwrap_or(cols - 1)
@@ -406,7 +413,7 @@ fn where_zone(
     rows: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
-    let cols = width.saturating_sub(SCALE).clamp(1, CHANNELS);
+    let cols = width.saturating_sub(SCALE).max(1);
 
     // Per column: all hits, the selected piconet's, the piconet heard most
     // there, and the one heard most among the others (whose colour the
@@ -555,6 +562,44 @@ mod tests {
             stream: 0,
             header: None,
         });
+    }
+
+    /// A wide panel spreads the 79 channels over every column: each column
+    /// one channel, each channel one column or one more, none dropped, and
+    /// the last channel in the last column.
+    #[test]
+    fn every_column_is_a_channel_on_a_wide_panel() {
+        for cols in [79usize, 105, 170, 240] {
+            let mut width = vec![0usize; CHANNELS];
+            for c in 0..cols {
+                let chans = channels_of(c, cols);
+                assert_eq!(chans.len(), 1, "{cols}: column {c}");
+                width[chans.start] += 1;
+            }
+            let (lo, hi) = (width.iter().min().unwrap(), width.iter().max().unwrap());
+            assert!(*lo >= 1 && hi - lo <= 1, "{cols}: {width:?}");
+            assert_eq!(channels_of(cols - 1, cols), 78..79);
+            assert_eq!(column_of(78, cols) + width[78], cols);
+        }
+    }
+
+    /// WHERE reaches the frame's right edge: the axis's `78` ends in the
+    /// last column inside the frame, at every width, where it used to stop
+    /// at the 79th column and leave the rest of the panel empty.
+    #[test]
+    fn where_reaches_the_right_edge() {
+        let mut m = SdrMetrics::fixture().streaming();
+        m.net.bt_channels_watched = (60..68).collect();
+        hit(&mut m, 0x5a3c71, 78, 100);
+        hit(&mut m, 0x5a3c71, 0, 100);
+        for w in [100u16, 120, 170] {
+            let out = draw(NetBtHopsPanel, w, 30, &m);
+            let text = out.join("\n");
+            let axis = out.iter().find(|l| l.contains(" 78")).expect(&text);
+            let border = axis.chars().count() - 1;
+            let at = axis[..axis.rfind("78").unwrap()].chars().count();
+            assert_eq!(at + 2, border, "{w}: {axis}");
+        }
     }
 
     /// A run is bracketed end to end, a lone channel gets the arrow, and a
@@ -725,8 +770,9 @@ mod tests {
         t.draw(|f| NetBtHopsPanel.render(f, f.size(), &m, &theme, false))
             .unwrap();
         let buf = t.backend().buffer().clone();
-        // Column of channel 10: the scale, then channel 0.
-        let x = (SCALE + 10) as u16;
+        // Column of channel 10: the scale, then the channels spread over
+        // the rest of the width.
+        let x = (SCALE + column_of(10, 90 - SCALE)) as u16;
         let y = (0..20)
             .find(|&y| buf.get(x, y).symbol() == "\u{2588}")
             .expect("channel 10's bar");
