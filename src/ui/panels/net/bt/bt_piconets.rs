@@ -306,8 +306,9 @@ fn detail(
     out
 }
 
-/// A piconet summed up: its LAP, its UAP in words, its readings on one
-/// line, and where the rest of it is. The sections themselves are the
+/// The PICONET section: who the piconet is and what that rests on (its
+/// LAP, its UAP and the CRCs under it, when and where it was heard), its
+/// readings on one line, and where the rest of it is. The sections themselves are the
 /// Piconet view's bench, one side each, so this view stays the overview it
 /// is: who is here, and where they hop.
 ///
@@ -316,13 +317,29 @@ fn detail(
 /// member's residuals from the slot grid, which is not a jitter: the two
 /// sides' offset from each other is in it (the bench has each side's). Each to the places its uncertainty gives it, and a dash until it
 /// can be stated; the ± is the bench's, where there is room for it.
-fn summary(p: &Piconet, state: &SdrMetrics, iw: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
+fn piconet_lines(
+    p: &Piconet,
+    state: &SdrMetrics,
+    now: std::time::Instant,
+    iw: usize,
+    theme: &crate::Theme,
+) -> Vec<Line<'static>> {
     let field = |label: &str, value: String| {
         Line::from(vec![
             crate::ui::chrome::field(label, LABEL_W, theme),
             Span::styled(value, Style::default().fg(theme.value)),
         ])
     };
+    let room = iw.saturating_sub(LABEL_W + 1);
+    let wrapped = |out: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        for (i, chunk) in crate::ui::chrome::wrap(text, room, 2)
+            .into_iter()
+            .enumerate()
+        {
+            out.push(field(if i == 0 { label } else { "" }, chunk));
+        }
+    };
+    let since = |t: std::time::Instant| ago(now.saturating_duration_since(t).as_secs());
     let mut out = vec![
         crate::ui::chrome::section("piconet", "", iw, theme),
         field(
@@ -330,13 +347,27 @@ fn summary(p: &Piconet, state: &SdrMetrics, iw: usize, theme: &crate::Theme) -> 
             format!("{}  the master's", state.net.show_lap(p.lap)),
         ),
     ];
-    let uap = uap_sentence(state.net.bt_uap.get(&p.lap), &state.net);
-    for (i, chunk) in crate::ui::chrome::wrap(&uap, iw.saturating_sub(LABEL_W + 1), 2)
-        .into_iter()
-        .enumerate()
-    {
-        out.push(field(if i == 0 { "UAP" } else { "" }, chunk));
-    }
+    wrapped(&mut out, "UAP", &sections::uap_account(p, &state.net));
+    out.push(field(
+        "heard",
+        format!(
+            "{} hits, first {} ago, last {} ago",
+            p.hits,
+            since(p.first_seen),
+            since(p.last_seen)
+        ),
+    ));
+    // Of 79, not of the channels watched now: in SURVEY a piconet was heard
+    // wherever the survey stood at the time.
+    wrapped(
+        &mut out,
+        "channels",
+        &format!(
+            "{} of 79: {}",
+            p.channels_hit(),
+            channel_runs(p.channel_mask())
+        ),
+    );
     let value = |r: Option<Reading>| {
         r.and_then(|r| r.value_text())
             .unwrap_or_else(|| "—".to_string())
@@ -396,7 +427,7 @@ fn detail_within(
 ) -> Vec<Line<'static>> {
     let text = match p.kind() {
         Kind::Piconet => {
-            let out = summary(p, state, iw, theme);
+            let out = piconet_lines(p, state, now, iw, theme);
             return if out.len() > budget { Vec::new() } else { out };
         }
         Kind::Inquiry(_) => format!(
@@ -774,31 +805,76 @@ mod tests {
         }
     }
 
-    /// **The selected piconet, summed up**: its LAP, its UAP in words, its
-    /// readings on one line, and where the rest of it is. The sections live
-    /// on NET 6's bench, one side each.
+    /// **The PICONET section says who the piconet is** and what that rests
+    /// on: its LAP, its UAP and the CRCs under it, when it was heard, and
+    /// where, as runs of the 79 channels; then where the rest of it is.
     #[test]
-    fn the_selected_piconet_is_summed_up_and_points_at_net_6() {
+    fn the_piconet_section_says_who_it_is() {
+        use crate::signal::bt::header::{Header, PacketType};
+        use crate::signal::bt::piconet::{observe_packet, BtPacket, HeaderRead, PayloadVerdict};
         let mut m = heard();
-        m.net.bt_view.selected = Some(0x5a3c71);
-        let out = draw(NetBtPiconetsPanel, 60, 30, &m);
-        let text = out.join("\n");
-        let head = out.iter().position(|l| l.contains("PICONET")).expect(&text);
-        let hint = out
-            .iter()
-            .position(|l| l.contains("Enter: packet by packet"))
-            .expect(&text);
-        assert!(
-            hint - head <= 5,
-            "three fields, the UAP on two rows at most, and the hint: {text}"
+        let lap = 0xc3_d318;
+        for ch in [2u8, 3, 4, 5, 17, 73] {
+            observe(&mut m.net.bt_piconets, lap, ch, Instant::now());
+        }
+        m.net.bt_uap.insert(lap, vec![0x67]);
+        observe_packet(
+            &mut m.net.bt_piconets,
+            lap,
+            BtPacket {
+                seen: Instant::now(),
+                at_us: 0.0,
+                stream: 1,
+                channel: 73,
+                header: Some(HeaderRead::Decoded(Header {
+                    lt_addr: 1,
+                    packet_type: PacketType::Dm1,
+                    flags: 0,
+                    hec: 0,
+                    clk6: 0,
+                })),
+                direction: None,
+                deviation: Default::default(),
+                carrier: Default::default(),
+                f0_ppm: None,
+                payload: PayloadVerdict::Crc(true),
+            },
         );
-        assert!(text.contains("the master's"), "{text}");
-        assert!(text.contains("2 candidates (0x4c, 0x9a)"), "{text}");
-        for gone in ["MODULATION", "CARRIER", "TIMING", "HEADERS"] {
+        m.net.bt_view.selected = Some(lap);
+        let out = draw(NetBtPiconetsPanel, 70, 40, &m);
+        let text = out.join("\n");
+        assert!(text.contains("PICONET"), "{text}");
+        assert!(text.contains("0xc3d318  the master's"), "{text}");
+        assert!(
+            text.contains("0x67, resolved by a payload CRC · 1 CRC passes under it"),
+            "{text}"
+        );
+        let when = out.iter().find(|l| l.contains("heard")).expect(&text);
+        assert!(when.contains("6 hits, first"), "{when}");
+        assert!(text.contains("6 of 79: 2-5, 17, 73"), "{text}");
+        assert!(text.contains("Enter: packet by packet, on NET 6"), "{text}");
+        for gone in ["MODULATION", "CARRIER", "TIMING"] {
             assert!(!text.contains(gone), "{gone}: {text}");
         }
         let none = draw(NetBtPiconetsPanel, 60, 16, &heard()).join("\n");
         assert!(!none.contains("PICONET"), "{none}");
+    }
+
+    /// Two candidates are where an encrypted link stays, and the section
+    /// says so beside them; masked, neither the LAP nor a UAP value shows.
+    #[test]
+    fn two_candidates_say_why_and_masked_show_no_address_bits() {
+        let mut m = heard();
+        m.net.bt_view.selected = Some(0x5a3c71);
+        let text = draw(NetBtPiconetsPanel, 70, 40, &m).join("\n");
+        assert!(text.contains("2 candidates (0x4c, 0x9a)"), "{text}");
+        assert!(text.contains("reconnect"), "{text}");
+
+        m.net.address_display = crate::state::AddressDisplay::Masked;
+        let text = draw(NetBtPiconetsPanel, 70, 40, &m).join("\n");
+        assert!(!text.contains("5a3c71"), "{text}");
+        assert!(!text.contains("0x4c") && !text.contains("0x9a"), "{text}");
+        assert!(text.contains("2 candidates"), "{text}");
     }
 
     /// The readings on one line, every member's pooled as the Classic view

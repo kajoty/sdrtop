@@ -131,6 +131,62 @@ pub(super) fn index_of(dev: &Deviation) -> Option<Uncertain> {
     dev.settled.mean().map(|df1| df1.scale(2.0 / 1e6))
 }
 
+/// What a piconet's UAP rests on, in words, as the address mode shows it:
+/// one value only a payload's CRC can choose (a header leaves two,
+/// `header::PiconetClock`), with the CRCs that pass under it in the packets
+/// kept; two candidates, where an encrypted link stays until a reconnect
+/// sends a few packets in the clear; more, which further headers narrow; or
+/// none narrowed yet. Candidates are listed while a reader can take them in
+/// and never when masked, where two are half an address byte from one.
+pub(super) fn uap_account(p: &Piconet, net: &crate::state::NetState) -> String {
+    let masked = net.address_display == crate::state::AddressDisplay::Masked;
+    let listed = |many: &[u8]| {
+        if masked {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                many.iter()
+                    .map(|u| format!("{u:#04x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+    match net.bt_uap.get(&p.lap).map(|u| u.as_slice()) {
+        Some([one]) => {
+            let passing = p
+                .packets
+                .iter()
+                .filter(|k| k.payload == crate::signal::bt::piconet::PayloadVerdict::Crc(true))
+                .count();
+            let under = match passing {
+                0 => String::new(),
+                1 => " · 1 CRC passes under it".to_string(),
+                n => format!(" · {n} CRCs pass under it"),
+            };
+            format!("{}, resolved by a payload CRC{under}", net.show_uap(*one))
+        }
+        Some(two @ [_, _]) => format!(
+            "2 candidates{}: only a payload CRC chooses, which an encrypted link \
+             gives only at a reconnect",
+            listed(two)
+        ),
+        Some(few) if (3..=4).contains(&few.len()) => format!(
+            "{} candidates{}; each further header narrows them",
+            few.len(),
+            listed(few)
+        ),
+        Some(many) if !many.is_empty() => {
+            format!(
+                "{} candidates; each further header narrows them",
+                many.len()
+            )
+        }
+        _ => "not narrowed: no header of it decoded yet".to_string(),
+    }
+}
+
 /// The channels a piconet was heard on, as runs: `2-5, 17, 40-41`.
 pub(super) fn channel_runs(mask: u128) -> String {
     let mut runs = Vec::new();

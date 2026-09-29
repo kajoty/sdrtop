@@ -40,7 +40,7 @@ use super::sections::{
     INDEX_RESOLUTION, JITTER_LIMIT_US, JITTER_RESOLUTION_US, RATIO_RESOLUTION,
 };
 use crate::signal::bt::header::PacketType;
-use crate::signal::bt::piconet::{Direction, HeaderRead, Kind, PayloadVerdict, Piconet, Side};
+use crate::signal::bt::piconet::{Direction, HeaderRead, Kind, Piconet, Side};
 use crate::signal::bt::slots::{spread, SlotRefusal, Spread, MIN_HITS};
 use crate::signal::dsp::uncertainty::Uncertain;
 use crate::state::{Provenance, SdrMetrics};
@@ -251,31 +251,13 @@ fn uap_lines(
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let net = &state.net;
+    let full = super::sections::uap_account(p, net);
+    // Narrow, a resolved UAP's short form: still what the value rests on.
     let text = match net.bt_uap.get(&p.lap).map(|u| u.as_slice()) {
-        Some([_]) => {
-            let passing = p
-                .packets
-                .iter()
-                .filter(|k| k.payload == PayloadVerdict::Crc(true))
-                .count();
-            let under = match passing {
-                0 => String::new(),
-                1 => " · 1 CRC passes under it".to_string(),
-                n => format!(" · {n} CRCs pass under it"),
-            };
-            let full = format!("{}, resolved by a payload CRC{under}", uap_text(p.lap, net));
-            // Narrow, the short form: still what the value rests on.
-            if full.chars().count() + Columns::LABEL > iw {
-                format!("{}, by a payload CRC", uap_text(p.lap, net))
-            } else {
-                full
-            }
+        Some([_]) if full.chars().count() + Columns::LABEL > iw => {
+            format!("{}, by a payload CRC", uap_text(p.lap, net))
         }
-        Some([_, _]) => "2 left: an encrypted link resolves from a reconnect".to_string(),
-        Some(many) if !many.is_empty() => {
-            format!("{} left: each further header narrows them", many.len())
-        }
-        _ => "not narrowed: no header of it decoded yet".to_string(),
+        _ => full,
     };
     // Two rows where one is too narrow: what the value rests on is the
     // point of the line, and cut short it would say less than it knows.
@@ -1087,7 +1069,7 @@ mod tests {
         m.net.bt_uap.insert(LAP, vec![0x67, 0x9a]);
         let text = draw(NetBtBenchPanel, 100, 50, &m).join("\n");
         assert!(
-            text.contains("2 left: an encrypted link resolves from a reconnect"),
+            text.contains("2 candidates (0x67, 0x9a): only a payload CRC chooses"),
             "{text}"
         );
 
