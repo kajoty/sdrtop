@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(l.text, "2 piconets heard, 1 UAP resolved");
     }
 
-    /// NET 6's line: the piconet it would show and the packets it has, as
+    /// Classic 2's line: the piconet it would show and the packets it has, as
     /// the address mode shows it, or that none is selected.
     #[test]
     fn the_piconet_view_has_a_live_line() {
@@ -387,7 +387,7 @@ mod tests {
         assert!(l.text.ends_with("; not listening now"), "{}", l.text);
     }
 
-    /// NET 7's line: the piconet it would show and each end's index, as the
+    /// Classic 3's line: the piconet it would show and each end's index, as the
     /// address mode shows it; a dash for an end not read yet.
     #[test]
     fn the_bench_view_has_a_live_line() {

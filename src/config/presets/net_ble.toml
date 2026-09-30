@@ -1,4 +1,4 @@
-# NET BLE — what is this device advertising, and is its own transmitter any
+# LE Advertising: what is this device advertising, and is its own transmitter any
 # good? Design section 9's question for this preset. Real advertising channel
 # PDUs, CRC-checked, as they arrive, beside the detail of the one selected
 # (focus the list with v): its header, its physics and its modulation.
@@ -11,9 +11,9 @@
 # condition is not met, rather than showing an empty table that could be
 # mistaken for a quiet room.
 
-section = "net"
-slot    = 4
-title   = "BLE"
+section = "le"
+slot    = 2
+title   = "Advertising"
 blurb   = "what is this device advertising"
 
 panels = [

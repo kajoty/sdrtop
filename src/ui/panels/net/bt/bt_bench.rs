@@ -828,7 +828,7 @@ impl Panel for NetBtBenchPanel {
         }
         let Some(p) = selected(state) else {
             let lines: Vec<Line> = crate::ui::chrome::wrap(
-                "no piconet selected: select a piconet in NET 5 and press Enter",
+                "no piconet selected: select a piconet in Classic 1 and press Enter",
                 width,
                 4,
             )
@@ -908,7 +908,7 @@ mod tests {
         let mut m = heard();
         m.net.bt_view.selected = None;
         let out = draw(NetBtBenchPanel, 80, 10, &m).join("\n");
-        assert!(out.contains("select a piconet in NET 5"), "{out}");
+        assert!(out.contains("select a piconet in Classic 1"), "{out}");
     }
 
     /// Under one MODULATION heading, the master's column and the slave's,
@@ -1009,7 +1009,10 @@ mod tests {
             out[at + 1].contains('◀') && out[at + 1].contains(" us"),
             "{text}"
         );
-        assert!(!text.contains("│ clock"), "the clock is NET 5's: {text}");
+        assert!(
+            !text.contains("│ clock"),
+            "the clock is Classic 1's: {text}"
+        );
         let offset = out
             .iter()
             .find(|l| l.contains("after the master"))
@@ -1378,7 +1381,10 @@ mod tests {
             packets.ends_with('╮'),
             "the list spans the width: {packets}"
         );
-        assert!(!six.join("\n").contains("Bench [C]"), "no bench on NET 6");
+        assert!(
+            !six.join("\n").contains("Bench [C]"),
+            "no bench on Classic 2"
+        );
         let seven = screen("net_bench");
         let bench = seven
             .iter()

@@ -369,12 +369,12 @@ each panel's numbers mean is on [the NET page](net.md).
 | `k` | Band Capability | `NET 1` | `K` time the tuning call |
 | `j` | Band Occupancy | `NET 2` | `←→` move the cursor 1 MHz · `B` cursor to the busiest cell · `L` lock the receiver here |
 | `z` | Coexistence | `NET 2` | `↓` back in time: the profile shows that moment · `↑` forward in time · `N` back to now |
-| `u` | Band Census | `NET 3` | `↑↓` select · `S` sort by the next column · `R` reverse · `T` trust as frequency reference, or let it go |
-| `v` | BLE Advertising | `NET 4` | `↑↓` select a packet · `Enter` only this address, or all again · `H` hold the list, or let it run |
-| `b` | Classic Bluetooth Hops | `NET 5` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
-| `c` | Piconets | `NET 5` | `↑↓` select a piconet · `Enter` packet by packet, on NET 6 |
-| `c` | Bench | `NET 7` | `← →` the previous or next piconet |
-| `v` | Packets | `NET 6` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
+| `u` | Band Census | `LE 1` | `↑↓` select · `S` sort by the next column · `R` reverse · `T` trust as frequency reference, or let it go |
+| `v` | BLE Advertising | `LE 2` | `↑↓` select a packet · `Enter` only this address, or all again · `H` hold the list, or let it run |
+| `b` | Classic Bluetooth Hops | `Classic 1` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
+| `c` | Piconets | `Classic 1` | `↑↓` select a piconet · `Enter` packet by packet, on Classic 2 |
+| `c` | Bench | `Classic 3` | `← →` the previous or next piconet |
+| `v` | Packets | `Classic 2` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
 
 `T` in the Census asks how far the trusted device's crystal can be off, in
 ppm, as text you type; `Enter` confirms and `Esc` cancels. This table is

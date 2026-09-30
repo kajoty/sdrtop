@@ -1018,7 +1018,7 @@ mod tests {
         }
     }
 
-    /// NET 6 with two piconets heard, the first with `n` packets kept, one
+    /// Classic 2 with two piconets heard, the first with `n` packets kept, one
     /// a slot apart on stream 1, and the packet list focused.
     fn piconet_view(n: u32) -> (LayoutEngine, crate::app::FocusKeys, Arc<Mutex<SdrMetrics>>) {
         use crate::signal::bt::piconet::{observe, observe_packet, BtPacket, PayloadVerdict};
@@ -1123,7 +1123,7 @@ mod tests {
         assert!(m.net.lock_at.is_none(), "the radio did not move");
     }
 
-    /// Unfocused, `← →` step a locked radio in NET 6 exactly as in NET 5:
+    /// Unfocused, `← →` step a locked radio in Classic 2 exactly as in Classic 1:
     /// the same classic receiver, the same block.
     #[test]
     fn the_piconet_view_steps_the_radio_as_the_classic_view_does() {
