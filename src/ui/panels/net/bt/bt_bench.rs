@@ -33,6 +33,7 @@ use ratatui::{
 
 use super::bt_packets::selected;
 use super::bt_piconets::silence;
+use super::plot::{time_plot, Series};
 use super::sections::{
     index_of, residual_histogram, BR_DELTA_F1_KHZ, BR_INDEX, BR_RATIO, DELTA_F1_RESOLUTION_KHZ,
     DRIFT_LIMIT_KHZ, DRIFT_RATE_LIMIT, DRIFT_RATE_RESOLUTION, DRIFT_RESOLUTION_KHZ, F0_LIMIT_KHZ,
@@ -145,14 +146,11 @@ enum Cell<'a> {
     Text(String),
     /// Nothing on this end, and why, briefly.
     Missing(&'static str),
-    /// A trace of the end's newest packets, oldest on the left, with the
-    /// span it is scaled to.
-    Trend(String, String),
 }
 
 impl Cell<'_> {
-    /// The reading's spans, in `ink` where the cell is a trace.
-    fn spans(&self, ink: Color, theme: &crate::Theme) -> Vec<Span<'static>> {
+    /// The reading's spans.
+    fn spans(&self, theme: &crate::Theme) -> Vec<Span<'static>> {
         match self {
             Cell::Judged(row) => {
                 let mut spans = row.reading_spans(theme);
@@ -169,10 +167,6 @@ impl Cell<'_> {
                 format!("— {why}"),
                 Style::default().fg(theme.stale),
             )],
-            Cell::Trend(trace, span) => vec![
-                Span::styled(trace.clone(), Style::default().fg(ink)),
-                Span::styled(format!(" {span}"), Style::default().fg(theme.label)),
-            ],
         }
     }
 }
@@ -208,11 +202,11 @@ fn side_rows(
         ];
         match cell {
             Cell::Judged(limit) if bar >= BAR_MIN => {
-                spans.extend(exactly(cell.spans(ink, theme), READING_W));
+                spans.extend(exactly(cell.spans(theme), READING_W));
                 spans.push(Span::raw(" "));
                 spans.extend(limit.bar_spans(theme, bar));
             }
-            _ => spans.extend(cell.spans(ink, theme)),
+            _ => spans.extend(cell.spans(theme)),
         }
         fit(Line::from(spans), width)
     };
@@ -222,86 +216,112 @@ fn side_rows(
     ]
 }
 
-/// A trend of both ends on one row: `▶` the master's trace and span, then
-/// `◀` the slave's, each in its end's ink.
-fn trend_row(
-    label: &str,
-    master: Cell<'_>,
-    slave: Cell<'_>,
-    width: usize,
-    inks: Inks,
-    theme: &crate::Theme,
-) -> Line<'static> {
-    let arrow = |a: &str, ink| Span::styled(format!("{a} "), Style::default().fg(ink));
-    let mut spans = vec![
-        crate::ui::chrome::field(label, PAIR_LABEL, theme),
-        Span::raw(" "),
-        arrow("▶", inks.master),
-    ];
-    spans.extend(master.spans(inks.master, theme));
-    spans.push(Span::raw("   "));
-    spans.push(arrow("◀", inks.slave));
-    spans.extend(slave.spans(inks.slave, theme));
-    fit(Line::from(spans), width)
-}
+/// How far back a plot reaches, at most.
+const PLOT_SPAN_S: f64 = 60.0;
 
-/// The most braille cells a trend takes, two points to a cell.
-const TREND_CELLS: usize = 16;
+/// The rows of braille a plot is drawn in.
+const PLOT_ROWS: usize = 6;
 
-/// The most packets a trend point averages. One header's reading is
-/// noisy, and a trace of single readings is a solid block that shows the
-/// noise and hides the drift; a point is the mean of a few consecutive
-/// packets instead, so what moves is the side, not the scatter.
-const TREND_GROUP: usize = 4;
+/// The fewest packets a plot point averages. One header's reading is
+/// noisy, and a trace of single readings is a band that shows the noise
+/// and hides the drift; a point is the mean of a few consecutive packets
+/// instead, so what moves is the end, not the scatter.
+const PLOT_GROUP: usize = 4;
 
-/// A trend of `value` over one side's newest packets that have it: each
-/// point the mean of consecutive packets, oldest on the left and the
-/// newest at the right edge, scaled to the points' span, which is stated
-/// beside it with `places` decimals. Missing below four points, where a
-/// trace is a guess at a shape.
-fn trend(
+/// The most points a plot is drawn from: about a dot column each.
+const PLOT_POINTS: usize = 100;
+
+/// One end's plot series: `value` over its packets of the last
+/// `PLOT_SPAN_S` that have it, each point the mean of `group` consecutive
+/// ones placed at their mean age, oldest first.
+fn series(
     p: &Piconet,
     direction: Direction,
-    places: usize,
-    width: usize,
+    ink: Color,
+    group: usize,
+    now: std::time::Instant,
     value: impl Fn(&crate::signal::bt::piconet::BtPacket) -> Option<f64>,
-) -> Cell<'static> {
-    // Two ends on one row: each gets half of what the label and arrows
-    // leave, less its span's text.
-    let cells = (width.saturating_sub(LABEL_COLUMN + 7) / 2)
-        .saturating_sub(12)
-        .clamp(4, TREND_CELLS);
-    let mut values: Vec<f64> = p
+) -> Series {
+    let mut readings: Vec<(f64, f64)> = p
         .packets
         .iter()
         .filter(|k| k.direction == Some(direction))
-        .filter_map(&value)
-        .take(cells * 2 * TREND_GROUP)
+        .filter_map(|k| {
+            let age = now.saturating_duration_since(k.seen).as_secs_f64();
+            if age > PLOT_SPAN_S {
+                return None;
+            }
+            Some((age, value(k)?))
+        })
         .collect();
-    values.reverse();
-    // As many packets a point as fill the trace, and no more than
-    // TREND_GROUP; the oldest few that do not make a whole point are left.
-    let group = values.len().div_ceil(cells * 2).clamp(1, TREND_GROUP);
-    let skip = values.len() % group;
-    let points: Vec<f64> = values[skip..]
-        .chunks(group)
-        .map(|g| g.iter().sum::<f64>() / g.len() as f64)
+    readings.reverse();
+    let points = readings
+        .chunks_exact(group)
+        .map(|g| {
+            let n = g.len() as f64;
+            (
+                g.iter().map(|r| r.0).sum::<f64>() / n,
+                g.iter().map(|r| r.1).sum::<f64>() / n,
+            )
+        })
         .collect();
-    if points.len() < 4 {
-        return Cell::Missing("too few packets");
-    }
-    let (lo, hi) = points
+    Series { points, ink }
+}
+
+/// How many packets a point averages, alike for both ends so their points
+/// are alike: `PLOT_GROUP`, or more where that would give more points than
+/// the plot has room for.
+fn group_for(p: &Piconet) -> usize {
+    let most = [Direction::Master, Direction::Slave]
         .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-            (lo.min(*v), hi.max(*v))
-        });
-    let data: Vec<f32> = points.iter().map(|v| *v as f32).collect();
-    Cell::Trend(
-        // Exactly as many cells as there are points for, so the newest is
-        // at the right edge.
-        crate::ui::widgets::charts::mini_braille_line(&data, points.len().div_ceil(2)),
-        format!("{lo:.places$}–{hi:.places$}"),
-    )
+        .map(|d| p.packets.iter().filter(|k| k.direction == Some(*d)).count())
+        .max()
+        .unwrap_or(0);
+    most.div_ceil(PLOT_POINTS).max(PLOT_GROUP)
+}
+
+/// A plot of `value` for both ends under a title that says what a point
+/// is, or a quiet line saying there are too few packets for one yet.
+#[allow(clippy::too_many_arguments)]
+fn plot_lines(
+    p: &Piconet,
+    title: &str,
+    places: usize,
+    width: usize,
+    inks: Inks,
+    now: std::time::Instant,
+    theme: &crate::Theme,
+    value: impl Fn(&crate::signal::bt::piconet::BtPacket) -> Option<f64> + Copy,
+) -> Vec<Line<'static>> {
+    let group = group_for(p);
+    let (m, s) = (
+        series(p, Direction::Master, inks.master, group, now, value),
+        series(p, Direction::Slave, inks.slave, group, now, value),
+    );
+    let plot = time_plot(
+        [&m, &s],
+        PLOT_ROWS,
+        width.saturating_sub(1),
+        places,
+        PLOT_SPAN_S,
+        theme,
+    );
+    if plot.is_empty() {
+        return vec![quiet(
+            format!("{title}: too few packets for a plot yet"),
+            theme,
+        )];
+    }
+    let mut out = vec![Line::from(Span::styled(
+        format!(" {title}, means of {group} packets"),
+        Style::default().fg(theme.label),
+    ))];
+    out.extend(plot.into_iter().map(|l| {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(l.spans);
+        Line::from(spans)
+    }));
+    out
 }
 
 /// The MODULATION section: each end's index, df1 and df2/df1 against the
@@ -364,14 +384,8 @@ fn modulation_lines(
     if trends {
         let index =
             |k: &crate::signal::bt::piconet::BtPacket| index_of(&k.deviation).map(|i| i.value());
-        out.push(trend_row(
-            "Mod trend",
-            trend(p, Direction::Master, 3, width, index),
-            trend(p, Direction::Slave, 3, width, index),
-            width,
-            inks,
-            theme,
-        ));
+        let now = std::time::Instant::now();
+        out.extend(plot_lines(p, "index", 3, width, inks, now, theme, index));
     }
     // The headers a busy neighbour kept from being read
     // (`signal::net::measure`), a warning rather than a footnote.
@@ -441,23 +455,6 @@ fn carrier_lines(
         theme,
     )];
     out.extend(side_rows("f0", f0(m), f0(s), width, inks, theme));
-    if trends {
-        // Each packet's own f0, in kHz of its channel, corrected as the row
-        // is.
-        let f0_of = |k: &crate::signal::bt::piconet::BtPacket| {
-            let hz = crate::signal::bt::channel::centre_hz(k.channel)?;
-            let (ppm, _) = state.radio.corrected_ppm(k.f0_ppm?, now);
-            Some(ppm.value() * hz as f64 / 1e9)
-        };
-        out.push(trend_row(
-            "f0 trend",
-            trend(p, Direction::Master, 1, width, f0_of),
-            trend(p, Direction::Slave, 1, width, f0_of),
-            width,
-            inks,
-            theme,
-        ));
-    }
     out.extend(side_rows(
         "Drift worst",
         drift(m),
@@ -474,6 +471,16 @@ fn carrier_lines(
         inks,
         theme,
     ));
+    if trends {
+        // Each packet's own f0, in kHz of its channel, corrected as the row
+        // is.
+        let f0_of = |k: &crate::signal::bt::piconet::BtPacket| {
+            let hz = crate::signal::bt::channel::centre_hz(k.channel)?;
+            let (ppm, _) = state.radio.corrected_ppm(k.f0_ppm?, now);
+            Some(ppm.value() * hz as f64 / 1e9)
+        };
+        out.extend(plot_lines(p, "f0 kHz", 1, width, inks, now, theme, f0_of));
+    }
     out
 }
 
@@ -1012,6 +1019,9 @@ mod tests {
                 PayloadVerdict::NoPayload,
             );
             p.deviation = around(df1_hz(k));
+            // A second apart, the oldest first, so the plot has a time
+            // axis to place them on.
+            p.seen = Instant::now() - std::time::Duration::from_secs((n - k) as u64);
             p.f0_ppm = Some(crate::signal::dsp::uncertainty::Uncertain::from_sigma(
                 khz(k) * 1e3 / 2_475e6 * 1e6,
                 0.05,
@@ -1031,13 +1041,14 @@ mod tests {
             .collect()
     }
 
-    /// A trend per side from its newest packets' own readings, oldest on
-    /// the left, with the span it is scaled to beside it, so a trace that
-    /// fills its cell is not read as a large change.
+    /// The trends are plots: both ends on one time axis and one scale, each
+    /// point the mean of a few packets, which the title says; a rising
+    /// master climbs from the bottom left to the top right.
     #[test]
     fn the_trend_follows_the_ring() {
         let mut m = heard();
-        // The master's index rises from 0.320 to 0.340; the slave's holds.
+        // The master's index rises from 0.320 to 0.340; the slave's holds
+        // lower, rising a little.
         readings(
             &mut m,
             Direction::Master,
@@ -1054,29 +1065,50 @@ mod tests {
             |k| 159_000.0 + k as f32 * 100.0,
             |k| -12.0 - k as f64 * 0.1,
         );
-        let out = draw(NetBtBenchPanel, 191, 60, &m);
+        let out = draw(NetBtBenchPanel, 191, 40, &m);
         let text = out.join("\n");
-        let row = out.iter().find(|l| l.contains("Mod trend")).expect(&text);
-        // The span of the drawn points, each the mean of a few packets.
-        let span = row
-            .split_whitespace()
-            .find(|w| w.starts_with("0.3") && w.contains('–'))
-            .expect(row);
-        let (lo, hi) = span.split_once('–').expect(span);
-        let (lo, hi): (f64, f64) = (lo.parse().unwrap(), hi.parse().unwrap());
+        // The MODULATION column, its frame edge and rules stripped.
+        let column: Vec<String> = out
+            .iter()
+            .map(|l| columns_of(l).first().cloned().unwrap_or_default())
+            .collect();
+        let title = column
+            .iter()
+            .position(|l| l.contains("index, means of"))
+            .expect(&text);
+        let label = |row: &str| -> f64 {
+            row.split_whitespace()
+                .next()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let (top, bottom) = (&column[title + 1], &column[title + 6]);
         assert!(
-            (lo - 0.320).abs() < 0.002 && (hi - 0.340).abs() < 0.002,
-            "{row}"
+            (label(top) - 0.34).abs() < 0.004,
+            "the top of the scale: {text}"
         );
-        let slave_at = row[..row.find('◀').expect(row)].chars().count();
-        let master = braille(row, 0);
-        assert!(master.len() >= 4, "{row}");
-        // Rising: the oldest at the bottom dot, the newest at the top.
-        assert_ne!(master[0] & 0x40, 0, "{row}");
-        assert_ne!(master[master.len() - 1] & 0x08, 0, "{row}");
-        assert!(!braille(row, slave_at).is_empty(), "the slave's too: {row}");
-        let f0 = out.iter().find(|l| l.contains("f0 trend")).expect(&text);
-        assert!(f0.contains("-13.9–-12.0"), "{f0}");
+        assert!((label(bottom) - 0.32).abs() < 0.004, "the bottom: {text}");
+        let lit = |row: &str| braille(row, 0).iter().map(|&c| c != 0).collect::<Vec<_>>();
+        // The newest point is at its time, the mean age of its packets, so
+        // a little short of `now`: in the right half, not at the edge.
+        let (t, b) = (lit(top), lit(bottom));
+        assert!(
+            t[t.len() / 2..].iter().any(|&x| x),
+            "the newest master top right: {text}"
+        );
+        assert!(b[0], "the oldest at the bottom left: {text}");
+        assert!(column[title + 7].contains("now"), "{text}");
+        // f0: the master near +3 kHz, the slave falling from -12 to -14.
+        let f0: Vec<String> = out
+            .iter()
+            .map(|l| columns_of(l).get(1).cloned().unwrap_or_default())
+            .collect();
+        let at = f0
+            .iter()
+            .position(|l| l.contains("f0 kHz, means of"))
+            .expect(&text);
+        assert!(label(&f0[at + 1]) > 2.5, "{text}");
+        assert!(label(&f0[at + 6]) < -13.0, "{text}");
     }
 
     /// Too narrow for two columns, each reading goes on a line of its own,
