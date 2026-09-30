@@ -35,7 +35,7 @@ use super::bt_packets::selected;
 use super::bt_piconets::silence;
 use super::plot::{time_plot, Series};
 use super::sections::{
-    index_of, residual_histogram, BR_DELTA_F1_KHZ, BR_INDEX, BR_RATIO, DELTA_F1_RESOLUTION_KHZ,
+    index_of, residual_shape, BR_DELTA_F1_KHZ, BR_INDEX, BR_RATIO, DELTA_F1_RESOLUTION_KHZ,
     DRIFT_LIMIT_KHZ, DRIFT_RATE_LIMIT, DRIFT_RATE_RESOLUTION, DRIFT_RESOLUTION_KHZ, F0_LIMIT_KHZ,
     F0_RESOLUTION_KHZ, INDEX_RESOLUTION, JITTER_LIMIT_US, JITTER_RESOLUTION_US, RATIO_RESOLUTION,
 };
@@ -79,9 +79,10 @@ fn quiet(text: String, theme: &crate::Theme) -> Line<'static> {
     ))
 }
 
-/// A note under a plot: what it rests on, in the label ink.
+/// A note under a plot: what it rests on, in the label ink, whole (three
+/// rows at most, enough for the longest at a column's width).
 fn footnote(text: &str, width: usize, theme: &crate::Theme) -> Vec<Line<'static>> {
-    crate::ui::chrome::wrap(text, width.saturating_sub(1), 2)
+    crate::ui::chrome::wrap(text, width.saturating_sub(1), 3)
         .into_iter()
         .map(|chunk| {
             Line::from(Span::styled(
@@ -487,15 +488,24 @@ fn carrier_lines(
 /// Each side's residuals on the piconet's grid: its packets on the stream
 /// the grid was fitted on, read against it.
 fn residuals(p: &Piconet, direction: Direction) -> Vec<f64> {
+    residuals_of(p, Some(direction))
+}
+
+/// The residuals of the packets sent by `direction`, or by no one known
+/// yet (`None`: an ID, or a header before the clock was known).
+fn residuals_of(p: &Piconet, direction: Option<Direction>) -> Vec<f64> {
     let Some(Ok(fit)) = p.slots.as_ref() else {
         return Vec::new();
     };
     p.packets
         .iter()
-        .filter(|k| k.stream == p.slots_stream && k.direction == Some(direction))
+        .filter(|k| k.stream == p.slots_stream && k.direction == direction)
         .filter_map(|k| fit.residual_at(k.at_us))
         .collect()
 }
+
+/// The rows of eighth blocks the timing shape is drawn in.
+const SHAPE_ROWS: usize = 6;
 
 /// The TIMING section: each end's jitter about its own average, the
 /// slave's place against the master's, the residuals' shape, and the
@@ -584,18 +594,41 @@ fn timing_lines(
             // the shape whether it is one spread or two, as when a slave
             // answers a little late on every slot and stands as its own hump.
             if plots {
-                let (bars, beyond) = residual_histogram(&f.residuals_us, width, inks.master, theme);
-                out.extend(bars);
+                // The shape stacked by who sent each packet, so an offset
+                // between the ends is two humps of two colours.
+                let unknown = residuals_of(p, None);
+                let (shape, beyond) = residual_shape(
+                    [&master, &slave, &unknown],
+                    SHAPE_ROWS,
+                    width,
+                    [inks.master, inks.slave, theme.stale],
+                    theme,
+                );
+                if !shape.is_empty() {
+                    out.extend(shape);
+                    out.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("▶ master".to_string(), Style::default().fg(inks.master)),
+                        Span::raw("  "),
+                        Span::styled("◀ slave".to_string(), Style::default().fg(inks.slave)),
+                        Span::raw("  "),
+                        Span::styled(
+                            "· not yet placed".to_string(),
+                            Style::default().fg(theme.stale),
+                        ),
+                    ]));
+                }
                 let span = crate::ui::widgets::timing_fmt::seconds_ms((f.span_us / 1e3) as u64);
                 let beyond = if beyond > 0 {
                     format!(", {beyond} beyond the plot's 1.5")
                 } else {
                     String::new()
                 };
+                let placed = master.len() + slave.len() + unknown.len();
                 out.extend(footnote(
                     &format!(
-                        "residual from the grid, us{beyond}: {} hits over {span}, every \
-                         member's; hits dated to 0.25 us",
+                        "residual from the grid of {} hits over {span}, us{beyond}: {placed} \
+                         packets kept, by who sent them; hits dated to 0.25 us",
                         f.hits
                     ),
                     width,
@@ -1263,23 +1296,39 @@ mod tests {
         assert!(!text.contains("relative to our own oscillator"), "{text}");
     }
 
-    /// The residuals as a shape, every member's, with what they rest on:
-    /// the plot that shows a slave answering late as a hump of its own.
+    /// The residuals as a shape stacked by who sent them, with a legend and
+    /// what they rest on: the plot that shows a slave answering late as a
+    /// hump of its own.
     #[test]
     fn the_grid_residuals_are_plotted_with_what_they_rest_on() {
         let mut m = heard();
-        let times: Vec<f64> = (0..60u32)
-            .map(|k| f64::from(k) * 1e6 + if k % 2 == 0 { 0.0 } else { 0.3 })
-            .collect();
-        m.net.bt_piconets[0].slots = Some(crate::signal::bt::slots::fit(&times));
-        let out = draw(NetBtBenchPanel, 191, 80, &m).join("\n");
-        assert!(out.contains("residual from the grid"), "{out}");
-        assert!(out.contains("60 hits over"), "{out}");
-        assert!(out.contains("every member's"), "{out}");
+        let mut times = Vec::new();
+        let mut packets = Vec::new();
+        for k in 0..40u32 {
+            let master = k % 2 == 0;
+            let t = 1_000.0 + k as f64 * 625.0 + if master { 0.0 } else { 1.0 };
+            times.push(t);
+            let d = if master {
+                Direction::Master
+            } else {
+                Direction::Slave
+            };
+            packets.push(packet(t, 1 - k as u8 % 2, d, PayloadVerdict::NoPayload));
+        }
+        let p = &mut m.net.bt_piconets[0];
+        p.slots = Some(crate::signal::bt::slots::fit(&times));
+        p.slots_stream = 1;
+        for k in packets {
+            observe_packet(&mut m.net.bt_piconets, LAP, k);
+        }
+        let out = draw(NetBtBenchPanel, 191, 40, &m).join("\n");
+        assert!(out.contains("residual from the grid of 40 hits"), "{out}");
         assert!(
-            out.contains('\u{2588}') || out.contains('\u{2584}'),
-            "a bar drawn: {out}"
+            out.contains("40 packets") && out.contains("by who sent them"),
+            "{out}"
         );
+        assert!(out.contains("· not yet placed"), "the legend: {out}");
+        assert!(out.contains('\u{2588}'), "a bar drawn: {out}");
     }
 
     /// The whole piconet's facts are the Classic view's now: the bench has

@@ -229,30 +229,32 @@ pub(super) fn channel_runs(mask: u128) -> String {
 /// The residual plot's reach either side of the grid, µs: past the 1 µs
 /// limit, so a residual beyond it shows as one.
 const PLOT_US: f64 = 1.5;
-/// Its height in rows of eighth blocks.
-const PLOT_ROWS: usize = 3;
 
-/// Where each hit sat against the grid:
-/// residuals from −[`PLOT_US`] to +[`PLOT_US`] in bars of the piconet's
-/// own colour, the specification's ±1 µs (2.2.5) as `┊` rules in the
-/// warning ink, zero as a dim one, and a tick and label row under them. The
-/// numbers say how wide the spread is; the shape says whether it is one
-/// spread or two, as when a peripheral answers a little late on every slot
-/// and stands as its own hump. Returns the lines, empty where the width
-/// cannot hold a readable plot, and how many residuals fell beyond it.
-pub(super) fn residual_histogram(
-    residuals: &[f32],
+/// The residuals of one piconet as a shape, stacked by who sent them: the
+/// master's in `inks[0]`, then the slave's in `inks[1]`, then those of
+/// unknown sender in `inks[2]` (the stale ink), so the two ends stand as
+/// two humps of two colours when their timing differs, and nothing is put
+/// on a side it was not heard from. `rows` rows of eighth blocks over
+/// −[`PLOT_US`] to +[`PLOT_US`], the specification's ±1 µs (2.2.5) as `┊`
+/// rules in the warning ink and zero as a dim one, then a tick row and a
+/// label row. A cell shows one colour: the part that fills most of it.
+/// Returns the lines, empty where the width cannot hold a readable plot,
+/// and how many residuals fell beyond it.
+pub(super) fn residual_shape(
+    by_side: [&[f64]; 3],
+    rows: usize,
     iw: usize,
-    colour: ratatui::style::Color,
+    inks: [ratatui::style::Color; 3],
     theme: &crate::Theme,
 ) -> (Vec<Line<'static>>, usize) {
     const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let cols = iw.saturating_sub(4);
-    let beyond = residuals
+    let beyond = by_side
         .iter()
-        .filter(|r| (r.abs() as f64) >= PLOT_US)
+        .flat_map(|side| side.iter())
+        .filter(|r| r.abs() >= PLOT_US)
         .count();
-    if cols < 15 {
+    if cols < 15 || rows == 0 {
         return (Vec::new(), beyond);
     }
     let col_of = |x: f64| {
@@ -260,30 +262,70 @@ pub(super) fn residual_histogram(
             .floor()
             .clamp(0.0, cols as f64 - 1.0) as usize
     };
-    let mut bins = vec![0u32; cols];
-    for &r in residuals.iter().filter(|r| (r.abs() as f64) < PLOT_US) {
-        bins[col_of(r as f64)] += 1;
+    let mut bins = vec![[0u32; 3]; cols];
+    for (k, side) in by_side.iter().enumerate() {
+        for &r in side.iter().filter(|r| r.abs() < PLOT_US) {
+            bins[col_of(r)][k] += 1;
+        }
     }
-    let most = bins.iter().copied().max().unwrap_or(0).max(1);
+    let most = bins
+        .iter()
+        .map(|b| b.iter().sum::<u32>())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let scale = (rows * 8) as f64 / most as f64;
+    // Each bin's segments as tops in eighths, stacked master, slave,
+    // unknown, rounded cumulatively so the whole bar is its total's height.
+    let tops: Vec<[usize; 3]> = bins
+        .iter()
+        .map(|b| {
+            let mut sum = 0;
+            let mut t = [0usize; 3];
+            for k in 0..3 {
+                sum += b[k];
+                t[k] = (sum as f64 * scale).round() as usize;
+            }
+            t
+        })
+        .collect();
     let limits = [col_of(-1.0), col_of(1.0)];
     let zero = col_of(0.0);
-    let mut out = Vec::with_capacity(PLOT_ROWS + 2);
-    for row in 0..PLOT_ROWS {
-        let base = (PLOT_ROWS - 1 - row) * 8;
+    let mut out = Vec::with_capacity(rows + 2);
+    for row in 0..rows {
+        let base = (rows - 1 - row) * 8;
         let mut spans = vec![Span::raw("  ")];
-        for (c, &n) in bins.iter().enumerate() {
-            let fill = ((n as f64 / most as f64 * (PLOT_ROWS * 8) as f64).round() as usize)
-                .saturating_sub(base)
-                .min(8);
-            spans.push(if fill > 0 {
-                Span::styled(EIGHTHS[fill].to_string(), Style::default().fg(colour))
+        for (c, t) in tops.iter().enumerate() {
+            let fill = t[2].saturating_sub(base).min(8);
+            if fill > 0 {
+                // The segment that fills most of this cell's part.
+                let (lo, hi) = (base, base + fill);
+                let mut bottom = 0;
+                let mut best = (0, 0usize);
+                for (k, &top) in t.iter().enumerate() {
+                    let overlap = top.min(hi).saturating_sub(bottom.max(lo));
+                    if overlap > best.1 {
+                        best = (k, overlap);
+                    }
+                    bottom = top;
+                }
+                spans.push(Span::styled(
+                    EIGHTHS[fill].to_string(),
+                    Style::default().fg(inks[best.0]),
+                ));
             } else if limits.contains(&c) {
-                Span::styled("\u{250a}", Style::default().fg(theme.status_warn))
+                spans.push(Span::styled(
+                    "\u{250a}",
+                    Style::default().fg(theme.status_warn),
+                ));
             } else if c == zero {
-                Span::styled("\u{250a}", Style::default().fg(theme.border_dim))
+                spans.push(Span::styled(
+                    "\u{250a}",
+                    Style::default().fg(theme.border_dim),
+                ));
             } else {
-                Span::raw(" ")
-            });
+                spans.push(Span::raw(" "));
+            }
         }
         out.push(Line::from(spans));
     }
@@ -434,55 +476,87 @@ fn clock_text(hypotheses: u8) -> String {
 mod tests {
     use super::*;
 
-    /// **The residuals as a shape**: each lands in its column, the
-    /// ±1 µs limits and zero are ruled and labelled, and a residual past
-    /// the plot is counted rather than dropped.
-    #[test]
-    fn the_residual_histogram_places_each_hit_and_the_limits() {
-        let theme = crate::Theme::sdr();
-        let colour = theme.series_color(1);
-        // 40 columns across 3 us: 0.075 us each.
-        let (lines, beyond) =
-            residual_histogram(&[0.0, 0.01, 0.02, 0.9, -0.5, 2.0], 44, colour, &theme);
-        assert_eq!(beyond, 1);
-        assert_eq!(lines.len(), PLOT_ROWS + 2);
-        let text = |l: &Line| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        };
-        // The tallest bar (three residuals near zero) reaches the top row.
-        let top = text(&lines[0]);
-        assert_eq!(top.chars().nth(2 + 20), Some('\u{2588}'), "{top:?}");
-        // Limits ruled at -1 and +1 (columns 6 and 33), labelled below.
-        assert_eq!(top.chars().nth(2 + 6), Some('\u{250a}'), "{top:?}");
-        assert_eq!(top.chars().nth(2 + 33), Some('\u{250a}'), "{top:?}");
-        let labels = text(&lines[PLOT_ROWS + 1]);
-        assert!(labels.contains("-1") && labels.contains("+1"), "{labels:?}");
-        // The limit rules are in the warning ink, the bars in the colour.
-        let limit_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.content == "\u{250a}")
-            .unwrap();
-        assert_eq!(limit_span.style.fg, Some(theme.status_warn));
-        let bar = lines[2]
-            .spans
-            .iter()
-            .find(|s| s.content != " " && s.content != "\u{250a}" && s.content != "  ")
-            .unwrap();
-        assert_eq!(bar.style.fg, Some(colour));
-        // Too narrow for a readable plot: none, and still the count.
-        assert_eq!(
-            residual_histogram(&[3.0], 16, colour, &theme),
-            (Vec::new(), 1)
-        );
-    }
-
     #[test]
     fn channel_runs_join_neighbours() {
         assert_eq!(channel_runs(0), "");
         assert_eq!(channel_runs(0b1111 << 2 | 1 << 17 | 1 << 78), "2-5, 17, 78");
+    }
+
+    /// The residuals stacked by who sent them: each end in its own colour,
+    /// the master's below where a bin holds both, those of unknown sender
+    /// in the stale ink and never on a side; the limits ruled, the axis
+    /// labelled, and what fell past the plot counted.
+    #[test]
+    fn each_end_stands_in_its_own_colour() {
+        let theme = crate::Theme::sdr();
+        let (m, s) = (theme.series_color(1), theme.value);
+        let inks = [m, s, theme.stale];
+        let master: Vec<f64> = vec![-1.2; 12];
+        let slave: Vec<f64> = vec![1.2; 12];
+        let unknown: Vec<f64> = vec![0.0; 4];
+        let (lines, beyond) = residual_shape([&master, &slave, &unknown], 6, 64, inks, &theme);
+        assert_eq!(beyond, 0);
+        assert_eq!(lines.len(), 6 + 2, "six rows, the ticks, the labels");
+        let inks_of = |col: usize| -> Vec<Option<ratatui::style::Color>> {
+            lines[..6]
+                .iter()
+                .filter_map(|l| {
+                    let span = l.spans.get(1 + col)?;
+                    (span.content != " " && span.content != "\u{250a}").then_some(span.style.fg)
+                })
+                .collect()
+        };
+        let cols = 60;
+        let col_of = |x: f64| ((x + 1.5) / 3.0 * cols as f64).floor() as usize;
+        assert!(
+            inks_of(col_of(-1.2)).iter().all(|c| *c == Some(m)),
+            "{:?}",
+            inks_of(col_of(-1.2))
+        );
+        assert!(!inks_of(col_of(-1.2)).is_empty());
+        assert!(inks_of(col_of(1.2)).iter().all(|c| *c == Some(s)));
+        assert!(inks_of(col_of(0.0)).iter().all(|c| *c == Some(theme.stale)));
+
+        // One bin with both: the master's part below, the slave's above.
+        let (lines, _) = residual_shape([&[0.5; 6], &[0.5; 6], &[]], 6, 64, inks, &theme);
+        let column: Vec<_> = lines[..6]
+            .iter()
+            .map(|l| l.spans[1 + col_of(0.5)].style.fg)
+            .collect();
+        assert_eq!(
+            column.first(),
+            Some(&Some(s)),
+            "the slave's on top: {column:?}"
+        );
+        assert_eq!(
+            column.last(),
+            Some(&Some(m)),
+            "the master's below: {column:?}"
+        );
+
+        // The axis, and what fell past it.
+        let (lines, beyond) = residual_shape([&[2.0, 0.1], &[-3.0], &[]], 6, 64, inks, &theme);
+        assert_eq!(beyond, 2);
+        let labels: String = lines[7]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(labels.contains("-1") && labels.contains("+1"), "{labels:?}");
+        let rule = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "\u{250a}")
+            .unwrap();
+        assert_eq!(
+            rule.style.fg,
+            Some(theme.status_warn),
+            "the limits in the warning ink"
+        );
+        // Too narrow for a readable plot: none, and still the count.
+        assert_eq!(
+            residual_shape([&[3.0], &[], &[]], 6, 16, inks, &theme),
+            (Vec::new(), 1)
+        );
     }
 }
