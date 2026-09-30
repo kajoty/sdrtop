@@ -13,7 +13,7 @@ The section only appears on a radio that reaches the band and can sample fast
 enough for its cheapest mode. On one that cannot, the section is hidden and
 the log says why in one line.
 
-Six views, one question each. The key is the number to press while the NET
+Seven views, one question each. The key is the number to press while the NET
 section is active:
 
 | Key | View | The question it answers |
@@ -23,7 +23,8 @@ section is active:
 | `NET 3` | **Census** | Who is here? |
 | `NET 4` | **BLE** | What is this device advertising, and is its transmitter any good? |
 | `NET 5` | **Classic** | Who is running a classic Bluetooth piconet near me? |
-| `NET 6` | **Piconet** | What is this one piconet saying, packet by packet, and how good is each end? |
+| `NET 6` | **Piconet** | What is this one piconet saying, packet by packet? |
+| `NET 7` | **Bench** | How good is each end of it, side by side? |
 
 The panels with controls announce them with a highlighted letter in the
 title; the full list is in [Keyboard Shortcuts](keys.md#net-panel-focus-modes).
@@ -385,7 +386,7 @@ The selected packet, spelled out:
   them, which means an average under the floor is a real finding and one
   over it is not a promise. Both are read as the test suite defines them,
   from whatever bits the packet carried, the way a classic piconet's are
-  (see [the bench](#the-bench-focus-c) below); on LE 1M the packet is taken again
+  (see [the bench](#bench--net-7-focus-c) below); on LE 1M the packet is taken again
   from the raw samples and timed from the access address, on LE 2M read
   through the receiver's own filter.
 
@@ -478,31 +479,54 @@ headers are read at that clock and no other. A header that could still be
 read two ways is left unread rather than read the likelier way. The column
 shows `32 left`, `2 left` or the value.
 
-The selected piconet is summed up under the roster: its LAP, its UAP in
-words, and one line of readings, every member's pooled: the modulation
-`index`, the carrier `f0`, and the `grid rms`, how far its hits land from the
-piconet's slot grid (every member's together, so it is not a jitter; the
-bench has each end's). `Enter` opens [the Piconet view](#piconet--net-6) on
-it, where the same piconet is taken apart packet by packet and end by end.
-An inquiry code or a page is not a piconet the Piconet view could open, so
-their whole account stays here.
+The selected piconet is spelled out under the roster, as a whole: the rule
+of the three classic views is that the piconet as one thing is here, its
+packets on NET 6 and each of its two ends on NET 7.
+
+- **PICONET**: its LAP, its **UAP** and what that rests on ("resolved by a
+  payload CRC" and how many CRCs pass under it, or the candidates left, two
+  being where an encrypted link stays, see [Reasoned, not
+  verified](#reasoned-not-verified)), when it was heard and on which of the
+  79 channels, and its slot **clock**. The clock comes from the piconet's
+  625 µs slot grid, fitted to every member's hits: slots that run long on
+  our clock mean a master whose crystal runs slow. Without a frequency
+  reference it is shown relative to our own oscillator, like every other
+  ppm here; with one it is corrected and said to be inside, at the edge of
+  or outside the specification's 20 ppm. This assumes the radio's tuner and
+  its sample clock share one crystal, which is true of a HackRF and an
+  RTL-SDR. The Classic export carries it as `clock_ppm`. Beside it, the
+  grid's rms: every member's hits together, so it is not a jitter (the two
+  ends' offset from each other is in it; NET 7 has each end's). Last, one
+  line of pooled readings, the modulation `index` and the carrier `f0`,
+  every member's.
+- **HEADERS**: once the UAP is one value, what the piconet's headers say
+  over the session: how many were read of those captured, how many did not
+  decode under the resolved UAP (a rising count is how a wrong UAP would
+  show), the packet types, the logical transport addresses in use (`0` is
+  broadcast), and how the hunt for the clock stands. Before that, nothing
+  is read or guessed.
+
+
+`Enter` opens [the Piconet view](#piconet--net-6) on the selected piconet,
+and `7` [the Bench](#bench--net-7-focus-c). An inquiry code or a page is not a
+piconet either could open, so their whole account stays here. A short panel
+keeps what fits whole and names the rest.
 
 ---
 
 ## Piconet · `NET 6`
 
-One piconet, taken apart: its packets as a list, and beside them a bench
-with the master's figures and the slave's side by side. If the Classic view
-is the room, this is one conversation in it: overheard, timed and measured,
-and still not understood, which is the polite way round. It is the piconet
-selected in the Classic view: `Enter` on the roster brings it here, and so
-does `6` with a piconet selected. `← →`, with either panel focused, step to
-the previous or next piconet in the roster's order. With none heard, or none
-selected, both panels say which of those it is.
+One piconet, packet by packet: its packet list, the whole screen. If the
+Classic view is the room, this is one conversation in it: overheard, timed
+and measured, and still not understood, which is the polite way round. It
+is the piconet selected in the Classic view: `Enter` on the roster brings it
+here, and so does `6` with a piconet selected. `← →`, with the list
+focused, step to the previous or next piconet in the roster's order. With
+none heard, or none selected, the list says which of those it is.
 
 The classic receiver runs here exactly as on the Classic view, same channels,
-same `← →` steps for a locked radio when nothing is focused, so the two views
-are two readings of one stream of hits.
+same `← →` steps for a locked radio when nothing is focused, so the three
+classic views are three readings of one stream of hits.
 
 ### Who sent it
 
@@ -544,7 +568,8 @@ as a jump. After a stream restart (a rate change, `Space` off and on) it is
 blank, and so is `SLOT µs` for a packet from before the grid was fitted:
 times from another run of the stream are on another clock.
 
-`MOD` and `f0` are single readings from one header, noisier than the bench's
+`MOD` and `f0` are single readings from one header, noisier than [the
+bench's](#bench--net-7-focus-c)
 and printed to the places their own uncertainty allows, a dash where it
 allows none. A value outside its limit turns amber or red, as on the bench;
 everything inside keeps the ordinary ink, so a problem is the thing that
@@ -576,15 +601,19 @@ or lets it run, `End` is live again. Held, the title says what the pause is
 costing (`[+37 NEW]`). The last line counts the session's packets by end,
 and the ones not yet placed.
 
-### The bench *(focus `c`)*
+---
 
-The piconet's measurements, the master's column and the slave's, under one
-heading per section with the limit it is held to:
+## Bench · `NET 7` *(focus `c`)*
 
-- The **UAP** and what it rests on: "resolved by a payload CRC" and how many
-  CRCs pass under it, or how many candidates are left.
-- The link's **LT_ADDRs and packet types** in the packets kept, the most
-  sent first, and the **channels** it was heard on, of all 79, as runs.
+The same piconet, each end of it side by side: three columns, MODULATION,
+CARRIER and TIMING, every reading two rows, `▶` the master's in the
+piconet's colour and `◀` the slave's in the ordinary ink, each with its bar
+on the same row, held against the limit the column's heading cites. The
+heading also says what the readings rest on (`258 hdr`, `1204 hits`). A side
+with nothing yet says so in words, never a zero. `7` opens it on the
+piconet selected in the Classic view; `← →`, with the bench focused, step
+through the piconets.
+
 - **Modulation**: each end's BR modulation index and deviation against
   0.28 to 0.35, read from the Core Specification, from every header's
   symbols. Read the way the SIG's test suite defines them, which took some
@@ -624,45 +653,40 @@ heading per section with the limit it is held to:
   the receiver that finds packets, because one wrong bit there looked like
   30 kHz of drift. Noise makes drift too, as it does on BLE: see the
   Modulation note in the BLE view's detail.
-- **Timing**: the piconet's 625 µs slot grid, fitted to every member's hits.
-  Below eight hits it is collecting; hits that do not line up on a grid
-  beyond chance are refused as one, never forced onto it. Given enough
-  periods to try, a dozen points will line up with almost anything, and the
-  panel would rather say "no grid" than find one it wanted to find. The fit
-  gives the piconet's **clock**: slots that run long on our clock mean a
-  master whose crystal runs slow. Without a frequency reference it is shown
-  relative to our own oscillator, like every other ppm here; with one it is
-  corrected and held against the specification's 20 ppm. This assumes the
-  radio's tuner and its sample clock share one crystal, which is true of a
-  HackRF and an RTL-SDR. The Classic export carries it as `clock_ppm`.
+- **Timing**: each end's timing on the piconet's 625 µs slot grid, fitted to
+  every member's hits. Below eight hits it is collecting; hits that do not
+  line up on a grid beyond chance are refused as one, never forced onto it.
+  Given enough periods to try, a dozen points will line up with almost
+  anything, and the panel would rather say "no grid" than find one it
+  wanted to find. (The piconet's clock from the same grid is the whole
+  piconet's, so it is on NET 5.)
 
   Each end's **jitter** is its own packets' scatter about their own average
   timing, which is how 2.2.5 states it, held against its 1 µs. The grid
   belongs to neither end, so where each end sits on it means little alone;
   how far the slave's packets sit from the master's (`offset`) is the
   difference of the two averages, and that the grid cannot move. Under it,
-  every member's residuals as a shape, the ±1 µs limits ruled: one hump is
-  one timing, and a slave answering a little late on every slot stands as a
-  hump of its own.
-- **Headers**: once the UAP is one value, what the piconet's headers say
-  over the session: how many were read of those captured, how many did not
-  decode under the resolved UAP (a rising count is how a wrong UAP would
-  show), the packet types, the logical transport addresses in use (`0` is
-  broadcast), and how the hunt for the clock stands. Before that, nothing
-  is read or guessed.
+  the residuals as a shape, the ±1 µs limits ruled, **stacked by who sent
+  them**: the master's in the piconet's colour, the slave's in the ordinary
+  ink, and the packets of unknown sender in the stale grey on top, never
+  put on a side. One hump is one timing; a slave answering a little late on
+  every slot stands as a hump of its own colour.
 
-Each end also gets a **trend** of its index and f0 over its newest packets,
-oldest on the left. Every point is the mean of a few packets, because one
-header's reading is noisy and a line of single readings is a solid block
-that shows the noise and hides the drift. The trace fills its row whatever
-it is doing, so the span it is scaled to is written beside it: a trace
-climbing from wall to wall across `0.333–0.335` is a transmitter holding
-steady, and one climbing across `0.30–0.34` is warming up. A slowly moving
-f0 in the minutes after a device switches on is exactly that.
+Under MODULATION the index and under CARRIER f0 are **plotted** over the
+last minute: both ends on one time axis and one scale, each in its colour,
+so whether the two read alike and whether either is moving shows at a
+glance. Each point is the mean of a few packets (the title says how many),
+because one header's reading is noisy and a line of single readings is a
+band that shows the noise and hides the drift. The scale's ends are written
+on the left: a line that fills the plot across `0.333` to `0.335` is a
+transmitter holding steady, one across `0.30` to `0.34` is warming up. A
+slowly moving f0 in the minutes after a device switches on is exactly that.
 
-A narrow bench puts the two ends one under the other, `▶` and `◀` marking
-each; a short one gives its plots up first, then whole sections from the
-bottom, and the last line names what a taller panel would show.
+Narrower than three columns, the bench draws as many sections as fit, in
+order, and names the rest ("+ TIMING on a wider panel"). Shorter than its
+sections, a column shrinks its plots first (six rows, then three, then
+none), keeps its readings whole, and says the plots are on a taller panel;
+only then do readings give way from the bottom, and it says that too.
 
 ---
 

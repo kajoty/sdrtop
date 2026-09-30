@@ -39,7 +39,7 @@ marked with a bar at its left edge.
 | **Lab** | The four measurement benches |
 | **Sweep** | The band sweep, full size and compact |
 | **Micro** | The four field views for a small screen |
-| **NET** | The 2.4 GHz band, BLE and classic Bluetooth: six views, on a radio that reaches the band ([the NET page](net.md)) |
+| **NET** | The 2.4 GHz band, BLE and classic Bluetooth: seven views, on a radio that reaches the band ([the NET page](net.md)) |
 
 Each layout shows its **number** beside its name, and that number is the key that
 opens it while you are in that section. The number is the same one the footer
