@@ -220,8 +220,9 @@ fn side_rows(
 /// How far back a plot reaches, at most.
 const PLOT_SPAN_S: f64 = 60.0;
 
-/// The rows of braille a plot is drawn in.
-const PLOT_ROWS: usize = 6;
+/// The rows a plot is drawn in where there is room, and the fewer it
+/// shrinks to where there is not, before it gives way altogether.
+const PLOT_ROWS: [usize; 2] = [6, 3];
 
 /// The fewest packets a plot point averages. One header's reading is
 /// noisy, and a trace of single readings is a band that shows the noise
@@ -288,6 +289,7 @@ fn plot_lines(
     p: &Piconet,
     title: &str,
     places: usize,
+    rows: usize,
     width: usize,
     inks: Inks,
     now: std::time::Instant,
@@ -301,7 +303,7 @@ fn plot_lines(
     );
     let plot = time_plot(
         [&m, &s],
-        PLOT_ROWS,
+        rows,
         width.saturating_sub(1),
         places,
         PLOT_SPAN_S,
@@ -332,7 +334,7 @@ fn modulation_lines(
     p: &Piconet,
     width: usize,
     inks: Inks,
-    trends: bool,
+    plot_rows: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let (m, s) = (&p.headers.sides.master, &p.headers.sides.slave);
@@ -382,11 +384,13 @@ fn modulation_lines(
     ));
     out.extend(side_rows("df1 avg", df1(m), df1(s), width, inks, theme));
     out.extend(side_rows("df2/df1", ratio(m), ratio(s), width, inks, theme));
-    if trends {
+    if plot_rows > 0 {
         let index =
             |k: &crate::signal::bt::piconet::BtPacket| index_of(&k.deviation).map(|i| i.value());
         let now = std::time::Instant::now();
-        out.extend(plot_lines(p, "index", 3, width, inks, now, theme, index));
+        out.extend(plot_lines(
+            p, "index", 3, plot_rows, width, inks, now, theme, index,
+        ));
     }
     // The headers a busy neighbour kept from being read
     // (`signal::net::measure`), a warning rather than a footnote.
@@ -408,7 +412,7 @@ fn carrier_lines(
     state: &SdrMetrics,
     width: usize,
     inks: Inks,
-    trends: bool,
+    plot_rows: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let (m, s) = (&p.headers.sides.master, &p.headers.sides.slave);
@@ -472,7 +476,7 @@ fn carrier_lines(
         inks,
         theme,
     ));
-    if trends {
+    if plot_rows > 0 {
         // Each packet's own f0, in kHz of its channel, corrected as the row
         // is.
         let f0_of = |k: &crate::signal::bt::piconet::BtPacket| {
@@ -480,7 +484,9 @@ fn carrier_lines(
             let (ppm, _) = state.radio.corrected_ppm(k.f0_ppm?, now);
             Some(ppm.value() * hz as f64 / 1e9)
         };
-        out.extend(plot_lines(p, "f0 kHz", 1, width, inks, now, theme, f0_of));
+        out.extend(plot_lines(
+            p, "f0 kHz", 1, plot_rows, width, inks, now, theme, f0_of,
+        ));
     }
     out
 }
@@ -504,9 +510,6 @@ fn residuals_of(p: &Piconet, direction: Option<Direction>) -> Vec<f64> {
         .collect()
 }
 
-/// The rows of eighth blocks the timing shape is drawn in.
-const SHAPE_ROWS: usize = 6;
-
 /// The TIMING section: each end's jitter about its own average, the
 /// slave's place against the master's, the residuals' shape, and the
 /// packets of each end.
@@ -514,7 +517,7 @@ fn timing_lines(
     p: &Piconet,
     width: usize,
     inks: Inks,
-    plots: bool,
+    plot_rows: usize,
     theme: &crate::Theme,
 ) -> Vec<Line<'static>> {
     let hint = match &p.slots {
@@ -593,13 +596,13 @@ fn timing_lines(
             // Every member's residuals as a shape: the numbers say how wide,
             // the shape whether it is one spread or two, as when a slave
             // answers a little late on every slot and stands as its own hump.
-            if plots {
+            if plot_rows > 0 {
                 // The shape stacked by who sent each packet, so an offset
                 // between the ends is two humps of two colours.
                 let unknown = residuals_of(p, None);
                 let (shape, beyond) = residual_shape(
                     [&master, &slave, &unknown],
-                    SHAPE_ROWS,
+                    plot_rows,
                     width,
                     [inks.master, inks.slave, theme.stale],
                     theme,
@@ -717,17 +720,21 @@ fn bench(
         .iter()
         .enumerate()
         .map(|(k, &w)| {
-            let build = |plots: bool| match k {
-                0 => modulation_lines(p, w, inks, plots, theme),
-                1 => carrier_lines(p, state, w, inks, plots, theme),
-                _ => timing_lines(p, w, inks, plots, theme),
+            let build = |plot_rows: usize| match k {
+                0 => modulation_lines(p, w, inks, plot_rows, theme),
+                1 => carrier_lines(p, state, w, inks, plot_rows, theme),
+                _ => timing_lines(p, w, inks, plot_rows, theme),
             };
-            let whole = build(true);
-            if whole.len() <= rows {
-                return whole;
+            // The plots shrink first, then go; the readings stay whole
+            // while they can.
+            for plot_rows in PLOT_ROWS {
+                let lines = build(plot_rows);
+                if lines.len() <= rows {
+                    return lines;
+                }
             }
             plots_left = true;
-            let mut lean = build(false);
+            let mut lean = build(0);
             if lean.len() > rows {
                 cut = true;
                 lean.truncate(rows);
@@ -1495,5 +1502,42 @@ mod tests {
             !text.contains("wider panel") && !text.contains("taller panel"),
             "{text}"
         );
+    }
+
+    /// A short bench shrinks its plots first (six rows, then three, then
+    /// none), keeps its readings, and says what a taller panel would show;
+    /// shorter still, the readings give way from the bottom, and it says so.
+    #[test]
+    fn a_short_bench_shrinks_its_plots_first() {
+        let mut m = heard();
+        readings(&mut m, Direction::Master, 0, 20, |_| 165_000.0, |_| 3.0);
+        readings(&mut m, Direction::Slave, 1, 20, |_| 160_000.0, |_| -12.0);
+        let plot_rows = |out: &[String]| -> usize {
+            let title = out.iter().position(|l| l.contains("index, means of"));
+            let axis = out.iter().position(|l| l.contains("now"));
+            match (title, axis) {
+                (Some(t), Some(a)) => a - t - 1,
+                _ => 0,
+            }
+        };
+        let tall = draw(NetBtBenchPanel, 191, 40, &m);
+        assert_eq!(plot_rows(&tall), 6, "{}", tall.join("\n"));
+        let mid = draw(NetBtBenchPanel, 191, 16, &m);
+        let text = mid.join("\n");
+        assert_eq!(plot_rows(&mid), 3, "{text}");
+        assert!(
+            text.contains("Rate worst") && !text.contains("taller panel"),
+            "{text}"
+        );
+        let low = draw(NetBtBenchPanel, 191, 11, &m);
+        let text = low.join("\n");
+        assert_eq!(plot_rows(&low), 0, "{text}");
+        assert!(text.contains("Rate worst"), "the readings whole: {text}");
+        assert!(text.contains("plots on a taller panel"), "{text}");
+        let tiny = draw(NetBtBenchPanel, 191, 7, &m);
+        let text = tiny.join("\n");
+        assert!(text.contains("Mod index"), "{text}");
+        assert!(!text.contains("Rate worst"), "{text}");
+        assert!(text.contains("the rest on a taller panel"), "{text}");
     }
 }
