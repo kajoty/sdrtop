@@ -69,7 +69,7 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
         "net_survey" => Some(survey(
             m,
             streaming
-                && m.ui.section == crate::signal::net::SECTION
+                && crate::signal::net::is_net(&m.ui.section)
                 && net.mode == crate::state::NetMode::Survey,
         )),
         "net_census" => {

@@ -300,9 +300,10 @@ impl UiState {
     /// Whether the active preset is a measurement lab (`lab_*`). Lab presets wear
     /// the instrument-chrome (banner + marker bar) and a cooler steel frame.
     /// Reads the per-frame `active_preset` mirror, so it is valid during draw.
-    /// Whether the deck is in the NET section, which the header varies on.
+    /// Whether the deck is in one of the NET sections, which the header
+    /// varies on.
     pub fn is_net_section(&self) -> bool {
-        self.section == crate::signal::net::SECTION
+        crate::signal::net::is_net(&self.section)
     }
 
     pub fn is_lab_mode(&self) -> bool {
@@ -460,6 +461,18 @@ mod tests {
         );
         // No timer yet → whatever the mode is.
         assert_eq!(decayed_mode(RailMode::Bench, true, None), RailMode::Bench);
+    }
+
+    /// The band's section and each Bluetooth's are all NET.
+    #[test]
+    fn every_net_section_is_net() {
+        let mut ui = UiState::default();
+        for s in ["net", "le", "classic"] {
+            ui.section = s.to_string();
+            assert!(ui.is_net_section(), "{s}");
+        }
+        ui.section = "lab".to_string();
+        assert!(!ui.is_net_section());
     }
 
     #[test]

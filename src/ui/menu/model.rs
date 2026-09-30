@@ -23,11 +23,6 @@ use crate::config::PresetConfig;
 /// would say otherwise.
 pub const HIDDEN: &str = "hidden";
 
-/// The NET section, named here because the startup path has to be able to drop
-/// it: `App::build_ui` removes every preset filed under it on a radio that
-/// cannot work in the 2.4 GHz band, so the section is absent rather than empty.
-pub const NET: &str = "net";
-
 /// The section a preset lands in when it names none. Only exists when something
 /// is actually in it, so a default install never shows an empty row.
 pub const OTHER: &str = "other";
@@ -41,7 +36,12 @@ const KNOWN: &[(&str, &str)] = &[
     ("lab", "Lab"),
     ("sweep", "Sweep"),
     ("micro", "Micro"),
-    (NET, "NET"),
+    // The NET feature's three (`signal::net::SECTIONS`): `App::build_ui`
+    // removes every preset filed under them on a radio that cannot work in the
+    // 2.4 GHz band, so they are absent rather than empty.
+    (crate::signal::net::SECTIONS[0], "NET"),
+    (crate::signal::net::SECTIONS[1], "LE"),
+    (crate::signal::net::SECTIONS[2], "Classic"),
 ];
 
 /// One layout, as the menu shows it.
@@ -213,6 +213,31 @@ mod tests {
         let ids: Vec<&str> = menu.sections.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["command_rail", "lab", "sweep", "micro", "net"]);
         assert!(menu.warnings.is_empty(), "{:?}", menu.warnings);
+    }
+
+    /// The NET feature's sections come after Micro: the band first, then
+    /// each Bluetooth, each under its own title.
+    #[test]
+    fn the_net_sections_sort_in_order_with_their_titles() {
+        let mut presets = LayoutConfig::default_config().presets;
+        presets.insert("a_le".into(), bare_preset(Some("le"), Some(9)));
+        presets.insert("a_classic".into(), bare_preset(Some("classic"), Some(9)));
+        let menu = build(&presets);
+        let ids: Vec<&str> = menu.sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "command_rail",
+                "lab",
+                "sweep",
+                "micro",
+                "net",
+                "le",
+                "classic"
+            ]
+        );
+        assert_eq!(menu.section("le").unwrap().title, "LE");
+        assert_eq!(menu.section("classic").unwrap().title, "Classic");
     }
 
     /// Slot order, not file order and not hash order.
