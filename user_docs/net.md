@@ -5,9 +5,10 @@
 **NET** is sdrtop's look at the 2.4 GHz band: who is on the air, what they
 are saying, and how well their transmitters do it. It listens to Bluetooth
 Low Energy advertising and to classic Bluetooth, and it measures the band
-itself. It never transmits, never joins or follows a connection, and never
-plays audio: the guest at the party who says nothing all evening and leaves
-knowing everyone's address.
+itself. It never transmits, never joins a connection (it follows the ones
+it hears being set up, from the sidelines), and never plays audio: the guest
+at the party who says nothing all evening and leaves knowing everyone's
+address.
 
 The section only appears on a radio that reaches the band and can sample fast
 enough for its cheapest mode. On one that cannot, the section is hidden and
@@ -16,7 +17,7 @@ the log says why in one line.
 It lives in three sections of the menu: **NET** for the band itself, **LE**
 for Bluetooth Low Energy and **Classic** for classic Bluetooth. They come and
 go together, because one radio requirement admits all three, and everything
-on this page holds in all of them. Seven views, one question each; the key is
+on this page holds in all of them. Eight views, one question each; the key is
 the number to press while that section is active:
 
 | Key | View | The question it answers |
@@ -25,6 +26,7 @@ the number to press while that section is active:
 | `NET 2` | **Survey** | What is in this band, and who is spending the airtime? |
 | `LE 1` | **Census** | Who is here? |
 | `LE 2` | **Advertising** | What is this device advertising, and is its transmitter any good? |
+| `LE 3` | **Connection** | What are two connected devices saying to each other, event by event? |
 | `Classic 1` | **Piconets** | Who is running a classic Bluetooth piconet near me? |
 | `Classic 2` | **Packets** | What is this one piconet saying, packet by packet? |
 | `Classic 3` | **Bench** | How good is each end of it, side by side? |
@@ -206,9 +208,10 @@ signals. Where it matters, the screen says which:
   another once the link has switched to EDR, which most audio links do,
   and the header alone cannot say which. Your headphones' music is the
   second name. The export's `packet_type` column says the same.
-- **"predicted, not followed"** beside a BLE connection's hop sequence means
-  sdrtop worked out which channels the connection will use from its own
-  parameters, and did not follow it there. It never does.
+- **"predicted, not followed"** beside a `CONNECT_IND` in the packet detail
+  means the channels there were worked out from its parameters. The
+  connection itself is followed on [LE 3](#connection--le-3-focus-e), through
+  the events whose channels the radio's window holds, and only those.
 
 ---
 
@@ -228,7 +231,8 @@ only from the facts drawn below it:
   VHT80 misses by a postcode.
 - **Retune** (`K`, focus `k`): times the radio's tuning call across the band.
   A call slower than the shortest BLE connection interval rules following a
-  connection out; a faster one is necessary but not proof, because the call
+  connection *by retuning* out (LE 3 follows without retuning, so it does
+  not wait on this); a faster one is necessary but not proof, because the call
   does not include the synthesiser settling. The panel says which of the two
   it is and never "fast enough", because optimism is not a measurement.
 
@@ -353,10 +357,10 @@ access address, so parked on a data channel it hears secondary advertising
 and never a connection, whose packets carry an address of their own. LE 2M
 lives almost entirely in connections, and never on the three advertising
 channels, so the key was either refused or listened very carefully to
-nothing. LE 2M comes back with connection following, which learns a
-connection's address and sees the moment it changes PHY, and then it will
-switch by itself, as it should. The decoder is already written and tested;
-it is only waiting for something worth decoding.
+nothing. LE 2M is back where it lives, in connections: a connection
+followed on [LE 3](#connection--le-3-focus-e) that moves to LE 2M is
+received on it from the moment the two devices agreed, by itself, as it
+should be.
 
 In SURVEY the line under the list gives each advertising channel's packet
 count and CRC pass rate; in LOCK, the one channel's.
@@ -372,7 +376,8 @@ The selected packet, spelled out:
 - **Connection**, for a `CONNECT_IND`: the parameters the two devices agreed
   (interval, latency, timeout, channel map, sleep-clock accuracy) and the
   first channels the connection will hop to, predicted from them with
-  Channel Selection Algorithm #1 or #2, **predicted, not followed**.
+  Channel Selection Algorithm #1 or #2, **predicted, not followed**. `Enter`
+  on a `CONNECT_IND` in the list opens the connection itself on LE 3.
 - **Physics**: SNR, carrier offset in kHz and ppm, and the carrier at the
   start and end of the packet: the start is the preamble's mean frequency
   (the test suite's f0), the end the last ten bits before the CRC.
@@ -412,6 +417,81 @@ CRC, with its uncertainty. A bin with fewer than ten packets gives its count
 and no rate. Filtered to one address, it is that device's own curve. A
 receiver whose failures do not fall as SNR rises is failing for a reason that
 is not noise, and this curve is where that shows.
+
+---
+
+## Connection · `LE 3` *(focus `e`)*
+
+Every connection whose `CONNECT_IND` sdrtop hears is followed, and this
+view shows one of them: the one opened with `Enter` on its `CONNECT_IND` in
+the Advertising list, or the newest. `← →` step through the others.
+
+**Without retuning.** The radio stays where it is and listens to the band it
+already has: at 20 Msps on 2426 MHz that is advertising channel 38 and data
+channels 7 to 14, which the top line counts (`8 in view (7-14)`). The
+`CONNECT_IND` says when the connection's events will be and which channel
+each will hop to (Core 5.4 Vol 6 Part B 4.5.3, 4.5.8), so sdrtop listens to
+the events that land in its window and writes down the rest as out of view.
+With all 37 channels in use that is about one event in five. It is like
+following a conversation through a wall that lets every fifth sentence
+through: you learn who talks, how fast and in what language, rather less
+of the gossip.
+
+**Catching one.** The `CONNECT_IND` has to be heard, on the advertising
+channel in view; a device that connects picks whichever channel it last
+heard the other on, so it can take a few reconnects. A connection already
+running when you started listening cannot be picked up halfway, yet.
+
+**The top lines** are the connection's parameters now in force (the
+`CONNECT_IND`'s, with every update since), the two addresses (masked with
+`i` like every other), when it was set up, the PHY each way, and whether
+it is encrypted.
+
+**Every event has one of four accounts:**
+
+- **followed**: a packet with the connection's access address was heard;
+- **missed**: its channel was in view and nothing was heard. Not a claim
+  about why: a Peripheral may skip events, and a Central may have nothing
+  to send;
+- **not in view**: its channel is outside the band; runs of these fold into
+  one row (`36-33  not in view (4)`), so the events heard lead the list;
+- **feed lost**: the samples were not there to listen to.
+
+**Who sent it**: the Central opens each event at its anchor point and the two
+take turns 150 µs apart (4.5.1, 4.1.1), so the first packet at the anchor
+is the Central's (`C→P`, in the connection's colour) and its answer the
+Peripheral's (`P→C`). A packet neither rule accounts for gets a dot.
+
+**What it said.** Link-layer control PDUs are named from Table 2.20 and their
+parameters read in words: versions, features, the PHY requests, channel
+maps, connection updates, terminate reasons. Each is read only at the length
+its own table entry gives, so an encrypted packet is not mistaken for one.
+The keys and random numbers of encryption setup are named, never printed.
+From `LL_START_ENC_REQ` on, the link is encrypted and only the length and
+the CRC are left. L2CAP payloads are not read at all.
+
+**Changes the two agree on** take effect at an *instant*, an event counter
+named in the PDU: a new channel map, a move to LE 2M, a new interval. sdrtop
+applies each it hears. One sent while its channel was out of view cannot be
+heard, and the connection then goes quiet in the window: after the
+supervision timeout with its events in view still silent, it is marked
+**lost after event N**, not followed on a stale schedule. `LL_TERMINATE_IND`
+ends it with its reason; a move to LE Coded, or a subrate change, is
+**not followed**, and says so.
+
+### Measured
+
+- **clock**: the Central's clock against this radio's, in ppm, from a line
+  through the anchors heard. Without a frequency reference it is relative,
+  and says so; with one, it is held against the sleep clock accuracy the
+  Central declared in its `CONNECT_IND` (inside, at the edge, outside).
+- **T_IFS**: the turns heard, pooled, against 150 ± 2 µs (4.2.1).
+- **CRC**: packets and passes per data channel heard.
+
+Tested against synthetic connections, end to end through the receiver; the
+first real pair heard will be noted here. Until then, take the view as a
+well-tested opinion about other people's radios. Keys: `↑↓` scroll, `End`
+back to the newest, `← →` the previous or next connection.
 
 ---
 
