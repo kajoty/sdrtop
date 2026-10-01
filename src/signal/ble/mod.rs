@@ -24,6 +24,7 @@ pub mod connect;
 pub mod data;
 pub mod detect;
 pub mod fer;
+pub mod follow;
 pub mod gfsk;
 pub mod interval;
 pub mod llcp;
