@@ -252,6 +252,22 @@ impl Csa1 {
         })
     }
 
+    /// Take a new channel map, as an LL_CHANNEL_MAP_IND does at its
+    /// instant: the remapping table is rebuilt and `lastUnmappedChannel`
+    /// carries on, the text keeping it from event to event whatever the map.
+    /// `false`, and nothing changed, for a map with no used channel.
+    pub fn set_map(&mut self, channel_map: u64) -> bool {
+        let used: Vec<u8> = (0u8..37)
+            .filter(|&c| channel_map & (1u64 << c) != 0)
+            .collect();
+        if used.is_empty() {
+            return false;
+        }
+        self.channel_map = channel_map;
+        self.used_channels = used;
+        true
+    }
+
     /// Advance to the next connection event and return its data channel
     /// index - the first call is the first connection event's own
     /// channel, since [`Self::new`] starts `lastUnmappedChannel` at 0
@@ -361,6 +377,28 @@ impl Csa2 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A new channel map under CSA #1 carries `lastUnmappedChannel` on
+    /// (4.5.8.2 keeps it from event to event; only the map changes), so the
+    /// hop goes on from where it was and only the remapping table is new.
+    #[test]
+    fn a_new_map_keeps_the_hop_where_it_was() {
+        let all = (1u64 << 37) - 1;
+        let low = (1u64 << 10) - 1;
+        let mut moved = Csa1::new(7, all).unwrap();
+        let mut reference = Csa1::new(7, all).unwrap();
+        for _ in 0..5 {
+            assert_eq!(moved.next(), reference.next());
+        }
+        assert!(moved.set_map(low));
+        // The sixth event's unmapped channel is (5 * 7 + 7) mod 37 = 5,
+        // used in the new map; the seventh's is 12, remapped by 12 mod 10.
+        assert_eq!(moved.next(), 5);
+        assert_eq!(moved.next(), 2);
+        assert!(!moved.set_map(0), "no used channel: refused, unchanged");
+        // Unmapped 19, unused: 19 mod 10.
+        assert_eq!(moved.next(), 9);
+    }
     use super::*;
 
     /// Build a synthetic `CONNECT_IND` payload's own bits directly, LSB-

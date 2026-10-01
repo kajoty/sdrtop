@@ -33,6 +33,9 @@
 #![allow(dead_code)]
 
 use super::connect::{sca_ppm, ConnectIndData, Csa1, Csa2};
+use super::data::DataPdu;
+use super::llcp;
+use super::receive::DataTiming;
 use super::Phy;
 
 /// The accuracy this radio's own sample clock is assumed to keep, in ppm,
@@ -83,6 +86,102 @@ struct Anchor {
     pair: f64,
 }
 
+/// Before an anchor is heard, where the first one can be: the transmit
+/// window after the CONNECT_IND (4.5.3), or after a connection update's
+/// instant, opening at `open_pair` for event `counter`, `size_pairs` wide.
+/// `sync_pair` is where the timing was last known, for the widening.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    counter: u16,
+    open_pair: f64,
+    size_pairs: f64,
+    sync_pair: f64,
+}
+
+/// How an event in a followed connection went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Account {
+    /// In view, and a packet with the connection's access address heard.
+    Followed,
+    /// In view, nothing heard. The Peripheral may skip events (its
+    /// latency) and the Central send nothing; neither is claimed.
+    Missed,
+    /// Its channel is outside the band the radio sees.
+    NotInView,
+    /// The feed lost samples inside its window: not listened to.
+    FeedLost,
+}
+
+/// Who sent a packet: the Central opens each event at its anchor (4.5.1),
+/// and the two take turns T_IFS apart (4.1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sender {
+    Central,
+    Peripheral,
+}
+
+/// One packet heard in an event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeardPdu {
+    pub pdu: DataPdu,
+    pub timing: DataTiming,
+    /// `None` when neither the anchor nor a turn after a placed packet
+    /// accounts for its time: never guessed.
+    pub sender: Option<Sender>,
+    /// An LL Control PDU, read when the link is not yet encrypted.
+    pub control: Option<llcp::Control>,
+    /// From the end of the packet before it to its start, us, when that
+    /// packet was the other end's turn.
+    pub t_ifs_us: Option<f64>,
+}
+
+/// One event, as it went.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    pub counter: u16,
+    pub channel: u8,
+    pub account: Account,
+    pub pdus: Vec<HeardPdu>,
+    /// The PHY the Central was to send it on.
+    pub phy: Phy,
+}
+
+/// Where following stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    Following,
+    /// The events in view went silent past the supervision timeout (4.5.2)
+    /// or the widening's limit (4.2.4): after the last event heard, if
+    /// any. Most often a change made outside the window, never seen.
+    Lost {
+        after: Option<u16>,
+    },
+    /// LL_TERMINATE_IND heard, with its reason.
+    Terminated {
+        reason: u8,
+    },
+    /// A change this follower cannot follow was seen.
+    NotFollowed {
+        why: &'static str,
+    },
+}
+
+/// How many events a connection keeps, newest first.
+pub const EVENTS_KEPT: usize = 500;
+
+/// T_IFS, us (4.1.1).
+const T_IFS_US: f64 = 150.0;
+
+/// How far from T_IFS a packet may start and still be taken as the other
+/// end's turn, us: far wider than the Core's 2 us (4.2.1), so a late
+/// answer is placed and its T_IFS judged against the limit, not dropped;
+/// far narrower than any other gap an event has.
+const TURN_SLACK_US: f64 = 25.0;
+
+/// In view and missed, at least this many times, before a silence is taken
+/// as loss: one or two misses are a weak packet or the Peripheral's latency.
+const LOSS_MISSES: u32 = 3;
+
 /// One connection, followed.
 #[derive(Clone, Debug)]
 pub struct Connection {
@@ -92,11 +191,21 @@ pub struct Connection {
     /// The next event not yet accounted for, and its channel.
     counter: u16,
     channel: u8,
-    /// Where the CONNECT_IND ended, pairs: the origin of the transmit
-    /// window, and the last synchronisation until an anchor is heard.
-    connect_end: f64,
+    window: Window,
     anchor: Option<Anchor>,
+    /// Each direction's PHY.
     phy: Phy,
+    phy_peripheral: Phy,
+    /// Changes waiting for their instant.
+    pending: Vec<llcp::Update>,
+    events: std::collections::VecDeque<Event>,
+    state: State,
+    encrypted_from: Option<u16>,
+    /// The last event a packet was heard in, and where its first packet
+    /// started.
+    last_heard: Option<(u16, f64)>,
+    /// Events in view missed since then.
+    misses: u32,
 }
 
 impl Connection {
@@ -110,17 +219,32 @@ impl Connection {
         } else {
             Hops::One(Csa1::new(c.hop_increment, c.channel_map)?)
         };
+        let unit = UNIT_US * 1e-6 * raw_rate;
         let mut this = Self {
             params: *c,
             raw_rate,
             hops,
             counter: 0,
             channel: 0,
-            connect_end: end_pair,
+            window: Window {
+                counter: 0,
+                open_pair: end_pair
+                    + TRANSMIT_WINDOW_DELAY_US * 1e-6 * raw_rate
+                    + c.win_offset as f64 * unit,
+                size_pairs: c.win_size as f64 * unit,
+                sync_pair: end_pair,
+            },
             anchor: None,
             // A legacy CONNECT_IND is sent on LE 1M, and the connection
             // starts on the PHY it was made on.
             phy: Phy::OneM,
+            phy_peripheral: Phy::OneM,
+            pending: Vec::new(),
+            events: std::collections::VecDeque::new(),
+            state: State::Following,
+            encrypted_from: None,
+            last_heard: None,
+            misses: 0,
         };
         this.channel = this.hop();
         Some(this)
@@ -134,8 +258,36 @@ impl Connection {
         self.params.crc_init
     }
 
+    /// The parameters now in force: the CONNECT_IND's, with every
+    /// connection update and channel map applied since.
+    pub fn params(&self) -> &ConnectIndData {
+        &self.params
+    }
+
+    /// The PHY the Central sends on.
     pub fn phy(&self) -> Phy {
         self.phy
+    }
+
+    /// The PHY the Peripheral sends on.
+    pub fn phy_peripheral(&self) -> Phy {
+        self.phy_peripheral
+    }
+
+    /// The events accounted for, newest first.
+    pub fn events(&self) -> &std::collections::VecDeque<Event> {
+        &self.events
+    }
+
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// The event LL_START_ENC_REQ was heard in: every packet after it is
+    /// encrypted (Vol 6 Part C 1 sends it in the clear and its answers
+    /// encrypted).
+    pub fn encrypted_from(&self) -> Option<u16> {
+        self.encrypted_from
     }
 
     /// The event `self.counter`'s channel, advancing CSA #1's state.
@@ -163,12 +315,9 @@ impl Connection {
                 (at, 0.0, at - a.pair)
             }
             None => {
-                let start = self.connect_end
-                    + self
-                        .pairs(TRANSMIT_WINDOW_DELAY_US + self.params.win_offset as f64 * UNIT_US);
-                let at = start + self.counter as f64 * interval;
-                let window = self.pairs(self.params.win_size as f64 * UNIT_US);
-                (at, window, at + window - self.connect_end)
+                let w = self.window;
+                let at = w.open_pair + self.counter.wrapping_sub(w.counter) as f64 * interval;
+                (at, w.size_pairs, at + w.size_pairs - w.sync_pair)
             }
         };
         let ppm = sca_ppm(self.params.sca).1 as f64 + OWN_CLOCK_PPM;
@@ -199,7 +348,222 @@ impl Connection {
 
     fn advance(&mut self) {
         self.counter = self.counter.wrapping_add(1);
+        self.apply_due_updates();
         self.channel = self.hop();
+    }
+
+    /// The changes whose instant is the event now due, before its channel
+    /// is chosen: from the instant on, the new parameters are in force
+    /// (5.1.1, 5.1.2, 5.1.10).
+    fn apply_due_updates(&mut self) {
+        let now = self.counter;
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|u| instant_of(u) == Some(now));
+        self.pending = waiting;
+        for update in due {
+            match update {
+                llcp::Update::ChannelMap { map, .. } => {
+                    let ok = match &mut self.hops {
+                        Hops::One(csa) => csa.set_map(map),
+                        Hops::Two(csa) => match Csa2::new(self.params.access_address, map) {
+                            Some(new) => {
+                                *csa = new;
+                                true
+                            }
+                            None => false,
+                        },
+                    };
+                    if ok {
+                        self.params.channel_map = map;
+                    }
+                }
+                llcp::Update::Phy { c_to_p, p_to_c, .. } => {
+                    if let Some(phy) = phy_of(c_to_p) {
+                        self.phy = phy;
+                    }
+                    if let Some(phy) = phy_of(p_to_c) {
+                        self.phy_peripheral = phy;
+                    }
+                    if c_to_p & 0b100 != 0 || p_to_c & 0b100 != 0 {
+                        self.state = State::NotFollowed {
+                            why: "moved to LE Coded: not followed",
+                        };
+                    }
+                }
+                llcp::Update::Connection {
+                    win_size,
+                    win_offset,
+                    interval,
+                    latency,
+                    timeout,
+                    ..
+                } => {
+                    // The old timing's anchor at the instant, then the new
+                    // transmit window after it, as at the start (reasoned
+                    // from 5.1.1's procedure, not yet seen on the air).
+                    let old = self.next_due();
+                    let unit = self.pairs(UNIT_US);
+                    self.window = Window {
+                        counter: now,
+                        open_pair: old.anchor_pair + win_offset as f64 * unit,
+                        size_pairs: win_size as f64 * unit,
+                        sync_pair: old.anchor_pair - old.widening_pairs,
+                    };
+                    self.anchor = None;
+                    self.params.interval = interval;
+                    self.params.latency = latency;
+                    self.params.timeout = timeout;
+                }
+                llcp::Update::Terminate { .. } | llcp::Update::Subrate => {}
+            }
+        }
+    }
+
+    /// Account for the event due: whether it was in view, whether the feed
+    /// lost samples in its window, and the packets heard there with the
+    /// link's access address. Nothing is recorded once following has ended.
+    pub fn account(
+        &mut self,
+        in_view: bool,
+        feed_lost: bool,
+        mut heard: Vec<(DataPdu, DataTiming)>,
+    ) {
+        if self.state != State::Following {
+            return;
+        }
+        let due = self.next_due();
+        heard.sort_by(|a, b| a.1.start_pair.total_cmp(&b.1.start_pair));
+        let account = if !in_view {
+            Account::NotInView
+        } else if feed_lost {
+            Account::FeedLost
+        } else if heard.is_empty() {
+            Account::Missed
+        } else {
+            Account::Followed
+        };
+        let opens = due.anchor_pair - due.widening_pairs;
+        let closes = due.anchor_pair + due.window_pairs + due.widening_pairs;
+        let mut pdus = Vec::with_capacity(heard.len());
+        let mut before: Option<(Sender, f64)> = None;
+        let mut central_at = None;
+        let mut ends = None;
+        for (pdu, timing) in heard {
+            let (sender, t_ifs_us) = match before {
+                None if (opens..=closes).contains(&timing.start_pair) => {
+                    (Some(Sender::Central), None)
+                }
+                Some((last, end)) => {
+                    let gap_us = (timing.start_pair - end) / self.raw_rate * 1e6;
+                    if (gap_us - T_IFS_US).abs() <= TURN_SLACK_US {
+                        let next = match last {
+                            Sender::Central => Sender::Peripheral,
+                            Sender::Peripheral => Sender::Central,
+                        };
+                        (Some(next), Some(gap_us))
+                    } else {
+                        (None, None)
+                    }
+                }
+                None => (None, None),
+            };
+            if sender == Some(Sender::Central) && central_at.is_none() {
+                central_at = Some(timing.start_pair);
+            }
+            before = sender.map(|s| (s, timing.end_pair));
+            let control = (pdu.llid == 3 && pdu.crc_ok && self.encrypted_from.is_none())
+                .then(|| llcp::read(&pdu.payload));
+            if let Some(k) = &control {
+                if k.opcode == 0x05 && k.name.is_some() {
+                    self.encrypted_from = Some(due.counter);
+                }
+                match llcp::update(&pdu.payload) {
+                    Some(llcp::Update::Terminate { reason }) => {
+                        ends = Some(State::Terminated { reason });
+                    }
+                    Some(llcp::Update::Subrate) => {
+                        ends = Some(State::NotFollowed {
+                            why: "subrate change: not followed",
+                        });
+                    }
+                    Some(update) if instant_of(&update).is_some() => self.pending.push(update),
+                    _ => {}
+                }
+            }
+            pdus.push(HeardPdu {
+                pdu,
+                timing,
+                sender,
+                control,
+                t_ifs_us,
+            });
+        }
+        let first_heard = pdus.first().map(|p| p.timing.start_pair);
+        self.events.push_front(Event {
+            counter: due.counter,
+            channel: due.channel,
+            account,
+            pdus,
+            phy: self.phy,
+        });
+        self.events.truncate(EVENTS_KEPT);
+
+        match account {
+            Account::Followed => {
+                self.last_heard = first_heard.map(|at| (due.counter, at));
+                self.misses = 0;
+            }
+            Account::Missed => self.misses += 1,
+            Account::NotInView | Account::FeedLost => {}
+        }
+        if let Some(end) = ends {
+            self.state = end;
+            return;
+        }
+        // Loss: the events in view silent past the supervision timeout
+        // (4.5.2), or the window widened past (connInterval / 2 - T_IFS)
+        // (4.2.4).
+        let since = due.anchor_pair - self.last_heard.map_or(self.window.sync_pair, |h| h.1);
+        let timeout = self.pairs(self.params.timeout as f64 * 10_000.0);
+        let widest = self.interval_pairs() / 2.0 - self.pairs(T_IFS_US);
+        if (self.misses >= LOSS_MISSES && since > timeout) || due.widening_pairs >= widest {
+            self.state = State::Lost {
+                after: self.last_heard.map(|h| h.0),
+            };
+            return;
+        }
+        match central_at {
+            Some(at) => self.heard(at),
+            None => self.missed(),
+        }
+    }
+}
+
+/// The instant an update takes effect at, for the ones that have one.
+fn instant_of(update: &llcp::Update) -> Option<u16> {
+    match *update {
+        llcp::Update::Connection { instant, .. } | llcp::Update::ChannelMap { instant, .. } => {
+            Some(instant)
+        }
+        // Both directions unchanged: "there is no Instant" (2.4.2.23).
+        llcp::Update::Phy {
+            c_to_p: 0,
+            p_to_c: 0,
+            ..
+        } => None,
+        llcp::Update::Phy { instant, .. } => Some(instant),
+        llcp::Update::Terminate { .. } | llcp::Update::Subrate => None,
+    }
+}
+
+/// A PHY field's one set bit as the PHY this follower can receive (Table
+/// 2.21); `None` for unchanged (zero) and for LE Coded, which it cannot.
+fn phy_of(bits: u8) -> Option<Phy> {
+    match bits {
+        0b001 => Some(Phy::OneM),
+        0b010 => Some(Phy::TwoM),
+        _ => None,
     }
 }
 
@@ -207,6 +571,8 @@ impl Connection {
 mod tests {
     use super::*;
     use crate::signal::ble::connect::{ConnectIndData, Csa1, Csa2};
+    use crate::signal::ble::data::DataPdu;
+    use crate::signal::ble::receive::DataTiming;
 
     fn params(interval: u16, win_offset: u16, win_size: u8) -> ConnectIndData {
         ConnectIndData {
@@ -306,6 +672,226 @@ mod tests {
             (w1 / rate * 1e6 - (520e-6 * 0.1e6 + 16.0)).abs() < 0.01,
             "{w1}"
         );
+    }
+
+    const RATE: f64 = 20e6;
+
+    fn pdu(llid: u8, payload: &[u8]) -> DataPdu {
+        DataPdu {
+            llid,
+            nesn: false,
+            sn: false,
+            md: false,
+            cte_info: None,
+            payload: payload.to_vec(),
+            crc_ok: true,
+        }
+    }
+
+    /// A 1M packet starting at `start`: preamble 8 bits, access address 32,
+    /// header 16, payload, CRC 24, at 1 us a bit.
+    fn at(start: f64, payload_len: usize) -> DataTiming {
+        let bits = 8 + 32 + 16 + payload_len * 8 + 24;
+        DataTiming {
+            start_pair: start,
+            end_pair: start + bits as f64 * 1e-6 * RATE,
+        }
+    }
+
+    /// The Central's empty PDU at the anchor and the Peripheral's T_IFS
+    /// after it.
+    fn exchange(c: &Connection, t_ifs_us: f64) -> Vec<(DataPdu, DataTiming)> {
+        let m = at(c.next_due().anchor_pair, 0);
+        let s = at(m.end_pair + t_ifs_us * 1e-6 * RATE, 0);
+        vec![(pdu(1, &[]), m), (pdu(1, &[]), s)]
+    }
+
+    /// The first PDU at the anchor is the Central's, the next T_IFS after
+    /// it the Peripheral's (4.5.1, 4.1.1); T_IFS is measured.
+    #[test]
+    fn an_event_places_its_packets() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let heard = exchange(&c, 150.0);
+        c.account(true, false, heard);
+        let e = &c.events()[0];
+        assert_eq!(e.account, Account::Followed);
+        assert_eq!(e.pdus[0].sender, Some(Sender::Central));
+        assert_eq!(e.pdus[1].sender, Some(Sender::Peripheral));
+        assert!((e.pdus[1].t_ifs_us.unwrap() - 150.0).abs() < 0.1);
+        assert_eq!(e.pdus[0].t_ifs_us, None);
+    }
+
+    /// A PDU heard far from the anchor, with nothing before it, is heard
+    /// but not placed, and does not move the timing.
+    #[test]
+    fn a_lone_late_packet_is_not_placed() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let heard = exchange(&c, 150.0);
+        c.account(true, false, heard);
+        let due = c.next_due().anchor_pair;
+        let late = at(due + 400e-6 * RATE, 0);
+        c.account(true, false, vec![(pdu(1, &[]), late)]);
+        let e = &c.events()[0];
+        assert_eq!(e.account, Account::Followed);
+        assert_eq!(e.pdus[0].sender, None);
+        let interval = 80.0 * 1.25e-3 * RATE;
+        assert!((c.next_due().anchor_pair - due - interval).abs() < 1.0);
+    }
+
+    /// A channel map update seen applies at its instant: from then on only
+    /// the channels it leaves in use.
+    #[test]
+    fn a_channel_map_update_applies_at_its_instant() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let a = c.next_due().anchor_pair;
+        // LL_CHANNEL_MAP_IND: channels 0-9 only, instant 6.
+        let ind = pdu(3, &[0x01, 0xff, 0x03, 0x00, 0x00, 0x00, 0x06, 0x00]);
+        c.account(true, false, vec![(ind, at(a, 8))]);
+        assert_eq!(
+            c.events()[0].pdus[0].control.as_ref().map(|k| k.name),
+            Some(Some("LL_CHANNEL_MAP_IND"))
+        );
+        while c.next_due().counter < 6 {
+            c.account(false, false, vec![]);
+        }
+        for _ in 0..30 {
+            assert!(c.next_due().channel < 10, "{:?}", c.next_due());
+            c.account(false, false, vec![]);
+        }
+    }
+
+    /// A PHY update to 2M moves the events from its instant to 2M.
+    #[test]
+    fn a_phy_update_moves_the_link_to_2m() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let a = c.next_due().anchor_pair;
+        // LL_PHY_UPDATE_IND: C->P 2M, P->C 2M, instant 4.
+        let ind = pdu(3, &[0x18, 0x02, 0x02, 0x04, 0x00]);
+        c.account(true, false, vec![(ind, at(a, 5))]);
+        assert_eq!(c.phy(), Phy::OneM);
+        while c.next_due().counter < 4 {
+            c.account(false, false, vec![]);
+        }
+        assert_eq!(c.phy(), Phy::TwoM);
+        c.account(false, false, vec![]);
+        assert_eq!(c.events()[0].phy, Phy::TwoM);
+    }
+
+    /// A connection update seen: at its instant the old timing's anchor
+    /// plus WinOffset opens a new transmit window WinSize wide, and the
+    /// events after it are the new interval apart.
+    #[test]
+    fn a_connection_update_opens_a_new_window_at_its_instant() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let a = c.next_due().anchor_pair;
+        let old_interval = 80.0 * 1.25e-3 * RATE;
+        // LL_CONNECTION_UPDATE_IND: WinSize 2, WinOffset 4, Interval 160,
+        // Latency 0, Timeout 300, Instant 3.
+        let ind = pdu(3, &[0x00, 2, 4, 0, 160, 0, 0, 0, 0x2c, 0x01, 3, 0]);
+        c.account(true, false, vec![(ind, at(a, 12))]);
+        c.account(false, false, vec![]);
+        c.account(false, false, vec![]);
+        let d = c.next_due();
+        assert_eq!(d.counter, 3);
+        let expect = a + 3.0 * old_interval + 4.0 * 1.25e-3 * RATE;
+        assert!((d.anchor_pair - expect).abs() < 1.0, "{d:?}");
+        assert!((d.window_pairs - 2.0 * 1.25e-3 * RATE).abs() < 1.0, "{d:?}");
+        assert_eq!((c.params().interval, c.params().timeout), (160, 300));
+        let heard = exchange(&c, 150.0);
+        let new_anchor = heard[0].1.start_pair;
+        c.account(true, false, heard);
+        let next = c.next_due();
+        assert!((next.anchor_pair - new_anchor - 160.0 * 1.25e-3 * RATE).abs() < 1.0);
+        assert_eq!(next.window_pairs, 0.0);
+    }
+
+    /// An update not seen: the events in view go silent, and once the
+    /// silence passes the supervision timeout (100 x 10 ms here, with 100 ms
+    /// events) the connection is lost after the last event heard.
+    #[test]
+    fn an_unseen_update_ends_in_lost() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        for _ in 0..10 {
+            let heard = exchange(&c, 150.0);
+            c.account(true, false, heard);
+        }
+        assert_eq!(c.state(), &State::Following);
+        for _ in 0..10 {
+            c.account(true, false, vec![]);
+        }
+        assert_eq!(
+            c.state(),
+            &State::Following,
+            "exactly the timeout is not past it"
+        );
+        c.account(true, false, vec![]);
+        assert_eq!(c.state(), &State::Lost { after: Some(9) });
+    }
+
+    /// Out of view for longer than the timeout is not lost: nothing was
+    /// there to hear.
+    #[test]
+    fn silence_out_of_view_is_not_loss() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let heard = exchange(&c, 150.0);
+        c.account(true, false, heard);
+        for _ in 0..30 {
+            c.account(false, false, vec![]);
+        }
+        assert_eq!(c.state(), &State::Following);
+    }
+
+    /// LL_TERMINATE_IND ends it with its reason, and nothing after counts.
+    #[test]
+    fn terminate_ends_it() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let a = c.next_due().anchor_pair;
+        c.account(true, false, vec![(pdu(3, &[0x02, 0x13]), at(a, 2))]);
+        assert_eq!(c.state(), &State::Terminated { reason: 0x13 });
+        c.account(true, false, vec![]);
+        assert_eq!(c.events().len(), 1);
+    }
+
+    /// After LL_START_ENC_REQ (sent in the clear, Vol 6 Part C 1) the
+    /// link's PDUs are encrypted: their control PDUs are not read.
+    #[test]
+    fn encryption_stops_the_reading() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let a = c.next_due().anchor_pair;
+        c.account(true, false, vec![(pdu(3, &[0x05]), at(a, 1))]);
+        assert_eq!(c.encrypted_from(), Some(0));
+        let a = c.next_due().anchor_pair;
+        c.account(
+            true,
+            false,
+            vec![(pdu(3, &[0x0c, 0x0c, 0x4c, 0x00, 0x34, 0x12]), at(a, 6))],
+        );
+        assert_eq!(c.events()[0].pdus[0].control, None);
+    }
+
+    /// Out of view, a lost feed and a miss are three accounts.
+    #[test]
+    fn accounts_are_kept_apart() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        c.account(false, false, vec![]);
+        c.account(true, true, vec![]);
+        c.account(true, false, vec![]);
+        let accounts: Vec<Account> = c.events().iter().map(|e| e.account).collect();
+        assert_eq!(
+            accounts,
+            [Account::Missed, Account::FeedLost, Account::NotInView]
+        );
+    }
+
+    /// The newest events are kept, the oldest let go.
+    #[test]
+    fn the_newest_events_are_kept() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        for _ in 0..EVENTS_KEPT + 20 {
+            c.account(false, false, vec![]);
+        }
+        assert_eq!(c.events().len(), EVENTS_KEPT);
+        assert_eq!(c.events()[0].counter, (EVENTS_KEPT + 19) as u16);
     }
 
     /// A map with no used channel is no connection to follow.
