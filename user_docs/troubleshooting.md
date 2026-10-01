@@ -103,7 +103,10 @@ it is short.
    it by default. If you actually want it, `--device soapy=driver=audio`.
 4. **Your HackRF or RTL-SDR appears once, not twice.** Deliberate: the native
    backend wins. `--device soapy` forces the other path.
-5. **Still nothing?** Please [open an issue](../../../issues) with the full
+5. **Is the radio on another machine?** That is SoapyRemote, and it has its own
+   short checklist in
+   [Supported hardware](hardware.md#a-radio-on-another-machine-soapyremote).
+6. **Still nothing?** Please [open an issue](../../../issues) with the full
    `SoapySDRUtil --find` output and anything in the log starting `SoapySDR:`.
    That backend was written from the API rather than from owning the hardware, so
    your report is not a nuisance, it is the test.

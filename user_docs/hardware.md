@@ -139,6 +139,7 @@ dropped.
 | Opening a device, reading its capabilities | Verified, on a HackRF through `SoapyHackRF` |
 | Streaming, at full sample rate, no drops | Verified, same HackRF, 8 Msps and 10 Msps |
 | The two radios above, unaffected | Verified. The native paths did not change |
+| A HackRF through **SoapyRemote** | Verified by a user, not by me: Raspberry Pi Zero 2 W server, Wi-Fi link, 1 Msps. See [below](#a-radio-on-another-machine-soapyremote) |
 | **Every other radio** | **Unverified.** The code is right as far as I can reason. That is not the same as right |
 
 So if you have an Airspy, an RSP, a Pluto or a Lime: you are the test. I would
@@ -166,11 +167,59 @@ sdrtop --device soapy=driver=airspy
 an issue. If SoapySDR cannot see your radio, sdrtop has no chance, and the
 problem is a missing driver module rather than anything in here.
 
+### A radio on another machine: SoapyRemote
+
+SoapyRemote puts the radio on one machine and sdrtop on another: a HackRF on a
+Raspberry Pi in the attic, sdrtop on the laptop downstairs. To sdrtop it is still
+a SoapySDR device, so everything on this page applies. The network is just one
+more stage in the chain, and usually the slowest one.
+
+On the machine with the radio, install the server (`soapyremote-server` on
+Debian and Ubuntu) next to the radio's own driver module, and start it:
+
+```sh
+SoapySDRServer --bind
+```
+
+On the machine running sdrtop, install the client module
+(`soapysdr-module-remote`), then:
+
+```sh
+# Can this machine see the server? Start here, as always.
+SoapySDRUtil --find="driver=remote"
+
+# Only radios reached over the network
+sdrtop --device soapy=driver=remote
+
+# One server in particular, written exactly as SoapySDRUtil prints it
+sdrtop --device soapy=remote=tcp://192.168.1.20:55132
+```
+
+The remote radio shows up in the picker as `SoapySDR · remote · HackRF One …`,
+and from there it is the same radio as if it were plugged in locally.
+
+Two things to know before you rely on it:
+
+- **sdrtop finds the server the way SoapyRemote finds it on its own**, by asking
+  the local network. If `SoapySDRUtil --find="driver=remote"` lists your radio,
+  sdrtop will too. If it only shows up when you hand SoapySDRUtil the address
+  yourself (another subnet, a VPN, a network that drops multicast), sdrtop
+  cannot reach it yet: there is no way to give sdrtop the address up front.
+- **Every sample crosses the network.** Pick a sample rate the link can carry.
+  The setup this was verified on ran 1 Msps over Wi-Fi that managed about
+  1.8 MB/s. If the link falls behind, the drop counters say so, and here the
+  culprit is the network rather than the USB cable: lower the rate first
+  ([more on drops](troubleshooting.md#samples-are-dropping)).
+
+This works thanks to a user who owns this exact setup, found why it did not, and
+sent the fix. That is exactly how the grey rows above are meant to turn green.
+
 ### The gotchas I already hit, so you do not have to
 
 | Symptom | Cause / fix |
 |---|---|
 | Your **sound card** shows up as an SDR | It is real: `soapysdr-module-audio` presents audio inputs as SDR sources, which is genuinely useful with a soundcard receiver and confusing on a laptop. sdrtop skips the `audio` driver by default. Ask for it with `--device soapy=driver=audio` |
+| A **SoapyRemote** radio is listed but **will not open** | A bug in 0.6.2 and earlier: the server address was dropped on the way from the picker to the open. Fixed; update sdrtop |
 | Your HackRF or RTL-SDR appears **once**, not twice, even with the Soapy module installed | On purpose. sdrtop's own driver for those two knows more about them than the generic path does, so the native one wins. Force the other with `--device soapy` |
 | The **RF bench is missing** its noise figure, MDS and linearity card | Also on purpose. Those model a specific front end stage by stage. SoapySDR does not publish that, and inventing it would be worse than leaving it out |
 | **No `[A]` boost** on your device | sdrtop asks the driver whether there is an automatic gain mode and only offers the key if there is. A HackRF reached through SoapySDR reports there is not, which surprised me too |
