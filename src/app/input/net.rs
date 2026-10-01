@@ -302,11 +302,7 @@ pub(super) fn net_bt_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction
 pub(super) fn net_ble_connection(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
     let mut m = metrics(ctx.state);
     let rows = crate::ui::panels::net::ble::ble_connection::selected(&m).map_or(0, |f| {
-        f.connection
-            .events()
-            .iter()
-            .map(|e| e.pdus.len().max(1))
-            .sum::<usize>()
+        crate::ui::panels::net::ble::ble_connection::row_count(&f.connection)
     });
     let view = &mut m.net.connection_view;
     match key.code {
@@ -967,10 +963,11 @@ mod tests {
             };
             let now = std::time::Instant::now();
             m.net.follow(&c, (false, false, false), 0.0, 20e6, now);
+            // Missed, so each is a row of its own (a run out of view is one).
             for _ in 0..3 {
                 m.net.ble_connections[0]
                     .connection
-                    .account(false, false, Vec::new());
+                    .account(true, false, Vec::new());
             }
         }
         for _ in 0..5 {

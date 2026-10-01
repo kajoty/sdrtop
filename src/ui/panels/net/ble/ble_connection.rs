@@ -141,6 +141,80 @@ fn pdu_words(h: &HeardPdu, encrypted: bool) -> String {
     }
 }
 
+/// What the list shows, newest first: an event, or a run of two or more
+/// events in a row whose channels were all out of view, folded into one: at
+/// 8 channels of 37 three events in four are, and a row each buried the
+/// ones that were heard.
+enum Item<'a> {
+    Event(&'a Event),
+    OutOfView {
+        newest: u16,
+        oldest: u16,
+        count: usize,
+    },
+}
+
+fn items(c: &crate::signal::ble::follow::Connection) -> Vec<Item<'_>> {
+    fn close<'a>(run: &mut Vec<&'a Event>, out: &mut Vec<Item<'a>>) {
+        match run.as_slice() {
+            [] => {}
+            [one] => out.push(Item::Event(one)),
+            [first, .., last] => out.push(Item::OutOfView {
+                newest: first.counter,
+                oldest: last.counter,
+                count: run.len(),
+            }),
+        }
+        run.clear();
+    }
+    let mut out = Vec::new();
+    let mut run: Vec<&Event> = Vec::new();
+    for e in c.events() {
+        if e.account == Account::NotInView {
+            run.push(e);
+        } else {
+            close(&mut run, &mut out);
+            out.push(Item::Event(e));
+        }
+    }
+    close(&mut run, &mut out);
+    out
+}
+
+/// How many rows the list has: what `↓` scrolls through.
+pub(crate) fn row_count(c: &crate::signal::ble::follow::Connection) -> usize {
+    items(c)
+        .iter()
+        .map(|i| match i {
+            Item::Event(e) => e.pdus.len().max(1),
+            Item::OutOfView { .. } => 1,
+        })
+        .sum()
+}
+
+/// A folded run's one row.
+fn run_row(
+    newest: u16,
+    oldest: u16,
+    count: usize,
+    theme: &crate::Theme,
+) -> (Vec<String>, Vec<Option<Color>>) {
+    let mut ink = vec![None; COLUMNS.len()];
+    ink[WHERE] = Some(theme.stale);
+    ink[0] = Some(theme.stale);
+    (
+        vec![
+            format!("{newest}-{oldest}"),
+            String::new(),
+            format!("not in view ({count})"),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        ink,
+    )
+}
+
 /// One event's rows: one a packet, the event's own fields on the first.
 fn event_rows(
     e: &Event,
@@ -345,10 +419,16 @@ impl Panel for NetBleConnectionPanel {
 
         let mut lines = parameter_lines(followed, state, width, theme);
         let body = height.saturating_sub(lines.len() + 2);
-        let rows: Vec<(Vec<String>, Vec<Option<Color>>)> = c
-            .events()
-            .iter()
-            .flat_map(|e| event_rows(e, c.encrypted_from(), central, theme))
+        let rows: Vec<(Vec<String>, Vec<Option<Color>>)> = items(c)
+            .into_iter()
+            .flat_map(|item| match item {
+                Item::Event(e) => event_rows(e, c.encrypted_from(), central, theme),
+                Item::OutOfView {
+                    newest,
+                    oldest,
+                    count,
+                } => vec![run_row(newest, oldest, count, theme)],
+            })
             .skip(state.net.connection_view.first_visible)
             .take(body)
             .collect();
@@ -490,6 +570,28 @@ mod tests {
         ] {
             assert!(text.contains(want), "{want}:\n{text}");
         }
+    }
+
+    /// A run of events out of view is one row, newest to oldest and how
+    /// many; one alone keeps its own row and channel.
+    #[test]
+    fn a_run_out_of_view_is_one_row() {
+        let mut m = followed();
+        let conn = &mut m.net.ble_connections[0].connection;
+        for _ in 0..3 {
+            conn.account(false, false, Vec::new());
+        }
+        conn.account(true, false, Vec::new());
+        let text = draw(NetBleConnectionPanel, 191, 24, &m).join("\n");
+        assert!(text.contains("6-4"), "{text}");
+        assert!(text.contains("not in view (3)"), "{text}");
+        // Event 1, out of view alone between two in view, keeps its row.
+        let one = text
+            .lines()
+            .find(|l| l.contains("not in view") && !l.contains('('))
+            .unwrap();
+        assert!(one.contains(" 1 "), "{one}");
+        assert_eq!(row_count(&m.net.ble_connections[0].connection), 7);
     }
 
     /// Masked, the access address is the connection's number and the two

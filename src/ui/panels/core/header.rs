@@ -591,7 +591,8 @@ fn net_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
         };
         fields.push(BandField::new(format!("gaps {}", health.gaps), style, 4));
     }
-    compose_net_band(state.net.mode, &fields, theme, inner_width)
+    let section = crate::ui::menu::model::section_title(&state.ui.section);
+    compose_net_band(&section, state.net.mode, &fields, theme, inner_width)
 }
 
 /// A decode load as the band shows it: a percentage while it is one a reader
@@ -700,6 +701,7 @@ impl BandField {
 /// channel goes last, and `NET` and the mode never go, because a header that
 /// has stopped saying which mode is running is worse than no header.
 fn compose_net_band(
+    section: &str,
     mode: crate::state::NetMode,
     fields: &[BandField],
     theme: &crate::Theme,
@@ -709,7 +711,8 @@ fn compose_net_band(
 
     const SEP: &str = " \u{b7} ";
     let sep_w = SEP.chars().count();
-    let mut width = 1 + 3 + sep_w + mode.label().len(); // " NET" + sep + mode
+    // " NET" (or the section's title) + sep + mode.
+    let mut width = 1 + section.chars().count() + sep_w + mode.label().len();
 
     let mut by_importance: Vec<usize> = (0..fields.len()).collect();
     by_importance.sort_by_key(|&i| std::cmp::Reverse(fields[i].keep));
@@ -723,7 +726,10 @@ fn compose_net_band(
     }
 
     let mut spans = vec![
-        Span::styled(" NET", Style::default().fg(theme.border_accent)),
+        Span::styled(
+            format!(" {section}"),
+            Style::default().fg(theme.border_accent),
+        ),
         Span::styled(SEP, Style::default().fg(theme.label)),
         Span::styled(
             mode.label().to_string(),
@@ -1369,6 +1375,27 @@ mod tests {
         m
     }
 
+    /// The band line names the section it is in: the band's own, or either
+    /// Bluetooth's, as the menu titles them.
+    #[test]
+    fn the_net_band_names_its_section() {
+        let theme = crate::Theme::sdr();
+        for (section, title) in [
+            ("net", " NET ·"),
+            ("le", " LE ·"),
+            ("classic", " Classic ·"),
+        ] {
+            let mut m = net_fixture();
+            m.ui.section = section.to_string();
+            let text: String = net_band_line(&m, &theme, 191)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(text.starts_with(title), "{section}: {text}");
+        }
+    }
+
     /// In NET the strip lights what the radio sees: the window around the
     /// tuning, the watched classic channels in their ink within it, and the
     /// BLE decoder's channel as a dot, the whole strip exactly the frame wide.
@@ -1465,7 +1492,7 @@ mod tests {
             BandField::new("gaps 0".to_string(), v, 4),
         ];
         let render = |w: u16| -> String {
-            compose_net_band(crate::state::NetMode::Lock, &fields, &theme, w)
+            compose_net_band("NET", crate::state::NetMode::Lock, &fields, &theme, w)
                 .spans
                 .iter()
                 .map(|s| s.content.as_ref())

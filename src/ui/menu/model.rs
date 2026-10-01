@@ -171,7 +171,10 @@ pub fn build(presets: &HashMap<String, PresetConfig>) -> Menu {
     Menu { sections, warnings }
 }
 
-fn section_title(id: &str) -> String {
+/// A section's title as the menu shows it: the known ones' own, `Other`, or
+/// the id itself for one a user preset invented. Also what the NET header
+/// calls the section it is in.
+pub fn section_title(id: &str) -> String {
     if let Some((_, title)) = KNOWN.iter().find(|(k, _)| *k == id) {
         return (*title).to_string();
     }
