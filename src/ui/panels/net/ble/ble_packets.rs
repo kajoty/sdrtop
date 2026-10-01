@@ -364,7 +364,10 @@ impl Panel for NetBlePacketsPanel {
     fn focus_bindings(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("↑↓", "select a packet"),
-            ("Enter", "only this address, or all again"),
+            (
+                "Enter",
+                "only this address, or all again; on a CONNECT_IND, its connection",
+            ),
             ("H", "hold the list, or let it run"),
         ]
     }

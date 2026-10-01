@@ -364,7 +364,11 @@ impl Panel for NetBleConnectionPanel {
     }
 
     fn focus_bindings(&self) -> &'static [(&'static str, &'static str)] {
-        &[("↑↓", "scroll the events"), ("End", "back to the newest")]
+        &[
+            ("↑↓", "scroll the events"),
+            ("End", "back to the newest"),
+            ("← →", "the previous or next connection"),
+        ]
     }
 
     fn chrome(&self, state: &SdrMetrics) -> PanelChrome {
