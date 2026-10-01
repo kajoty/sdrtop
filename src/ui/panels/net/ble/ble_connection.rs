@@ -80,6 +80,13 @@ const BREATHING: usize = 2;
 
 const NOT_KNOWN: &str = "·";
 
+/// What a clock reading is printed to, ppm, at most: its own uncertainty
+/// decides below that.
+const CLOCK_RESOLUTION_PPM: f64 = 0.1;
+
+/// What T_IFS is printed to, us, at most.
+const T_IFS_RESOLUTION_US: f64 = 0.1;
+
 /// The connection the view shows: the one selected, if still followed, or
 /// the newest.
 pub(crate) fn selected(state: &SdrMetrics) -> Option<&FollowedConnection> {
@@ -331,6 +338,113 @@ fn parameter_lines(
         .collect()
 }
 
+/// The width of a MEASURED row's label.
+const LABEL_W: usize = 8;
+
+/// What the events followed measure, read off them: the Central's clock
+/// against this radio's, the Peripheral's turns against T_IFS, and the CRC
+/// per channel heard.
+fn measured_lines(
+    f: &FollowedConnection,
+    state: &SdrMetrics,
+    width: usize,
+    theme: &crate::Theme,
+) -> Vec<Line<'static>> {
+    use crate::signal::ble::follow::T_IFS_TOLERANCE_US;
+    use crate::ui::widgets::reading::Reading;
+    let c = &f.connection;
+    let row = |label: &str, text: String, ink: Color| {
+        Line::from(vec![
+            crate::ui::chrome::field(label, LABEL_W, theme),
+            Span::styled(text, Style::default().fg(ink)),
+        ])
+    };
+    let mut out = vec![crate::ui::chrome::section(
+        "measured",
+        "Core 5.4 Vol 6 Part B 4.1.1, 4.2.1, 4.5.1",
+        width,
+        theme,
+    )];
+    let room = width.saturating_sub(LABEL_W + 1);
+
+    // The clock: relative to this radio until a reference makes it
+    // absolute, then judged against the SCA the Central declared, the
+    // accuracy its anchors are scheduled by between events.
+    let clock = match c.clock_ppm() {
+        None => (
+            format!("collecting: {} of 3 anchors", c.anchors_heard()),
+            theme.label,
+        ),
+        Some(raw) => {
+            let (clock, provenance) = state.radio.corrected_ppm(raw, std::time::Instant::now());
+            let (_, sca) = crate::signal::ble::connect::sca_ppm(c.params().sca);
+            let reading = Reading::new(clock, "ppm", CLOCK_RESOLUTION_PPM).text();
+            let anchors = c.anchors_heard();
+            if provenance == crate::state::Provenance::Unreferenced {
+                (
+                    format!("{reading} against this radio, relative · {anchors} anchors"),
+                    theme.value,
+                )
+            } else {
+                // Outside, at the edge within twice its uncertainty, or
+                // inside: the classic slot clock's three words.
+                let (v, s, limit) = (clock.value().abs(), clock.sigma(), sca as f64);
+                let (word, ink) = if v > limit {
+                    ("outside", theme.status_warn)
+                } else if v + 2.0 * s > limit {
+                    ("at the edge of", theme.status_warn)
+                } else {
+                    ("inside", theme.value)
+                };
+                (
+                    format!("{reading}, {word} its declared ≤{sca} ppm · {anchors} anchors"),
+                    ink,
+                )
+            }
+        }
+    };
+    out.push(row("clock", clock.0, clock.1));
+
+    let t_ifs = match c.t_ifs() {
+        None => ("no turn heard yet".to_string(), theme.label),
+        Some(t) => (
+            format!(
+                "{} over {} · {} outside 150 ±{} us",
+                Reading::new(t.mean, "us", T_IFS_RESOLUTION_US).text(),
+                t.count,
+                t.outside,
+                T_IFS_TOLERANCE_US
+            ),
+            if t.outside > 0 {
+                theme.status_warn
+            } else {
+                theme.value
+            },
+        ),
+    };
+    out.push(row("T_IFS", t_ifs.0, t_ifs.1));
+
+    let heard: Vec<String> = c
+        .per_channel()
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.0 > 0)
+        .map(|(ch, n)| format!("ch {ch}: {} of {}", n.1, n.0))
+        .collect();
+    let crc = if heard.is_empty() {
+        "nothing heard yet".to_string()
+    } else {
+        heard.join(" · ")
+    };
+    for (i, chunk) in crate::ui::chrome::wrap(&crc, room, 2)
+        .into_iter()
+        .enumerate()
+    {
+        out.push(row(if i == 0 { "CRC" } else { "" }, chunk, theme.value));
+    }
+    out
+}
+
 /// The last line: the events kept, by account.
 fn tally(
     c: &crate::signal::ble::follow::Connection,
@@ -422,6 +536,7 @@ impl Panel for NetBleConnectionPanel {
         let central = theme.series_color(k);
 
         let mut lines = parameter_lines(followed, state, width, theme);
+        lines.extend(measured_lines(followed, state, width, theme));
         let body = height.saturating_sub(lines.len() + 2);
         let rows: Vec<(Vec<String>, Vec<Option<Color>>)> = items(c)
             .into_iter()
@@ -574,6 +689,35 @@ mod tests {
         ] {
             assert!(text.contains(want), "{want}:\n{text}");
         }
+    }
+
+    /// MEASURED: the Central's clock once three anchors are heard, said as
+    /// relative without a reference; T_IFS pooled and judged; CRC per
+    /// channel heard.
+    #[test]
+    fn the_measured_section_reads_the_events() {
+        let m = followed();
+        let text = draw(NetBleConnectionPanel, 191, 24, &m).join("\n");
+        for want in [
+            "MEASURED",
+            "collecting: 1 of 3 anchors",
+            "T_IFS",
+            "over 1 · 0 outside 150 ±2 us",
+            "ch 7: 2 of 2",
+        ] {
+            assert!(text.contains(want), "{want}:\n{text}");
+        }
+        let mut m = followed();
+        let conn = &mut m.net.ble_connections[0].connection;
+        for _ in 0..4 {
+            let a = conn.next_due().anchor_pair;
+            conn.account(true, false, vec![(pdu(1, &[]), at(a, 0))]);
+        }
+        let text = draw(NetBleConnectionPanel, 191, 24, &m).join("\n");
+        assert!(
+            text.contains("ppm against this radio, relative · 5 anchors"),
+            "{text}"
+        );
     }
 
     /// A run of events out of view is one row, newest to oldest and how

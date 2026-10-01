@@ -35,6 +35,7 @@ use super::data::DataPdu;
 use super::llcp;
 use super::receive::DataTiming;
 use super::Phy;
+use crate::signal::dsp::uncertainty::Uncertain;
 
 /// The accuracy this radio's own sample clock is assumed to keep, in ppm,
 /// for the listening window only: an assumption, neither measured nor read
@@ -167,6 +168,22 @@ pub enum State {
 /// How many events a connection keeps, newest first.
 pub const EVENTS_KEPT: usize = 500;
 
+/// How many anchors heard the Central's clock is fitted to, the newest.
+const ANCHORS_KEPT: usize = 2_000;
+
+/// The Inter Frame Space's tolerance, us: "the start of a packet is
+/// transmitted 150±2 µs after the end of the previous" (4.2.1).
+pub const T_IFS_TOLERANCE_US: f64 = 2.0;
+
+/// The turns heard, pooled: T_IFS's mean with its standard error, how many,
+/// and how many fell outside 150 ± [`T_IFS_TOLERANCE_US`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TIfs {
+    pub mean: Uncertain,
+    pub count: usize,
+    pub outside: usize,
+}
+
 /// T_IFS, us (4.1.1).
 const T_IFS_US: f64 = 150.0;
 
@@ -204,6 +221,14 @@ pub struct Connection {
     last_heard: Option<(u16, f64)>,
     /// Events in view missed since then.
     misses: u32,
+    /// Events accounted for since the CONNECT_IND, never wrapping: the
+    /// x of the clock fit, where the 16-bit counter wraps at 65536.
+    index: u64,
+    /// Anchors heard, `(index, pair)`, for the Central's clock: since the
+    /// last connection update, which changes the interval they are on.
+    anchors: std::collections::VecDeque<(u64, f64)>,
+    /// Packets heard and CRCs passed, per data channel.
+    per_channel: [(u32, u32); 37],
 }
 
 impl Connection {
@@ -243,6 +268,9 @@ impl Connection {
             encrypted_from: None,
             last_heard: None,
             misses: 0,
+            index: 0,
+            anchors: std::collections::VecDeque::new(),
+            per_channel: [(0, 0); 37],
         };
         this.channel = this.hop();
         Some(this)
@@ -288,6 +316,83 @@ impl Connection {
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// The Central's clock against this radio's, ppm, positive when the
+    /// Central's runs fast: a least-squares line through the anchors heard
+    /// (the event's index against where its anchor was, in pairs), its slope
+    /// against the interval the Central was to keep (4.5.1), with the
+    /// slope's standard error from the anchors' scatter about the line. The
+    /// sign is the classic slot clock's (`signal::bt::slots`, read through
+    /// the Piconets panel): a radio reference corrects both the same way.
+    /// `None` with fewer than three anchors.
+    pub fn clock_ppm(&self) -> Option<Uncertain> {
+        let n = self.anchors.len();
+        if n < 3 {
+            return None;
+        }
+        let nf = n as f64;
+        let mx = self.anchors.iter().map(|a| a.0 as f64).sum::<f64>() / nf;
+        let my = self.anchors.iter().map(|a| a.1).sum::<f64>() / nf;
+        let sxx: f64 = self.anchors.iter().map(|a| (a.0 as f64 - mx).powi(2)).sum();
+        if sxx <= 0.0 {
+            return None;
+        }
+        let sxy: f64 = self
+            .anchors
+            .iter()
+            .map(|a| (a.0 as f64 - mx) * (a.1 - my))
+            .sum();
+        let slope = sxy / sxx;
+        let ssr: f64 = self
+            .anchors
+            .iter()
+            .map(|a| (a.1 - my - slope * (a.0 as f64 - mx)).powi(2))
+            .sum();
+        let slope_sigma = (ssr / (nf - 2.0) / sxx).sqrt();
+        let interval = self.interval_pairs();
+        Some(Uncertain::from_sigma(
+            (1.0 - slope / interval) * 1e6,
+            slope_sigma / interval * 1e6,
+        ))
+    }
+
+    /// How many anchors the clock is fitted to.
+    pub fn anchors_heard(&self) -> usize {
+        self.anchors.len()
+    }
+
+    /// The turns heard in the events kept, pooled (4.1.1).
+    pub fn t_ifs(&self) -> Option<TIfs> {
+        let gaps: Vec<f64> = self
+            .events
+            .iter()
+            .flat_map(|e| e.pdus.iter().filter_map(|p| p.t_ifs_us))
+            .collect();
+        if gaps.is_empty() {
+            return None;
+        }
+        let n = gaps.len() as f64;
+        let mean = gaps.iter().sum::<f64>() / n;
+        let sd = if gaps.len() > 1 {
+            (gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
+        } else {
+            0.0
+        };
+        Some(TIfs {
+            mean: Uncertain::from_sigma(mean, sd / n.sqrt()),
+            count: gaps.len(),
+            outside: gaps
+                .iter()
+                .filter(|g| (*g - T_IFS_US).abs() > T_IFS_TOLERANCE_US)
+                .count(),
+        })
+    }
+
+    /// Packets heard and CRCs passed, per data channel, over the
+    /// connection.
+    pub fn per_channel(&self) -> &[(u32, u32); 37] {
+        &self.per_channel
     }
 
     /// The event LL_START_ENC_REQ was heard in: every packet after it is
@@ -344,6 +449,10 @@ impl Connection {
             counter: self.counter,
             pair: anchor_pair,
         });
+        self.anchors.push_back((self.index, anchor_pair));
+        if self.anchors.len() > ANCHORS_KEPT {
+            self.anchors.pop_front();
+        }
         self.advance();
     }
 
@@ -355,6 +464,7 @@ impl Connection {
 
     fn advance(&mut self) {
         self.counter = self.counter.wrapping_add(1);
+        self.index += 1;
         self.apply_due_updates();
         self.channel = self.hop();
     }
@@ -418,6 +528,8 @@ impl Connection {
                         sync_pair: old.anchor_pair - old.widening_pairs,
                     };
                     self.anchor = None;
+                    // The anchors before are on the old interval.
+                    self.anchors.clear();
                     self.params.interval = interval;
                     self.params.latency = latency;
                     self.params.timeout = timeout;
@@ -457,6 +569,10 @@ impl Connection {
         let mut central_at = None;
         let mut ends = None;
         for (pdu, timing) in heard {
+            if let Some(n) = self.per_channel.get_mut(due.channel as usize) {
+                n.0 += 1;
+                n.1 += pdu.crc_ok as u32;
+            }
             let (sender, t_ifs_us) = match before {
                 None if (opens..=closes).contains(&timing.start_pair) => {
                     (Some(Sender::Central), None)
@@ -899,6 +1015,58 @@ mod tests {
         }
         assert_eq!(c.events().len(), EVENTS_KEPT);
         assert_eq!(c.events()[0].counter, (EVENTS_KEPT + 19) as u16);
+    }
+
+    /// The Central's clock from its anchors: a Central 12 ppm fast puts
+    /// its anchors 12 ppm closer together on this radio's clock, and the
+    /// fit through 200 of them says +12 to well within its uncertainty.
+    #[test]
+    fn the_centrals_clock_is_read_from_its_anchors() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        assert_eq!(c.clock_ppm(), None, "nothing heard yet");
+        let first = c.next_due().anchor_pair;
+        let interval = 80.0 * 1.25e-3 * RATE * (1.0 - 12e-6);
+        for k in 0..200 {
+            // A little scatter, as a real anchor's timing has.
+            let jitter = ((k * 37 % 11) as f64 - 5.0) * 0.5;
+            let at_k = first + k as f64 * interval + jitter;
+            c.account(true, false, vec![(pdu(1, &[]), at(at_k, 0))]);
+        }
+        let clock = c.clock_ppm().unwrap();
+        assert!((clock.value() - 12.0).abs() < 0.05, "{clock:?}");
+        assert!(clock.sigma() > 0.0 && clock.sigma() < 0.05, "{clock:?}");
+        assert!(
+            (clock.value() - 12.0).abs() < 4.0 * clock.sigma() + 0.001,
+            "{clock:?}"
+        );
+    }
+
+    /// T_IFS pooled over the answers heard, and how many fall outside
+    /// 150 +-2 us (4.1.1, 4.2.1).
+    #[test]
+    fn t_ifs_is_pooled_and_judged() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        assert!(c.t_ifs().is_none());
+        for t_ifs in [150.4, 149.8, 150.1, 153.0] {
+            let heard = exchange(&c, t_ifs);
+            c.account(true, false, heard);
+        }
+        let t = c.t_ifs().unwrap();
+        assert_eq!((t.count, t.outside), (4, 1));
+        assert!((t.mean.value() - 150.825).abs() < 0.01, "{t:?}");
+    }
+
+    /// Packets and CRC passes, counted per data channel over the whole
+    /// connection.
+    #[test]
+    fn crc_is_counted_per_channel() {
+        let mut c = Connection::new(&params(80, 0, 1), false, 0.0, RATE).unwrap();
+        let ch = c.next_due().channel;
+        let mut heard = exchange(&c, 150.0);
+        heard[1].0.crc_ok = false;
+        c.account(true, false, heard);
+        assert_eq!(c.per_channel()[ch as usize], (2, 1));
+        assert_eq!(c.per_channel().iter().map(|p| p.0).sum::<u32>(), 2);
     }
 
     /// A map with no used channel is no connection to follow.
