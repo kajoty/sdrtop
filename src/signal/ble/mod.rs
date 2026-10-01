@@ -20,7 +20,11 @@ pub mod address;
 pub mod assigned;
 pub mod channel;
 pub mod coded;
+// Called only by its own tests until the receiver for a connection's own
+// access address reads it.
 pub mod connect;
+#[allow(dead_code)]
+pub mod data;
 pub mod detect;
 pub mod fer;
 pub mod gfsk;

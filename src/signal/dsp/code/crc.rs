@@ -5,10 +5,9 @@
 //!
 //! Source: Bluetooth Core Specification, Vol 6, Part B, section 3.1.1 -
 //! polynomial `0x00065B`, reflected input and output, initial value
-//! `0x555555` for advertising channel PDUs and test packets. (A data channel
-//! connection's own CRC initial value is carried in `CONNECT_IND` and is a
-//! later step's concern; nothing here assumes the advertising value where it
-//! should not.)
+//! `0x555555` for advertising channel PDUs and test packets. A data channel
+//! connection's own initial value is carried in its `CONNECT_IND`, and
+//! [`crc24`] takes it.
 //!
 //! **Verified against an independent, authoritative catalogue, not the
 //! specification restated from memory.** The CRC RevEng catalogue
@@ -31,9 +30,6 @@
 //! well-known `0xEDB88320` the bit-reversal of its own polynomial
 //! `0x04C11DB7`), not something specific to Bluetooth.
 
-/// No consumer yet outside this module's own tests: nothing decodes a full
-/// PDU to check against a CRC until B6 puts a real packet on screen. Applies
-/// to every item below.
 const POLY: u32 = 0x00065B;
 const INIT: u32 = 0x555555;
 const MASK: u32 = 0x00FF_FFFF;
@@ -51,8 +47,16 @@ fn reflect24(mut x: u32) -> u32 {
 /// CRC-24/BLE of `data`: reflected input and output, the advertising-channel
 /// and test-packet initial value.
 pub fn crc24_ble(data: &[u8]) -> u32 {
+    crc24(data, INIT)
+}
+
+/// The same CRC from another initial value: a connection's own, which its
+/// CONNECT_IND carries and every data channel PDU on it is checked under
+/// (Core 5.4 Vol 6 Part B 3.1.1). `init`'s bit 0 is position 0, as the
+/// specification numbers the register.
+pub fn crc24(data: &[u8], init: u32) -> u32 {
     let rev_poly = reflect24(POLY);
-    let mut reg = reflect24(INIT);
+    let mut reg = reflect24(init & MASK);
     for &byte in data {
         reg ^= byte as u32;
         for _ in 0..8 {
@@ -93,6 +97,16 @@ mod tests {
         let a = crc24_ble(b"advertising channel PDU");
         let b = crc24_ble(b"advertising channel PDX");
         assert_ne!(a, b);
+    }
+
+    /// With the advertising init, the general form is the advertising one;
+    /// another init moves the result.
+    #[test]
+    fn the_general_form_takes_the_link_init() {
+        for data in [&b"123456789"[..], b"", b"advertising channel PDU"] {
+            assert_eq!(crc24(data, 0x55_5555), crc24_ble(data));
+        }
+        assert_ne!(crc24(b"123456789", 0x3a_5b7c), crc24_ble(b"123456789"));
     }
 
     /// The empty message still produces a value - the initial value alone,
