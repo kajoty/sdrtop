@@ -26,6 +26,7 @@ pub mod detect;
 pub mod fer;
 pub mod gfsk;
 pub mod interval;
+pub mod llcp;
 pub mod measure;
 pub mod pdu;
 pub mod receive;
