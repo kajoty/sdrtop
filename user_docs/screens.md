@@ -46,7 +46,7 @@ opens it while you are in that section. The number is the same one the footer
 shows you on the deck, because both read the same table. There is no second copy
 to go stale.
 
-Every NET view has a third line: what that screen would tell you now, built by
+Every view in NET, LE and Classic has a third line: what that screen would tell you now, built by
 the view's own rules. `●` means the receiver feeding it is running; `○` means it
 is not, and the line gives the session's figures as the session's.
 

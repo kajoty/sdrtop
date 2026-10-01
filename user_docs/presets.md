@@ -57,7 +57,7 @@ panels  = [ ... ]   # exactly as above
 
 | Field | What it does |
 |-------|--------------|
-| `section` | Which family it belongs to: `command_rail`, `lab`, `sweep`, `micro`, `net`, or a name of your own, which becomes a new section. `hidden` keeps it out of the menu entirely |
+| `section` | Which family it belongs to: `command_rail`, `lab`, `sweep`, `micro`, `net`, `le`, `classic`, or a name of your own, which becomes a new section. `hidden` keeps it out of the menu entirely |
 | `slot` | The number key, `1` to `9`, **within that section**. Leave it out and the layout is still listed, just without a shortcut |
 | `title` | What the menu calls it. Defaults to the preset name |
 | `blurb` | The half-line under the title. Optional, and worth writing: it is what tells you which of two similar layouts you want |

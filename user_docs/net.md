@@ -13,18 +13,21 @@ The section only appears on a radio that reaches the band and can sample fast
 enough for its cheapest mode. On one that cannot, the section is hidden and
 the log says why in one line.
 
-Seven views, one question each. The key is the number to press while the NET
-section is active:
+It lives in three sections of the menu: **NET** for the band itself, **LE**
+for Bluetooth Low Energy and **Classic** for classic Bluetooth. They come and
+go together, because one radio requirement admits all three, and everything
+on this page holds in all of them. Seven views, one question each; the key is
+the number to press while that section is active:
 
 | Key | View | The question it answers |
 |-----|------|--------------------------|
 | `NET 1` | **Capability** | What can this radio reach and receive here? |
 | `NET 2` | **Survey** | What is in this band, and who is spending the airtime? |
-| `NET 3` | **Census** | Who is here? |
-| `NET 4` | **BLE** | What is this device advertising, and is its transmitter any good? |
-| `NET 5` | **Classic** | Who is running a classic Bluetooth piconet near me? |
-| `NET 6` | **Piconet** | What is this one piconet saying, packet by packet? |
-| `NET 7` | **Bench** | How good is each end of it, side by side? |
+| `LE 1` | **Census** | Who is here? |
+| `LE 2` | **Advertising** | What is this device advertising, and is its transmitter any good? |
+| `Classic 1` | **Piconets** | Who is running a classic Bluetooth piconet near me? |
+| `Classic 2` | **Packets** | What is this one piconet saying, packet by packet? |
+| `Classic 3` | **Bench** | How good is each end of it, side by side? |
 
 The panels with controls announce them with a highlighted letter in the
 title; the full list is in [Keyboard Shortcuts](keys.md#net-panel-focus-modes).
@@ -65,13 +68,13 @@ introduced.)
 Census views a step is the next advertising channel, 37, 38, 39 and round
 again, because that is the only place advertising happens and anywhere in
 between is an expensive way to hear nothing. On the other views it is one
-block of the band along: the span, or on the Classic view the most channels
+block of the band along: the span, or on the classic views the most channels
 it watches at once (`[net].bt_channels`) if that is fewer, wrapping round at
 the ends. Surveying, the survey owns the tuning, and the keys
 just remind you that `m` locks.
 
 A lock carries across views, so a Survey locked on a Wi-Fi channel would
-arrive at the BLE view parked where no advertising ever comes. Opening an
+arrive at the Advertising view parked where no advertising ever comes. Opening an
 advertising view off the three channels therefore moves the radio to the
 nearest of them, once, and the log says so. Tune somewhere else afterwards
 (a data channel, to catch secondary advertising, say) and it stays where you
@@ -277,8 +280,8 @@ key says what it is counting from. `■ BT 12` is every channel in view,
 `■ BT 12 on 1 ch` is one channel because the load allows no more, and
 `■ BT: not running, load` means the survey has the machine to itself, which
 is not the same as a quiet band. On an old i3 that is about one channel at
-8 Msps and none at 20; the Classic and Piconet views (`NET 5`, `NET 6`)
-always run their full set.
+8 Msps and none at 20; the classic views (`Classic 1` to `3`) always run
+their full set.
 
 ### Decode health
 
@@ -290,7 +293,7 @@ panels is only as complete as this panel says the feed was.
 
 ---
 
-## Census · `NET 3` *(focus `u`)*
+## Census · `LE 1` *(focus `u`)*
 
 One row per transmitter the BLE decoder has confirmed: an address is only
 counted from a packet whose CRC passed, because a corrupted address would be
@@ -325,7 +328,7 @@ the table.
 
 ---
 
-## BLE · `NET 4`
+## Advertising · `LE 2`
 
 Real BLE advertising packets, CRC-checked, as they arrive. The radio has to be
 on an advertising channel (2402, 2426 or 2480 MHz); the header says which
@@ -386,7 +389,7 @@ The selected packet, spelled out:
   them, which means an average under the floor is a real finding and one
   over it is not a promise. Both are read as the test suite defines them,
   from whatever bits the packet carried, the way a classic piconet's are
-  (see [the bench](#bench--net-7-focus-c) below); on LE 1M the packet is taken again
+  (see [the bench](#bench--classic-3-focus-c) below); on LE 1M the packet is taken again
   from the raw samples and timed from the access address, on LE 2M read
   through the receiver's own filter.
 
@@ -412,7 +415,7 @@ is not noise, and this curve is where that shows.
 
 ---
 
-## Classic · `NET 5`
+## Piconets · `Classic 1`
 
 Classic Bluetooth hops across 79 one-megahertz channels, 1600 times a second,
 in a sequence a passive listener does not know in advance. What can be found
@@ -481,7 +484,7 @@ shows `32 left`, `2 left` or the value.
 
 The selected piconet is spelled out under the roster, as a whole: the rule
 of the three classic views is that the piconet as one thing is here, its
-packets on NET 6 and each of its two ends on NET 7.
+packets on Classic 2 and each of its two ends on Classic 3.
 
 - **PICONET**: its LAP, its **UAP** and what that rests on ("resolved by a
   payload CRC" and how many CRCs pass under it, or the candidates left, two
@@ -496,7 +499,7 @@ packets on NET 6 and each of its two ends on NET 7.
   its sample clock share one crystal, which is true of a HackRF and an
   RTL-SDR. The Classic export carries it as `clock_ppm`. Beside it, the
   grid's rms: every member's hits together, so it is not a jitter (the two
-  ends' offset from each other is in it; NET 7 has each end's). Last, one
+  ends' offset from each other is in it; Classic 3 has each end's). Last, one
   line of pooled readings, the modulation `index` and the carrier `f0`,
   every member's.
 - **HEADERS**: once the UAP is one value, what the piconet's headers say
@@ -507,24 +510,24 @@ packets on NET 6 and each of its two ends on NET 7.
   is read or guessed.
 
 
-`Enter` opens [the Piconet view](#piconet--net-6) on the selected piconet,
-and `7` [the Bench](#bench--net-7-focus-c). An inquiry code or a page is not a
+`Enter` opens [the Packets view](#packets--classic-2) on the selected piconet,
+and `3` [the Bench](#bench--classic-3-focus-c). An inquiry code or a page is not a
 piconet either could open, so their whole account stays here. A short panel
 keeps what fits whole and names the rest.
 
 ---
 
-## Piconet · `NET 6`
+## Packets · `Classic 2`
 
 One piconet, packet by packet: its packet list, the whole screen. If the
-Classic view is the room, this is one conversation in it: overheard, timed
+Piconets view is the room, this is one conversation in it: overheard, timed
 and measured, and still not understood, which is the polite way round. It
-is the piconet selected in the Classic view: `Enter` on the roster brings it
-here, and so does `6` with a piconet selected. `← →`, with the list
+is the piconet selected in the Piconets view: `Enter` on the roster brings it
+here, and so does `2` with a piconet selected. `← →`, with the list
 focused, step to the previous or next piconet in the roster's order. With
 none heard, or none selected, the list says which of those it is.
 
-The classic receiver runs here exactly as on the Classic view, same channels,
+The classic receiver runs here exactly as on the Piconets view, same channels,
 same `← →` steps for a locked radio when nothing is focused, so the three
 classic views are three readings of one stream of hits.
 
@@ -569,7 +572,7 @@ blank, and so is `SLOT µs` for a packet from before the grid was fitted:
 times from another run of the stream are on another clock.
 
 `MOD` and `f0` are single readings from one header, noisier than [the
-bench's](#bench--net-7-focus-c)
+bench's](#bench--classic-3-focus-c)
 and printed to the places their own uncertainty allows, a dash where it
 allows none. A value outside its limit turns amber or red, as on the bench;
 everything inside keeps the ordinary ink, so a problem is the thing that
@@ -603,15 +606,15 @@ and the ones not yet placed.
 
 ---
 
-## Bench · `NET 7` *(focus `c`)*
+## Bench · `Classic 3` *(focus `c`)*
 
 The same piconet, each end of it side by side: three columns, MODULATION,
 CARRIER and TIMING, every reading two rows, `▶` the master's in the
 piconet's colour and `◀` the slave's in the ordinary ink, each with its bar
 on the same row, held against the limit the column's heading cites. The
 heading also says what the readings rest on (`258 hdr`, `1204 hits`). A side
-with nothing yet says so in words, never a zero. `7` opens it on the
-piconet selected in the Classic view; `← →`, with the bench focused, step
+with nothing yet says so in words, never a zero. `3` opens it on the
+piconet selected in the Piconets view; `← →`, with the bench focused, step
 through the piconets.
 
 - **Modulation**: each end's BR modulation index and deviation against
@@ -652,14 +655,14 @@ through the piconets.
   decided again from the measurement itself, never taken from the part of
   the receiver that finds packets, because one wrong bit there looked like
   30 kHz of drift. Noise makes drift too, as it does on BLE: see the
-  Modulation note in the BLE view's detail.
+  Modulation note in the Advertising view's detail.
 - **Timing**: each end's timing on the piconet's 625 µs slot grid, fitted to
   every member's hits. Below eight hits it is collecting; hits that do not
   line up on a grid beyond chance are refused as one, never forced onto it.
   Given enough periods to try, a dozen points will line up with almost
   anything, and the panel would rather say "no grid" than find one it
   wanted to find. (The piconet's clock from the same grid is the whole
-  piconet's, so it is on NET 5.)
+  piconet's, so it is on Classic 1.)
 
   Each end's **jitter** is its own packets' scatter about their own average
   timing, which is how 2.2.5 states it, held against its 1 µs. The grid
@@ -728,5 +731,12 @@ shape. A preset of your own that names them needs updating:
 | `net_ble_rf` | `net_ble_detail` (the packet detail) |
 | `net_bt_census` | `net_bt_piconets` (the piconet roster) |
 | the `net_coexist` preset | part of `net_survey`; the `net_coexist` panel itself is unchanged |
+
+The built-in views moved too: Census and the BLE view (now Advertising)
+went from `section = "net"` to `"le"`, the three classic views to
+`"classic"`. A preset of yours still filed under `"net"` keeps working and
+stays in NET; move it with `section` and `slot` if you want it beside its
+kind. All three sections are hidden together on a radio that cannot reach
+the band.
 
 How presets are written is in [Layout presets](presets.md).
