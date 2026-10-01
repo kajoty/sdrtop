@@ -262,6 +262,15 @@ impl Connection {
         &self.params
     }
 
+    /// Which Channel Selection Algorithm the connection hops by, 1 or 2,
+    /// as its CONNECT_IND's ChSel named it.
+    pub fn algorithm(&self) -> u8 {
+        match self.hops {
+            Hops::One(_) => 1,
+            Hops::Two(_) => 2,
+        }
+    }
+
     /// The PHY the Central sends on.
     pub fn phy(&self) -> Phy {
         self.phy
@@ -273,8 +282,6 @@ impl Connection {
     }
 
     /// The events accounted for, newest first.
-    // Read by the Connection view, and its tests until then.
-    #[allow(dead_code)]
     pub fn events(&self) -> &std::collections::VecDeque<Event> {
         &self.events
     }
@@ -286,8 +293,6 @@ impl Connection {
     /// The event LL_START_ENC_REQ was heard in: every packet after it is
     /// encrypted (Vol 6 Part C 1 sends it in the clear and its answers
     /// encrypted).
-    // Read by the Connection view, and its tests until then.
-    #[allow(dead_code)]
     pub fn encrypted_from(&self) -> Option<u16> {
         self.encrypted_from
     }

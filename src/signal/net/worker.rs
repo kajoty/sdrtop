@@ -134,13 +134,6 @@ const EVENT_SPAN_US: f64 = 4_500.0;
 /// after a gap, the rest wait for the next block rather than stall this one.
 const FOLLOW_ROUNDS: usize = 32;
 
-/// Whether a data channel lies inside the band this block holds: its whole
-/// 2 MHz, inside the usable span around the tuning.
-fn channel_in_view(ch: u8, centre_hz: f64, span_hz: f64) -> bool {
-    crate::signal::ble::channel::centre_hz(ch)
-        .is_some_and(|hz| (hz as f64 - centre_hz).abs() <= span_hz / 2.0 - 1e6)
-}
-
 /// The stretch of stream an event is listened to over, in pairs: from its
 /// earliest start less the warm-up to its latest anchor plus an event's
 /// length, never into the next event.
@@ -1131,12 +1124,13 @@ impl NetWorker {
                         })
                         .filter_map(|p| {
                             let c = crate::signal::ble::connect::decode_octets(&p.payload)?;
-                            Some((c, p.ch_sel, connect_end_pair(p, rate_hz)?))
+                            let flags = (p.ch_sel, p.tx_add_random, p.rx_add_random);
+                            Some((c, flags, connect_end_pair(p, rate_hz)?))
                         })
                         .collect();
                     let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    for (c, ch_sel, end) in &connects {
-                        m.net.follow(c, *ch_sel, *end, rate_hz);
+                    for (c, flags, end) in &connects {
+                        m.net.follow(c, *flags, *end, rate_hz, now);
                     }
                     for (address, said) in advertised {
                         m.net.advertised.entry(address).or_default().merge(said);
@@ -1220,7 +1214,11 @@ impl NetWorker {
                             if to > held_end {
                                 continue;
                             }
-                            let in_view = channel_in_view(due.channel, centre_hz, span_hz);
+                            let in_view = crate::signal::ble::channel::in_view(
+                                due.channel,
+                                centre_hz,
+                                span_hz,
+                            );
                             let mut heard = Vec::new();
                             let mut feed_lost = false;
                             if in_view {

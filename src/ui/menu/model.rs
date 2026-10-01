@@ -268,7 +268,10 @@ mod tests {
             v.iter().map(|(s, t)| (Some(*s), t.to_string())).collect()
         };
         assert_eq!(titles("net"), want(&[(1, "Capability"), (2, "Survey")]));
-        assert_eq!(titles("le"), want(&[(1, "Census"), (2, "Advertising")]));
+        assert_eq!(
+            titles("le"),
+            want(&[(1, "Census"), (2, "Advertising"), (3, "Connection")])
+        );
         assert_eq!(
             titles("classic"),
             want(&[(1, "Piconets"), (2, "Packets"), (3, "Bench")])

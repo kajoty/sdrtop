@@ -348,6 +348,7 @@ pub struct NetState {
     /// events the radio's window holds (`signal::ble::follow`), newest
     /// first, at most [`CONNECTIONS_KEPT`].
     pub ble_connections: Vec<FollowedConnection>,
+    pub connection_view: ConnectionView,
     /// Packets that have entered [`Self::ble_packets`] this session: each
     /// one's [`BlePacket::seq`] is the count at its arrival.
     pub ble_heard: u64,
@@ -620,6 +621,27 @@ impl NetState {
         }
     }
 
+    /// A connection's access address as the address mode allows it: in hex,
+    /// or in `masked` as `#n`, the connection's place in the order heard, so
+    /// one connection is one number in every panel. It names a connection,
+    /// not a device, but it is unique to that pair while they are linked.
+    pub fn show_access_address(&self, aa: u32) -> String {
+        match self.address_display {
+            AddressDisplay::Masked => {
+                let heard = self.ble_connections.len();
+                match self
+                    .ble_connections
+                    .iter()
+                    .position(|f| f.connection.access_address() == aa)
+                {
+                    Some(k) => format!("#{}", heard - k),
+                    None => "#?".to_string(),
+                }
+            }
+            _ => format!("{aa:#010x}"),
+        }
+    }
+
     /// A UAP value as the address mode allows it: the next 8 bits of the
     /// master's address after its LAP, so masked with it.
     pub fn show_uap(&self, uap: u8) -> String {
@@ -751,10 +773,23 @@ pub struct NetDecodeHealth {
 /// room's phones and their watches, few enough that each is worth a look.
 pub const CONNECTIONS_KEPT: usize = 16;
 
-/// One connection followed.
+/// One connection followed, when its CONNECT_IND was heard, and whether
+/// its two addresses are random (the packet's TxAdd for InitA, RxAdd for
+/// AdvA).
 #[derive(Clone, Debug)]
 pub struct FollowedConnection {
+    pub seen: std::time::Instant,
+    pub init_random: bool,
+    pub adv_random: bool,
     pub connection: crate::signal::ble::follow::Connection,
+}
+
+/// How the Connection view is being read: which connection, by its access
+/// address (`None`: the newest), and how far its rows are scrolled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ConnectionView {
+    pub selected: Option<u32>,
+    pub first_visible: usize,
 }
 
 impl NetState {
@@ -765,9 +800,10 @@ impl NetState {
     pub fn follow(
         &mut self,
         c: &crate::signal::ble::connect::ConnectIndData,
-        ch_sel: bool,
+        (ch_sel, init_random, adv_random): (bool, bool, bool),
         end_pair: f64,
         raw_rate: f64,
+        now: std::time::Instant,
     ) -> bool {
         use crate::signal::ble::follow::{Connection, State};
         if self
@@ -780,8 +816,15 @@ impl NetState {
         let Some(connection) = Connection::new(c, ch_sel, end_pair, raw_rate) else {
             return false;
         };
-        self.ble_connections
-            .insert(0, FollowedConnection { connection });
+        self.ble_connections.insert(
+            0,
+            FollowedConnection {
+                seen: now,
+                init_random,
+                adv_random,
+                connection,
+            },
+        );
         if self.ble_connections.len() > CONNECTIONS_KEPT {
             let ended = self
                 .ble_connections
@@ -1286,10 +1329,11 @@ mod tests {
     /// [`CONNECTIONS_KEPT`], the ended ones let go before the followed.
     #[test]
     fn connections_are_followed_once_each_and_kept_to_a_number() {
+        let now = std::time::Instant::now();
         let mut net = NetState::default();
-        assert!(net.follow(&connect_ind(1), false, 0.0, 20e6));
+        assert!(net.follow(&connect_ind(1), (false, false, false), 0.0, 20e6, now));
         assert!(
-            !net.follow(&connect_ind(1), false, 9.0, 20e6),
+            !net.follow(&connect_ind(1), (false, false, false), 9.0, 20e6, now),
             "heard twice"
         );
         assert_eq!(net.ble_connections.len(), 1);
@@ -1312,7 +1356,7 @@ mod tests {
         c.account(true, false, vec![(terminate, timing)]);
         net.ble_connections[0].connection = c;
         for aa in 2..=(CONNECTIONS_KEPT as u32 + 1) {
-            assert!(net.follow(&connect_ind(aa), false, 0.0, 20e6));
+            assert!(net.follow(&connect_ind(aa), (false, false, false), 0.0, 20e6, now));
         }
         assert_eq!(net.ble_connections.len(), CONNECTIONS_KEPT);
         assert_eq!(

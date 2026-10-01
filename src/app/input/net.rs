@@ -297,6 +297,30 @@ pub(super) fn net_bt_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction
     KeyAction::Continue
 }
 
+/// The Connection view: `↑↓` scroll through the events kept, as far as the
+/// oldest one's last row; `End` goes back to the newest.
+pub(super) fn net_ble_connection(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
+    let mut m = metrics(ctx.state);
+    let rows = crate::ui::panels::net::ble::ble_connection::selected(&m).map_or(0, |f| {
+        f.connection
+            .events()
+            .iter()
+            .map(|e| e.pdus.len().max(1))
+            .sum::<usize>()
+    });
+    let view = &mut m.net.connection_view;
+    match key.code {
+        KeyCode::Up => view.first_visible = view.first_visible.saturating_sub(1),
+        KeyCode::Down => view.first_visible = (view.first_visible + 1).min(rows.saturating_sub(1)),
+        KeyCode::End => view.first_visible = 0,
+        _ => {
+            drop(m);
+            return global::handle(key, ctx);
+        }
+    }
+    KeyAction::Continue
+}
+
 /// `← →` in the Piconet view, the list's or the bench's: the previous or
 /// next piconet in the roster's order, the list starting afresh on it. With
 /// none heard, nothing, rather than a cleared selection.
@@ -918,6 +942,49 @@ mod tests {
             &mut show_footer,
             keys,
         );
+    }
+
+    /// The Connection view scrolls through the rows its events make, no
+    /// further than the last, and `End` goes back to the newest.
+    #[test]
+    fn the_connection_view_scrolls_its_events() {
+        let (mut engine, keys, state) = focused_on("net_connection", "net_ble_connection");
+        {
+            let mut m = metrics(&state);
+            let c = crate::signal::ble::connect::ConnectIndData {
+                init_a: [0; 6],
+                adv_a: [0; 6],
+                access_address: 0x5065_4b6a,
+                crc_init: 0x3a_5b7c,
+                win_size: 1,
+                win_offset: 0,
+                interval: 6,
+                latency: 0,
+                timeout: 100,
+                channel_map: (1u64 << 37) - 1,
+                hop_increment: 7,
+                sca: 0,
+            };
+            let now = std::time::Instant::now();
+            m.net.follow(&c, (false, false, false), 0.0, 20e6, now);
+            for _ in 0..3 {
+                m.net.ble_connections[0]
+                    .connection
+                    .account(false, false, Vec::new());
+            }
+        }
+        for _ in 0..5 {
+            key(&mut engine, &keys, &state, KeyCode::Down);
+        }
+        assert_eq!(
+            metrics(&state).net.connection_view.first_visible,
+            2,
+            "three rows"
+        );
+        key(&mut engine, &keys, &state, KeyCode::Up);
+        assert_eq!(metrics(&state).net.connection_view.first_visible, 1);
+        key(&mut engine, &keys, &state, KeyCode::End);
+        assert_eq!(metrics(&state).net.connection_view.first_visible, 0);
     }
 
     /// **Leaving focus leaves no trace**:

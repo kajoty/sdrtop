@@ -432,7 +432,7 @@ mod tests {
             "{le}"
         );
         assert!(le.contains("LE"), "{le}");
-        assert!(le.contains("2 views"), "{le}");
+        assert!(le.contains("3 views"), "{le}");
         // The selected view wears the bar, not a triangle.
         assert!(le.contains("\u{258c} 2  Advertising"), "{le}");
         assert!(!le.contains("\u{25b8}"), "{le}");

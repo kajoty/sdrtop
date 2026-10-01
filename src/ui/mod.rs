@@ -62,6 +62,7 @@ pub use panels::lab::timing_diagnostics::TimingDiagnosticsPanel;
 pub use panels::lab::timing_stripchart::TimingStripchartPanel;
 pub use panels::lab::timing_vitals::TimingVitalsPanel;
 
+pub use panels::net::ble::ble_connection::NetBleConnectionPanel;
 pub use panels::net::ble::ble_detail::NetBleDetailPanel;
 pub use panels::net::ble::ble_packets::NetBlePacketsPanel;
 pub use panels::net::bt::bt_bench::NetBtBenchPanel;

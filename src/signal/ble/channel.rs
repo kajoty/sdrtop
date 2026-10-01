@@ -163,8 +163,35 @@ pub fn to_decode(tuned_hz: u64, span_hz: f64, locked: bool) -> Option<u8> {
     in_view.or(tuned)
 }
 
+/// Whether channel `ch` lies inside the band a radio tuned to `tuned_hz`
+/// sees, `span_hz` wide: its whole 2 MHz, so a packet on it is received
+/// whole rather than cut by the edge.
+pub fn in_view(ch: u8, tuned_hz: f64, span_hz: f64) -> bool {
+    centre_hz(ch).is_some_and(|hz| (hz as f64 - tuned_hz).abs() <= span_hz / 2.0 - 1e6)
+}
+
+/// The data channels (0 to 36) [`in_view`] holds, ascending.
+pub fn data_channels_in_view(tuned_hz: f64, span_hz: f64) -> Vec<u8> {
+    (0..37)
+        .filter(|&ch| in_view(ch, tuned_hz, span_hz))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// At 20 Msps on 2426 MHz the data channels whose 2 MHz fit inside the
+    /// 20 MHz are 7 to 14 (2418 to 2434 MHz); 2416 and 2436 MHz reach past
+    /// the edge.
+    #[test]
+    fn twenty_megahertz_on_channel_38_holds_eight_data_channels() {
+        assert_eq!(
+            data_channels_in_view(2_426e6, 20e6),
+            (7..=14).collect::<Vec<u8>>()
+        );
+        assert!(in_view(38, 2_426e6, 20e6));
+        assert!(!in_view(37, 2_426e6, 20e6));
+    }
     use super::*;
 
     /// Every survey position at 8 Msps that holds an advertising channel

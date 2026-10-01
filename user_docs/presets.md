@@ -22,7 +22,7 @@ name as a built-in (`command_rail`, `spectrum`, `waterfall`,
 `spectrum_waterfall`, `main`, `lab_iq`, `lab_rf`, `lab_timing`, `lab_signal`,
 `lab_sweep`, `micro_main`, `micro_signal`, `micro_gain`, `micro_health`,
 `micro_sweep`, `net`, `net_survey`, `net_census`, `net_ble`, `net_bt`,
-`net_piconet`, `net_bench`, `observer`) and your version replaces it, so the number key that
+`net_piconet`, `net_bench`, `net_connection`, `observer`) and your version replaces it, so the number key that
 opens it now opens your layout. Those names are the whole list; a name that isn't
 on it is a new preset, which appears in the menu automatically rather than taking
 over a key.
@@ -178,6 +178,7 @@ These are the valid values for `name`. What each one actually draws is in
 
 **NET:** `net_capability` · `net_occupancy` · `net_coexist` ·
 `net_decode_health` · `net_census` · `net_ble_packets` · `net_ble_detail` ·
+`net_ble_connection` ·
 `net_bt_hops` · `net_bt_piconets` · `net_bt_packets` · `net_bt_bench`. What each shows is on
 [the NET page](net.md); three of these were renamed or replaced, which that
 page's [last section](net.md#if-you-wrote-your-own-net-preset) lists.

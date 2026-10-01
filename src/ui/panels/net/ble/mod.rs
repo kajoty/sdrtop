@@ -6,5 +6,6 @@
 //! `net::bt`, not in here - the two protocols share nothing above
 //! `signal::net::worker`, and the panel layer keeps the same split.
 
+pub mod ble_connection;
 pub mod ble_detail;
 pub mod ble_packets;
