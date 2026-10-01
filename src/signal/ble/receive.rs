@@ -34,6 +34,7 @@ use crate::signal::dsp::estimate::snr_from_metric;
 use crate::signal::dsp::fir::{design_lowpass_to_spec, StreamingDecimator};
 use crate::signal::dsp::nco::Nco;
 
+use super::data::{self, DataPdu};
 use super::detect::{access_address_bits, preamble_bits, ADVERTISING_ACCESS_ADDRESS};
 use super::gfsk;
 use super::pdu::{self, Packet};
@@ -370,11 +371,15 @@ fn frequency_template(reference: &[Complex<f32>], phy: Phy) -> Vec<f32> {
     track
 }
 
-fn matched_reference(raw_rate: f64, phy: Phy) -> Result<Vec<Complex<f32>>, String> {
+fn matched_reference(
+    raw_rate: f64,
+    phy: Phy,
+    access_address: u32,
+) -> Result<Vec<Complex<f32>>, String> {
     let sps = (raw_rate / phy.symbol_rate_hz()).round().max(1.0) as usize;
     let sample_rate = sps as f64 * phy.symbol_rate_hz();
-    let mut sync_bits = preamble_bits(ADVERTISING_ACCESS_ADDRESS, phy);
-    sync_bits.extend_from_slice(&access_address_bits(ADVERTISING_ACCESS_ADDRESS));
+    let mut sync_bits = preamble_bits(access_address, phy);
+    sync_bits.extend_from_slice(&access_address_bits(access_address));
 
     let mut padded_bits = margin_bits(MARGIN_SYMBOLS);
     padded_bits.extend_from_slice(&sync_bits);
@@ -410,6 +415,65 @@ const MARGIN_SYMBOLS: usize = 16;
 /// to settle against rather than to be decoded as anything itself.
 fn margin_bits(len: usize) -> Vec<bool> {
     (0..len).map(|i| i % 2 == 0).collect()
+}
+
+/// Which packets a receiver is for: the advertising channels' own, or one
+/// connection's, by the access address and CRC initial value its
+/// CONNECT_IND set (Core 5.4 Vol 6 Part B 2.1.2, 3.1.1). The whitening is
+/// the channel index's either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    Advertising,
+    // Built only by the tests until the NET worker follows a connection.
+    #[allow(dead_code)]
+    Data {
+        access_address: u32,
+        crc_init: u32,
+    },
+}
+
+impl Link {
+    fn access_address(self) -> u32 {
+        match self {
+            Link::Advertising => ADVERTISING_ACCESS_ADDRESS,
+            Link::Data { access_address, .. } => access_address,
+        }
+    }
+
+    /// The longest a PDU on this link can be, header through CRC, in bits.
+    fn longest_pdu_bits(self) -> usize {
+        match self {
+            Link::Advertising => MAX_PDU_BYTES * 8,
+            // Header, CTEInfo and 255 octets of payload and MIC (2.4).
+            Link::Data { .. } => data::HEADER_BITS + 8 + 255 * 8 + data::CRC_BITS,
+        }
+    }
+}
+
+/// Where a data channel packet sits in the stream, in I/Q pairs on the
+/// radio's own clock, fractional: from the start of its preamble's first bit
+/// to the end of its CRC's last, the two instants the Inter Frame Space is
+/// measured between (Core 5.4 Vol 6 Part B 4.1.1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DataTiming {
+    pub start_pair: f64,
+    pub end_pair: f64,
+}
+
+/// One alignment's decode, on whichever link the receiver is for.
+#[derive(Clone, Debug)]
+enum Heard {
+    Advertising(Box<Packet>),
+    Data(DataPdu, Option<DataTiming>),
+}
+
+impl Heard {
+    fn crc_ok(&self) -> bool {
+        match self {
+            Heard::Advertising(p) => p.crc_ok,
+            Heard::Data(d, _) => d.crc_ok,
+        }
+    }
 }
 
 /// One channel's live receiver: the decimator, the sync-word detector, and
@@ -494,6 +558,11 @@ pub struct Receiver {
     /// the decimator's delay and factor, where any capture sample sits in
     /// the stream exactly (`pdu::Packet::pdu_pair`).
     capture_origin: u64,
+    /// Whose packets it hears.
+    link: Link,
+    /// Data channel packets heard since the caller last took them
+    /// ([`Self::take_data`]).
+    data: Vec<(DataPdu, DataTiming)>,
 }
 
 /// What the receiver did with the samples it was given, counted as it went:
@@ -537,6 +606,19 @@ impl Receiver {
     /// A receiver for `channel` on `phy`, with the radio at `raw_rate` and
     /// tuned to `tuned_centre_hz`, which need not be the channel's own centre.
     pub fn new(raw_rate: f64, channel: u8, phy: Phy, tuned_centre_hz: f64) -> Result<Self, String> {
+        Self::for_link(raw_rate, channel, phy, tuned_centre_hz, Link::Advertising)
+    }
+
+    /// [`Self::new`] for `link`'s packets: a data channel receiver listens
+    /// for its connection's access address and checks its CRC from the
+    /// connection's initial value.
+    pub fn for_link(
+        raw_rate: f64,
+        channel: u8,
+        phy: Phy,
+        tuned_centre_hz: f64,
+        link: Link,
+    ) -> Result<Self, String> {
         let channel_hz = super::channel::centre_hz(channel)
             .ok_or_else(|| format!("BLE channel {channel} does not exist"))?;
         // The channel sits at `+offset` in the raw stream, so the oscillator
@@ -544,7 +626,7 @@ impl Receiver {
         let offset_hz = channel_hz as f64 - tuned_centre_hz;
         let mixer = (offset_hz.abs() >= 1.0).then(|| Nco::new(-offset_hz, raw_rate));
         let decim = front_end(raw_rate, phy)?;
-        let reference = matched_reference(raw_rate, phy)?;
+        let reference = matched_reference(raw_rate, phy, link.access_address())?;
         let shape = frequency_template(&reference, phy);
         let reference_energy = reference.iter().map(|s| s.norm_sqr() as f64).sum();
         Ok(Self {
@@ -576,7 +658,46 @@ impl Receiver {
             first_pair: None,
             worked: 0,
             capture_origin: 0,
+            link,
+            data: Vec::new(),
         })
+    }
+
+    /// Forget the stream, keep the filters and the reference: for a window
+    /// that does not follow on from the last one, as a connection event's
+    /// does not. The next sample pushed is read as if it were the first.
+    // Called by the tests until the NET worker follows a connection.
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        if let Some(mixer) = self.mixer.as_mut() {
+            mixer.reset();
+        }
+        self.decim.reset();
+        self.shape.reset();
+        self.last_sample = None;
+        self.recent.clear();
+        self.sync_window.clear();
+        self.sync_rho = 0.0;
+        self.trigger_len = 0;
+        self.history.clear();
+        self.capture.clear();
+        self.capturing = false;
+        self.inst.clear();
+        self.inst_sums = vec![0.0];
+        self.search = super::sync::growing(WORKING_SPS as f64);
+        self.next_pair = 0;
+        self.trigger_pair = 0;
+        self.first_pair = None;
+        self.worked = 0;
+        self.capture_origin = 0;
+    }
+
+    /// The data channel packets heard since the last call, with where each
+    /// sits in the stream. Always empty on an advertising receiver.
+    // Called by the tests until the NET worker follows a connection.
+    #[allow(dead_code)]
+    pub fn take_data(&mut self) -> Vec<(DataPdu, DataTiming)> {
+        std::mem::take(&mut self.data)
     }
 
     /// The carrier offset, read from the sync word this capture was triggered
@@ -789,7 +910,7 @@ impl Receiver {
         let mut working = Vec::new();
         self.decim.process(iq, &mut working);
 
-        let cap_limit = (16 + MAX_PDU_BYTES * 8) * WORKING_SPS;
+        let cap_limit = (16 + self.link.longest_pdu_bits()) * WORKING_SPS;
         // Every sample through the detector, capturing or not, as one block:
         // the discriminator first, straight across the block boundary, then
         // the correlation against the sync word's frequency track. A
@@ -839,10 +960,9 @@ impl Receiver {
                 }
                 let due = self.capture.len().is_multiple_of(DECODE_EVERY_SAMPLES);
                 match due.then(|| self.try_decode()).flatten() {
-                    Some(mut packet) => {
+                    Some(heard) => {
                         self.funnel.decoded += 1;
-                        packet.at_pair = Some(self.trigger_pair);
-                        found.push(packet);
+                        self.keep(heard, &mut found);
                         self.capturing = false;
                         self.capture.clear();
                     }
@@ -857,14 +977,13 @@ impl Receiver {
                         // CRC, still shows up as that rather than vanishing
                         // silently the way a wrong-alignment guess would.
                         match self.best_failed_candidate() {
-                            Some(mut packet) => {
-                                packet.at_pair = Some(self.trigger_pair);
-                                if packet.crc_ok {
+                            Some(heard) => {
+                                if heard.crc_ok() {
                                     self.funnel.decoded += 1;
                                 } else {
                                     self.funnel.crc_failed += 1;
                                 }
-                                found.push(packet);
+                                self.keep(heard, &mut found);
                             }
                             None => self.funnel.gave_up += 1,
                         }
@@ -922,17 +1041,32 @@ impl Receiver {
     /// either side of [`LOOKBACK_SAMPLES`], which is `self.capture`'s own
     /// nominal boundary once `push` starts seeding it from
     /// [`Receiver::history`] rather than empty.
-    fn try_decode(&mut self) -> Option<Packet> {
+    fn try_decode(&mut self) -> Option<Heard> {
         self.candidates()
             .into_iter()
-            .find(|(.., packet)| packet.crc_ok)
-            .map(|(skip, phase, packet)| self.measured(skip, phase, packet))
+            .find(|(.., heard)| heard.crc_ok())
+            .map(|(skip, phase, heard)| self.measured(skip, phase, heard))
+    }
+
+    /// A finished capture's packet to where it belongs: an advertising one
+    /// to the caller, stamped with its trigger, a data one to
+    /// [`Self::take_data`].
+    fn keep(&mut self, heard: Heard, found: &mut Vec<Packet>) {
+        match heard {
+            Heard::Advertising(mut packet) => {
+                packet.at_pair = Some(self.trigger_pair);
+                found.push(*packet);
+            }
+            Heard::Data(pdu, Some(timing)) => self.data.push((pdu, timing)),
+            // Not placed in the stream is not heard: nothing could time it.
+            Heard::Data(_, None) => {}
+        }
     }
 
     /// Every alignment [`Self::try_decode`] searches, in order, decoded: the
     /// header start it was read from, the phase it was sliced at, and the
     /// packet, CRC passed or not, not yet measured ([`Self::measured`]).
-    fn candidates(&mut self) -> Vec<(usize, f64, Packet)> {
+    fn candidates(&mut self) -> Vec<(usize, f64, Heard)> {
         let center = LOOKBACK_SAMPLES as isize;
         let step = WORKING_SPS as isize;
         let span = HEADER_SEARCH_SYMBOLS as isize;
@@ -968,9 +1102,9 @@ impl Receiver {
             // The capture's own mean from here on: see `decode_at`.
             let n = self.inst.len();
             let mean = (self.inst_sums[n] - self.inst_sums[skip]) / (n - skip) as f64;
-            if let Some(packet) = self.decode_at(&self.inst, skip, phase, mean as f32) {
-                let passed = packet.crc_ok;
-                out.push((skip, phase, packet));
+            if let Some(heard) = self.decode_at(&self.inst, skip, phase, mean as f32) {
+                let passed = heard.crc_ok();
+                out.push((skip, phase, heard));
                 // The search stops at the first CRC that passes, as it
                 // always has: later alignments cannot beat a passing one.
                 if passed {
@@ -1003,18 +1137,27 @@ impl Receiver {
     /// on the same recording. This reports those three (one address bit
     /// flipped in each) and 9 of the 41, where their length agrees with the
     /// signal; the CRC-good output is byte-identical on both recordings.
-    fn best_failed_candidate(&mut self) -> Option<Packet> {
+    fn best_failed_candidate(&mut self) -> Option<Heard> {
         let end = energy_end(&self.capture, LOOKBACK_SAMPLES)?;
         let tolerance = END_TOLERANCE_SYMBOLS * WORKING_SPS;
         self.candidates()
             .into_iter()
-            .filter_map(|(skip, phase, packet)| {
-                let ends = skip + pdu::used_bits(packet.length) * WORKING_SPS;
+            .filter_map(|(skip, phase, heard)| {
+                let bits = match &heard {
+                    Heard::Advertising(p) => pdu::used_bits(p.length),
+                    Heard::Data(d, _) => {
+                        data::HEADER_BITS
+                            + 8 * d.cte_info.is_some() as usize
+                            + d.payload.len() * 8
+                            + data::CRC_BITS
+                    }
+                };
+                let ends = skip + bits * WORKING_SPS;
                 let off = ends.abs_diff(end);
-                (off <= tolerance).then_some((off, skip, phase, packet))
+                (off <= tolerance).then_some((off, skip, phase, heard))
             })
             .min_by_key(|(off, ..)| *off)
-            .map(|(_, skip, phase, packet)| self.measured(skip, phase, packet))
+            .map(|(_, skip, phase, heard)| self.measured(skip, phase, heard))
     }
 
     /// The discriminator over the capture, extended to its end.
@@ -1039,7 +1182,7 @@ impl Receiver {
     /// `phase` is the sub-symbol sampling phase found for the capture (see
     /// `candidates`), and `threshold` the mean of the readings from `skip`
     /// on.
-    fn decode_at(&self, whole: &[f32], skip: usize, phase: f64, threshold: f32) -> Option<Packet> {
+    fn decode_at(&self, whole: &[f32], skip: usize, phase: f64, threshold: f32) -> Option<Heard> {
         if skip >= self.capture.len() {
             return None;
         }
@@ -1069,7 +1212,10 @@ impl Receiver {
         // only skips work whose answer was already `None`.
         let (mut header, _) = super::sync::slice_at(inst, sps, pdu::HEADER_BITS, threshold, phase);
         whiten(&mut header, self.channel);
-        let wanted = pdu::used_bits(pdu::length(&header)?);
+        let wanted = match self.link {
+            Link::Advertising => pdu::used_bits(pdu::length(&header)?),
+            Link::Data { .. } => data::used_bits(&header)?,
+        };
         if wanted > symbols {
             return None;
         }
@@ -1086,6 +1232,28 @@ impl Receiver {
         // decoded ones, are what a Gaussian filter's settling depends on.
         let raw_bits = bits.clone();
         whiten(&mut bits, self.channel);
+        // Where the PDU's first bit is centred, in pairs: `inst[i]` stands
+        // for capture instant `i + 0.5`, and working sample `w` for raw
+        // instant `delay + w * d` after the receiver's first.
+        let pdu_pair = self.first_pair.map(|first| {
+            let working = self.capture_origin as f64 + skip as f64 + phase + 0.5;
+            first as f64 + self.decim.delay() + working * self.decim.factor() as f64
+        });
+        if let Link::Data { crc_init, .. } = self.link {
+            let pdu = data::decode(&bits, crc_init)?;
+            // A bit is WORKING_SPS working samples; back half a bit to its
+            // start, then over the access address and the preamble.
+            let bit = (WORKING_SPS * self.decim.factor()) as f64;
+            let timing = pdu_pair.map(|centre| {
+                let first_bit = centre - 0.5 * bit;
+                let sync = (self.phy.preamble_bits_len() + 32) as f64;
+                DataTiming {
+                    start_pair: first_bit - sync * bit,
+                    end_pair: first_bit + wanted as f64 * bit,
+                }
+            });
+            return Some(Heard::Data(pdu, timing));
+        }
         let mut packet = pdu::decode(&bits)?;
         // Exactly this packet's own bits: the capture runs on past it
         // (see this struct's own `push`), and letting a measurement wander
@@ -1098,11 +1266,8 @@ impl Receiver {
         // `i + 0.5`, and working sample `w` for raw instant `delay + w * d`
         // after the receiver's first.
         packet.air = raw_bits.to_vec();
-        packet.pdu_pair = self.first_pair.map(|first| {
-            let working = self.capture_origin as f64 + skip as f64 + phase + 0.5;
-            first as f64 + self.decim.delay() + working * self.decim.factor() as f64
-        });
-        Some(packet)
+        packet.pdu_pair = pdu_pair;
+        Some(Heard::Advertising(Box::new(packet)))
     }
 
     /// `packet`, decoded at `skip` and `phase`, with its offset, SNR, modulation and drift
@@ -1126,7 +1291,17 @@ impl Receiver {
     /// the packet's known bits, and reading it here as well built the
     /// rebuilt waveform twice for every packet, a fifth of what a busy
     /// channel cost, for figures the worker then replaced.
-    fn measured(&self, skip: usize, phase: f64, mut packet: Packet) -> Packet {
+    fn measured(&self, skip: usize, phase: f64, heard: Heard) -> Heard {
+        match heard {
+            Heard::Advertising(packet) => {
+                Heard::Advertising(Box::new(self.measured_advertising(skip, phase, *packet)))
+            }
+            // A data packet's figures are its timing, already read.
+            data @ Heard::Data(..) => data,
+        }
+    }
+
+    fn measured_advertising(&self, skip: usize, phase: f64, mut packet: Packet) -> Packet {
         // The *reported* offset is read against the sync word, not the
         // packet's data: see `sync_offset`. The slicing threshold never had
         // to be exact, only good enough to slice against; this one is what a
@@ -1167,6 +1342,7 @@ mod tests {
     use super::*;
     use crate::hardware::{SampleFormat, StreamBlock};
     use crate::signal::ble::channel;
+    use crate::signal::ble::data::DataPdu;
     use crate::signal::ble::gfsk::modulate;
     use crate::signal::dsp::testkit::{at_snr, Rng};
 
@@ -1240,6 +1416,137 @@ mod tests {
             bytes.push(im as u8);
         }
         bytes
+    }
+
+    /// A data channel packet for one link, at the radio's own rate with its
+    /// channel at its offset from `tuned_hz`: sixteen random bits of lead-in
+    /// after `lead` pairs of silence, the preamble `aa` calls for, `aa`, the
+    /// PDU CRC'd under `crc_init` and whitened for `ch`, a short tail. Returns
+    /// the samples and where the preamble's first bit starts, in pairs.
+    fn synthetic_data_burst(
+        raw_rate: f64,
+        ch: u8,
+        tuned_hz: f64,
+        aa: u32,
+        crc_init: u32,
+        pdu: &DataPdu,
+        lead: usize,
+    ) -> (Vec<Complex<f32>>, f64) {
+        let sps = (raw_rate / 1e6).round() as usize;
+        let mut rng = Rng::new(4242);
+        let mut bits: Vec<bool> = (0..16).map(|_| rng.next_u64() & 1 == 1).collect();
+        bits.extend(super::super::detect::preamble_bits(aa, Phy::OneM));
+        bits.extend_from_slice(&super::super::detect::access_address_bits(aa));
+        bits.extend(super::super::data::encode(pdu, crc_init, ch));
+        bits.extend((0..16).map(|_| rng.next_u64() & 1 == 1));
+        let base = modulate(&bits, sps, Phy::OneM.deviation_hz(), raw_rate, 0.5);
+        let offset = channel::centre_hz(ch).unwrap() as f64 - tuned_hz;
+        let mut iq = vec![Complex::new(0.0f32, 0.0); lead];
+        iq.extend(base.iter().enumerate().map(|(n, s)| {
+            let ph = std::f64::consts::TAU * offset * (lead + n) as f64 / raw_rate;
+            s * Complex::new(ph.cos() as f32, ph.sin() as f32)
+        }));
+        let noisy = at_snr(&iq[lead..], 25.0, &mut Rng::new(99));
+        iq.truncate(lead);
+        iq.extend(noisy);
+        iq.extend(vec![Complex::new(0.0, 0.0); 2000]);
+        (iq, (lead + 16 * sps) as f64)
+    }
+
+    fn data_pdu(llid: u8, payload: &[u8]) -> DataPdu {
+        DataPdu {
+            llid,
+            nesn: false,
+            sn: true,
+            md: false,
+            cte_info: None,
+            payload: payload.to_vec(),
+            crc_ok: true,
+        }
+    }
+
+    const LINK_AA: u32 = 0x5065_4b6a;
+    const LINK_CRC: u32 = 0x3a_5b7c;
+
+    fn link_receiver(ch: u8) -> Receiver {
+        Receiver::for_link(
+            20e6,
+            ch,
+            Phy::OneM,
+            2_426e6,
+            Link::Data {
+                access_address: LINK_AA,
+                crc_init: LINK_CRC,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A data PDU on data channel 12 at 20 Msps, the radio at 2426 MHz,
+    /// under the link's own access address: heard, CRC passing, its bytes
+    /// as sent, and placed in time to within a quarter of a symbol at both
+    /// ends (the two instants T_IFS is measured between).
+    #[test]
+    fn a_link_receiver_hears_its_own_access_address() {
+        let sent = data_pdu(3, &[0x0c, 0x0c, 0x4c, 0x00, 0x34, 0x12]);
+        let (iq, start) = synthetic_data_burst(20e6, 12, 2_426e6, LINK_AA, LINK_CRC, &sent, 1000);
+        let mut rx = link_receiver(12);
+        assert!(rx.push_iq_at(&iq, 0).is_empty(), "no advertising packets");
+        let got = rx.take_data();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, sent);
+        // Preamble 8, address 32, header 16, payload, CRC 24, at 20 pairs a bit.
+        let bits = 8 + 32 + 16 + 6 * 8 + 24;
+        let end = start + bits as f64 * 20.0;
+        assert!(
+            (got[0].1.start_pair - start).abs() < 5.0,
+            "{:?} vs {start}",
+            got[0].1
+        );
+        assert!(
+            (got[0].1.end_pair - end).abs() < 5.0,
+            "{:?} vs {end}",
+            got[0].1
+        );
+    }
+
+    /// The advertising access address is not this link's: nothing heard,
+    /// and the advertising receiver does not hear the link's either.
+    #[test]
+    fn a_link_receiver_hears_no_other_access_address() {
+        let sent = data_pdu(1, &[]);
+        let (iq, _) = synthetic_data_burst(
+            20e6,
+            12,
+            2_426e6,
+            ADVERTISING_ACCESS_ADDRESS,
+            0x55_5555,
+            &sent,
+            1000,
+        );
+        let mut rx = link_receiver(12);
+        rx.push_iq_at(&iq, 0);
+        assert!(rx.take_data().is_empty());
+
+        let (iq, _) = synthetic_data_burst(20e6, 38, 2_426e6, LINK_AA, LINK_CRC, &sent, 1000);
+        let mut adv = Receiver::new(20e6, 38, Phy::OneM, 2_426e6).unwrap();
+        assert!(adv.push_iq_at(&iq, 0).is_empty());
+    }
+
+    /// After `reset`, a window far later in the stream is read as if it
+    /// were the first, and placed where it is.
+    #[test]
+    fn reset_forgets_the_stream() {
+        let sent = data_pdu(2, &[1, 2, 3, 4]);
+        let (iq, start) = synthetic_data_burst(20e6, 12, 2_426e6, LINK_AA, LINK_CRC, &sent, 1000);
+        let mut rx = link_receiver(12);
+        rx.push_iq_at(&iq, 0);
+        rx.reset();
+        rx.push_iq_at(&iq, 5_000_000);
+        let got = rx.take_data();
+        assert_eq!(got.len(), 2, "one from each window: {got:?}");
+        let later = got[1].1.start_pair - 5_000_000.0;
+        assert!((later - start).abs() < 5.0, "{:?}", got[1].1);
     }
 
     /// B6's exit condition, built with a synthetic transmitter standing in
@@ -1572,7 +1879,7 @@ mod tests {
     #[test]
     fn the_shape_detector_s_noise_statistics_are_the_ones_measured() {
         for (phy, raw_rate) in [(Phy::OneM, 4e6), (Phy::TwoM, 8e6)] {
-            let reference = matched_reference(raw_rate, phy).unwrap();
+            let reference = matched_reference(raw_rate, phy, ADVERTISING_ACCESS_ADDRESS).unwrap();
             let template = frequency_template(&reference, phy);
             let mut rng = Rng::new(17);
             let raw: Vec<Complex<f32>> = (0..400_000)
