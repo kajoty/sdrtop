@@ -23,8 +23,6 @@
 //!
 //! **Key material is named, never printed**: LL_ENC_REQ's and LL_ENC_RSP's
 //! random number, diversifiers and initialisation vectors.
-// Read only by its tests until the NET worker follows a connection.
-#![allow(dead_code)]
 
 use crate::signal::errors::error_name;
 

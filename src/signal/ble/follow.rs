@@ -29,8 +29,6 @@
 //! [`OWN_CLOCK_PPM`]: an assumption, not a reading, stated where it is used.
 //! The anchors heard will measure the Central's clock against this radio's,
 //! which is the measurement, not this window.
-// Read only by its tests until the NET worker follows a connection.
-#![allow(dead_code)]
 
 use super::connect::{sca_ppm, ConnectIndData, Csa1, Csa2};
 use super::data::DataPdu;
@@ -275,6 +273,8 @@ impl Connection {
     }
 
     /// The events accounted for, newest first.
+    // Read by the Connection view, and its tests until then.
+    #[allow(dead_code)]
     pub fn events(&self) -> &std::collections::VecDeque<Event> {
         &self.events
     }
@@ -286,6 +286,8 @@ impl Connection {
     /// The event LL_START_ENC_REQ was heard in: every packet after it is
     /// encrypted (Vol 6 Part C 1 sends it in the clear and its answers
     /// encrypted).
+    // Read by the Connection view, and its tests until then.
+    #[allow(dead_code)]
     pub fn encrypted_from(&self) -> Option<u16> {
         self.encrypted_from
     }

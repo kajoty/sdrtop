@@ -424,12 +424,7 @@ fn margin_bits(len: usize) -> Vec<bool> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Link {
     Advertising,
-    // Built only by the tests until the NET worker follows a connection.
-    #[allow(dead_code)]
-    Data {
-        access_address: u32,
-        crc_init: u32,
-    },
+    Data { access_address: u32, crc_init: u32 },
 }
 
 impl Link {
@@ -666,8 +661,6 @@ impl Receiver {
     /// Forget the stream, keep the filters and the reference: for a window
     /// that does not follow on from the last one, as a connection event's
     /// does not. The next sample pushed is read as if it were the first.
-    // Called by the tests until the NET worker follows a connection.
-    #[allow(dead_code)]
     pub fn reset(&mut self) {
         if let Some(mixer) = self.mixer.as_mut() {
             mixer.reset();
@@ -694,8 +687,6 @@ impl Receiver {
 
     /// The data channel packets heard since the last call, with where each
     /// sits in the stream. Always empty on an advertising receiver.
-    // Called by the tests until the NET worker follows a connection.
-    #[allow(dead_code)]
     pub fn take_data(&mut self) -> Vec<(DataPdu, DataTiming)> {
         std::mem::take(&mut self.data)
     }

@@ -48,7 +48,7 @@ pub mod sync;
 /// (`h = 2 * deviation / symbol_rate`) held at the same `h = 0.5`, and the
 /// same alternating-preamble rule run for twice as long - not independently
 /// looked up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Phy {
     #[default]
     OneM,

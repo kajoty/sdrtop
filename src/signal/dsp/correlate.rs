@@ -456,9 +456,6 @@ impl ShapeMatcher {
 
     /// Forget every value seen: the next is read as the first, with the
     /// warm-up again.
-    // Reached through `ble::receive::Receiver::reset`, which only the tests
-    // call until the NET worker follows a connection.
-    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.tail = vec![0.0; self.n];
         self.seen = 0;

@@ -116,6 +116,54 @@ fn decoded_block<'a>(
 
 /// The blocks the measurement path may cut a burst from: those held from
 /// before, and this one.
+/// How much of the stream is held while a connection is followed, s: its
+/// first event's transmit window (up to 10 ms, Core 5.4 Vol 6 Part B 4.5.3),
+/// the widening either side, and an event's length after.
+const FOLLOW_HELD_S: f64 = 0.02;
+
+/// Listened to before an event's earliest start, us: the receiver's filters
+/// and its detector settle on it, and the preamble's lead is in it.
+const FOLLOW_WARMUP_US: f64 = 64.0;
+
+/// The longest an event is listened to after its anchor, us: a Central's
+/// longest LE 1M packet (2120 us), T_IFS and an answer as long. A longer
+/// event's later packets are not heard; its first exchange is.
+const EVENT_SPAN_US: f64 = 4_500.0;
+
+/// At most this many events accounted a block per connection: catching up
+/// after a gap, the rest wait for the next block rather than stall this one.
+const FOLLOW_ROUNDS: usize = 32;
+
+/// Whether a data channel lies inside the band this block holds: its whole
+/// 2 MHz, inside the usable span around the tuning.
+fn channel_in_view(ch: u8, centre_hz: f64, span_hz: f64) -> bool {
+    crate::signal::ble::channel::centre_hz(ch)
+        .is_some_and(|hz| (hz as f64 - centre_hz).abs() <= span_hz / 2.0 - 1e6)
+}
+
+/// The stretch of stream an event is listened to over, in pairs: from its
+/// earliest start less the warm-up to its latest anchor plus an event's
+/// length, never into the next event.
+fn event_window(
+    due: &crate::signal::ble::follow::Due,
+    interval_pairs: f64,
+    rate_hz: f64,
+) -> (f64, f64) {
+    let us = |x: f64| x * 1e-6 * rate_hz;
+    let from = due.anchor_pair - due.widening_pairs - us(FOLLOW_WARMUP_US);
+    let span = us(EVENT_SPAN_US).min(interval_pairs - us(150.0));
+    let to = due.anchor_pair + due.window_pairs + due.widening_pairs + span;
+    (from, to)
+}
+
+/// Where a CONNECT_IND's packet ended, pairs: the end of its CRC, from where
+/// its PDU's first bit was centred and how many bits the PDU is, on LE 1M.
+fn connect_end_pair(p: &crate::signal::ble::pdu::Packet, rate_hz: f64) -> Option<f64> {
+    let bit = rate_hz / 1e6;
+    p.pdu_pair
+        .map(|centre| centre + (crate::signal::ble::pdu::used_bits(p.length) as f64 - 0.5) * bit)
+}
+
 fn held<'a>(
     recent: &'a std::collections::VecDeque<(u64, Vec<num_complex::Complex<f32>>)>,
     current: Option<(u64, &'a [num_complex::Complex<f32>])>,
@@ -497,6 +545,10 @@ impl NetWorker {
         // copied, and dropped at any break.
         let mut recent: std::collections::VecDeque<(u64, Vec<num_complex::Complex<f32>>)> =
             std::collections::VecDeque::new();
+        // One receiver per followed connection, channel and PHY, each reset
+        // before an event's window: built once, since a matched filter and
+        // its reference are the receiver's cost.
+        let mut link_rx: HashMap<(u32, u8, crate::signal::ble::Phy), BleReceiver> = HashMap::new();
 
         while let Ok(StreamBlock {
             seq,
@@ -566,7 +618,7 @@ impl NetWorker {
             // block rather than the state: see `StreamBlock::centre_hz`.
             let centre_hz = centre_hz as f64;
 
-            let (still_open, span_hz, is_net_bt, is_survey, phy, locked) = {
+            let (still_open, span_hz, is_net_bt, is_survey, phy, locked, following) = {
                 let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 let h = &mut m.net.health;
                 h.blocks_in = h.blocks_in.saturating_add(1);
@@ -595,6 +647,9 @@ impl NetWorker {
                     m.ui.active_preset == NET_SURVEY_PRESET,
                     m.net.ble_phy,
                     m.net.mode == crate::state::NetMode::Lock,
+                    m.net.ble_connections.iter().any(|f| {
+                        *f.connection.state() == crate::signal::ble::follow::State::Following
+                    }),
                 )
             };
 
@@ -699,7 +754,8 @@ impl NetWorker {
 
             // Decoded once, before either decoder runs, so both read it at once.
             let classic_here = still_open && (is_net_bt || is_survey);
-            if ble_on.is_some() || classic_here {
+            let follow_here = still_open && following;
+            if ble_on.is_some() || classic_here || follow_here {
                 decoded_block(&mut iq, &bytes, self.geometry);
             }
             let block: &[num_complex::Complex<f32>] = iq.as_deref().unwrap_or(&[]);
@@ -1066,7 +1122,22 @@ impl NetWorker {
                     // Read before the lock: parsing is work the UI
                     // thread should not wait behind.
                     let advertised: Vec<_> = packets.iter().filter_map(advertised_of).collect();
+                    // Each connection a passing CONNECT_IND set up, and where
+                    // its packet ended: the origin of its transmit window.
+                    let connects: Vec<_> = packets
+                        .iter()
+                        .filter(|p| {
+                            p.crc_ok && p.pdu_type == crate::signal::ble::pdu::PduType::ConnectInd
+                        })
+                        .filter_map(|p| {
+                            let c = crate::signal::ble::connect::decode_octets(&p.payload)?;
+                            Some((c, p.ch_sel, connect_end_pair(p, rate_hz)?))
+                        })
+                        .collect();
                     let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    for (c, ch_sel, end) in &connects {
+                        m.net.follow(c, *ch_sel, *end, rate_hz);
+                    }
                     for (address, said) in advertised {
                         m.net.advertised.entry(address).or_default().merge(said);
                     }
@@ -1111,13 +1182,146 @@ impl NetWorker {
                 }
             }
 
+            // Each followed connection's events whose windows this block
+            // completes: demodulated outside the lock with the link's own
+            // receiver, accounted for inside it. A round takes one event a
+            // connection, so an event's outcome is in its timing before the
+            // next one is placed.
+            if follow_here {
+                if let Some(this) = iq.as_deref() {
+                    let window = held(&recent, Some((first_pair, this)));
+                    let held_end = (first_pair + this.len() as u64) as f64;
+                    for _ in 0..FOLLOW_ROUNDS {
+                        let jobs: Vec<_> = {
+                            let m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                            m.net
+                                .ble_connections
+                                .iter()
+                                .map(|f| &f.connection)
+                                .filter(|c| {
+                                    *c.state() == crate::signal::ble::follow::State::Following
+                                })
+                                .map(|c| {
+                                    let interval = c.params().interval as f64 * 1.25e-3 * rate_hz;
+                                    (
+                                        c.access_address(),
+                                        c.crc_init(),
+                                        c.next_due(),
+                                        interval,
+                                        c.phy(),
+                                        c.phy_peripheral(),
+                                    )
+                                })
+                                .collect()
+                        };
+                        let mut done = Vec::new();
+                        for (aa, crc_init, due, interval, phy_c, phy_p) in jobs {
+                            let (from, to) = event_window(&due, interval, rate_hz);
+                            if to > held_end {
+                                continue;
+                            }
+                            let in_view = channel_in_view(due.channel, centre_hz, span_hz);
+                            let mut heard = Vec::new();
+                            let mut feed_lost = false;
+                            if in_view {
+                                let start = from.max(0.0).floor() as u64;
+                                let len = (to - start as f64).ceil() as usize;
+                                match window.slice(start, len) {
+                                    // Not held: lost to the feed, or older than
+                                    // what is kept. Not listened to either way.
+                                    None => feed_lost = true,
+                                    Some(samples) => {
+                                        let mut phys = vec![phy_c];
+                                        if phy_p != phy_c {
+                                            phys.push(phy_p);
+                                        }
+                                        for p in phys {
+                                            let key = (aa, due.channel, p);
+                                            let fits = link_rx.get(&key).is_some_and(|r| {
+                                                r.matches(due.channel, rate_hz, p, centre_hz)
+                                            });
+                                            if !fits {
+                                                let link =
+                                                    crate::signal::ble::receive::Link::Data {
+                                                        access_address: aa,
+                                                        crc_init,
+                                                    };
+                                                match BleReceiver::for_link(
+                                                    rate_hz,
+                                                    due.channel,
+                                                    p,
+                                                    centre_hz,
+                                                    link,
+                                                ) {
+                                                    Ok(r) => {
+                                                        link_rx.insert(key, r);
+                                                    }
+                                                    // No receiver, no listening.
+                                                    Err(_) => {
+                                                        feed_lost = true;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(rx) = link_rx.get_mut(&key) {
+                                                rx.reset();
+                                                rx.push_iq_at(&samples, start);
+                                                rx.take_funnel();
+                                                heard.extend(rx.take_data());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            done.push((aa, due.counter, in_view, feed_lost, heard));
+                        }
+                        if done.is_empty() {
+                            break;
+                        }
+                        let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        for (aa, counter, in_view, feed_lost, heard) in done {
+                            if let Some(f) = m
+                                .net
+                                .ble_connections
+                                .iter_mut()
+                                .find(|f| f.connection.access_address() == aa)
+                            {
+                                // Still the event this was for.
+                                if f.connection.next_due().counter == counter {
+                                    f.connection.account(in_view, feed_lost, heard);
+                                }
+                            }
+                        }
+                    }
+                    // Receivers of connections no longer followed go.
+                    let m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let alive: std::collections::HashSet<u32> = m
+                        .net
+                        .ble_connections
+                        .iter()
+                        .filter(|f| {
+                            *f.connection.state() == crate::signal::ble::follow::State::Following
+                        })
+                        .map(|f| f.connection.access_address())
+                        .collect();
+                    drop(m);
+                    link_rx.retain(|k, _| alive.contains(&k.0));
+                }
+            }
+
             // Held for the measurement path, as much as `measure::HELD_S`
-            // asks and no more; a block nothing decoded leaves a hole, so what
-            // was held before it can no longer be joined to what comes after.
+            // asks and no more, or a followed connection's event needs; a
+            // block nothing decoded leaves a hole, so what was held before it
+            // can no longer be joined to what comes after.
             match iq.take() {
                 Some(block) if still_open => {
                     recent.push_back((first_pair, block));
-                    let keep = (super::measure::HELD_S * rate_hz) as usize;
+                    let held_s = if following {
+                        FOLLOW_HELD_S.max(super::measure::HELD_S)
+                    } else {
+                        super::measure::HELD_S
+                    };
+                    let keep = (held_s * rate_hz) as usize;
                     while recent.len() > 1
                         && recent.iter().skip(1).map(|(_, b)| b.len()).sum::<usize>() >= keep
                     {
@@ -1244,9 +1448,10 @@ mod tests {
         use crate::signal::dsp::testkit::Rng;
         const SECONDS: f64 = 4.0;
         const BLOCK_PAIRS: usize = 131_072;
-        let cases: [(&str, f64, u64); 6] = [
+        let cases: [(&str, f64, u64); 7] = [
             ("net_survey", 8e6, 2_426_500_000),
             ("net_ble", 8e6, 2_426_000_000),
+            ("net_ble", 20e6, 2_426_000_000),
             ("net_bt", 4e6, 2_440_000_000),
             ("net_bt", 8e6, 2_440_000_000),
             ("net_bt", 20e6, 2_440_000_000),
@@ -1638,6 +1843,211 @@ mod tests {
             })
             .collect();
         (bytes, addr)
+    }
+
+    /// A connection set up and run on the air, as a 20 Msps stream tuned to
+    /// 2426 MHz: a CONNECT_IND on advertising channel 38, then `events`
+    /// events on the channels CSA #1 gives, each in view one an empty PDU
+    /// from the Central at its anchor and one from the Peripheral T_IFS
+    /// after. Returns the stream's eight-bit bytes, block by block, and the
+    /// access address.
+    fn a_connection_on_the_air(events: u16) -> (Vec<Vec<u8>>, u32) {
+        use crate::signal::ble::connect::Csa1;
+        use crate::signal::ble::data::{encode as encode_data, DataPdu};
+        use crate::signal::ble::detect::{
+            access_address_bits, preamble_bits, ADVERTISING_ACCESS_ADDRESS,
+        };
+        use crate::signal::ble::gfsk::modulate;
+        use crate::signal::ble::pdu::encode;
+        use crate::signal::ble::Phy;
+        use crate::signal::dsp::testkit::Rng;
+        use num_complex::Complex;
+
+        const RATE: f64 = 20e6;
+        const SPS: usize = 20;
+        const TUNED: f64 = 2_426e6;
+        const BLOCK: usize = 131_072;
+        const AA: u32 = 0x5065_4b6a;
+        const CRC: u32 = 0x3a_5b7c;
+        let us = |x: f64| x * 1e-6 * RATE;
+        let total = (us(2_000.0 + 1_250.0 + events as f64 * 7_500.0) as usize / BLOCK + 2) * BLOCK;
+        let mut iq = vec![Complex::new(0.0f32, 0.0); total];
+        let mut rng = Rng::new(17);
+        // A burst whose preamble starts at `at`, on `ch`.
+        let mut put = |at: usize, ch: u8, aa: u32, pdu_bits: Vec<bool>| {
+            let mut bits: Vec<bool> = (0..16).map(|_| rng.next_u64() & 1 == 1).collect();
+            bits.extend(preamble_bits(aa, Phy::OneM));
+            bits.extend_from_slice(&access_address_bits(aa));
+            bits.extend(pdu_bits);
+            let wave = modulate(&bits, SPS, Phy::OneM.deviation_hz(), RATE, 0.5);
+            let offset = crate::signal::ble::channel::centre_hz(ch).unwrap() as f64 - TUNED;
+            let from = at - 16 * SPS;
+            for (k, s) in wave.iter().enumerate() {
+                let n = from + k;
+                let ph = std::f64::consts::TAU * offset * n as f64 / RATE;
+                iq[n] += s * Complex::new(ph.cos() as f32, ph.sin() as f32) * 0.6;
+            }
+        };
+        // CONNECT_IND: InitA, AdvA, then LLData: AA, CRCInit, WinSize 1,
+        // WinOffset 0, Interval 6 (7.5 ms), Latency 0, Timeout 100, every
+        // channel, Hop 7, SCA 0.
+        let mut payload = vec![
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+        ];
+        payload.extend(AA.to_le_bytes());
+        payload.extend(&CRC.to_le_bytes()[..3]);
+        payload.extend([1, 0, 0, 6, 0, 0, 0, 100, 0, 0xff, 0xff, 0xff, 0xff, 0x1f, 7]);
+        let connect_at = us(2_000.0) as usize;
+        put(
+            connect_at,
+            38,
+            ADVERTISING_ACCESS_ADDRESS,
+            encode(38, 0x05, &payload),
+        );
+        // Preamble 8, address 32, header 16, 34 octets, CRC 24, 20 pairs a bit.
+        let connect_end = connect_at + (8 + 32 + 16 + 34 * 8 + 24) * SPS;
+        let empty = |sn: bool| DataPdu {
+            llid: 1,
+            nesn: !sn,
+            sn,
+            md: false,
+            cte_info: None,
+            payload: Vec::new(),
+            crc_ok: true,
+        };
+        let mut csa = Csa1::new(7, (1u64 << 37) - 1).unwrap();
+        for k in 0..events {
+            let ch = csa.next();
+            if !(7..=14).contains(&ch) {
+                continue;
+            }
+            let anchor = connect_end + us(1_250.0 + k as f64 * 7_500.0) as usize;
+            put(anchor, ch, AA, encode_data(&empty(false), CRC, ch));
+            let central_end = anchor + (8 + 32 + 16 + 24) * SPS;
+            put(
+                central_end + us(150.0) as usize,
+                ch,
+                AA,
+                encode_data(&empty(true), CRC, ch),
+            );
+        }
+        let blocks = iq
+            .chunks(BLOCK)
+            .map(|c| {
+                c.iter()
+                    .flat_map(|s| {
+                        let re = (s.re * 128.0).clamp(-127.0, 127.0) as i8;
+                        let im = (s.im * 128.0).clamp(-127.0, 127.0) as i8;
+                        [re as u8, im as u8]
+                    })
+                    .collect()
+            })
+            .collect();
+        (blocks, AA)
+    }
+
+    /// Runs the worker on the LE Advertising view over `blocks`, leaving out
+    /// the ones `skip` names (a lost block), and returns the state.
+    fn follow_over(blocks: &[Vec<u8>], skip: &[usize]) -> SdrMetrics {
+        let mut m = SdrMetrics::fixture().streaming();
+        m.ui.section = "le".to_string();
+        m.ui.active_preset = "net_ble".to_string();
+        m.radio.frequency = 2_426_000_000;
+        m.radio.config_sample_rate = 20e6;
+        m.radio.bb_filter_hz = 0;
+        let state = Arc::new(Mutex::new(m));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for (i, bytes) in blocks.iter().enumerate() {
+            if !skip.contains(&i) {
+                tx.send(stamped(&state, i as u64 + 1, false, bytes.clone()))
+                    .unwrap();
+            }
+        }
+        drop(tx);
+        NetWorker::new(rx, Arc::clone(&state), eight_bit(), SAFE_BT_CHANNELS).run();
+        let m = state.lock().unwrap().clone();
+        m
+    }
+
+    /// **What following a connection costs, measured**, as
+    /// `measure_the_receive_chain` measures the views: run by hand, in
+    /// release, on the machine the question is about (`cargo test --release
+    /// measure_following_a_connection -- --ignored --nocapture`). One
+    /// connection at the shortest interval the Core allows (7.5 ms), a
+    /// second of it, against `net_ble@20` in that probe for the same view
+    /// with nothing to follow.
+    #[test]
+    #[ignore]
+    fn measure_following_a_connection() {
+        let (blocks, _) = a_connection_on_the_air(133);
+        let start = std::time::Instant::now();
+        let m = follow_over(&blocks, &[]);
+        let wall = start.elapsed().as_secs_f64();
+        let stream = blocks.iter().map(|b| b.len() / 2).sum::<usize>() as f64 / 20e6;
+        let c = &m.net.ble_connections[0].connection;
+        let followed = c
+            .events()
+            .iter()
+            .filter(|e| e.account == crate::signal::ble::follow::Account::Followed)
+            .count();
+        eprintln!(
+            "following at 20 Msps: {} events, {followed} followed, {:.2}x real time",
+            c.events().len(),
+            wall / stream
+        );
+    }
+
+    /// **A connection heard set up is followed.** Its CONNECT_IND on
+    /// channel 38 starts it; every event on a channel the 20 MHz window
+    /// holds (data channels 7 to 14) is followed, its Central placed at the
+    /// anchor and its Peripheral T_IFS after; the rest are out of view.
+    #[test]
+    fn a_connection_heard_set_up_is_followed() {
+        use crate::signal::ble::follow::{Account, Sender};
+        let (blocks, aa) = a_connection_on_the_air(24);
+        let m = follow_over(&blocks, &[]);
+        assert_eq!(m.net.ble_connections.len(), 1);
+        let c = &m.net.ble_connections[0].connection;
+        assert_eq!(c.access_address(), aa);
+        let events = c.events();
+        assert!(events.len() >= 20, "{} accounted", events.len());
+        for e in events {
+            let in_view = (7..=14).contains(&e.channel);
+            assert_eq!(e.account == Account::NotInView, !in_view, "{e:?}");
+            if in_view {
+                assert_eq!(e.account, Account::Followed, "{e:?}");
+                let senders: Vec<_> = e.pdus.iter().map(|p| p.sender).collect();
+                assert_eq!(
+                    senders,
+                    [Some(Sender::Central), Some(Sender::Peripheral)],
+                    "{e:?}"
+                );
+                let t_ifs = e.pdus[1].t_ifs_us.unwrap();
+                assert!((t_ifs - 150.0).abs() < 1.0, "{t_ifs}");
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .filter(|e| e.account == Account::Followed)
+                .count()
+                >= 5
+        );
+    }
+
+    /// A block lost inside an event's window: that event is not listened
+    /// to, and says so; the ones after are followed again.
+    #[test]
+    fn an_event_in_a_lost_block_is_feed_lost() {
+        use crate::signal::ble::follow::Account;
+        let (blocks, _) = a_connection_on_the_air(24);
+        // Event 6, on channel 12, has its anchor in the eighth block.
+        let m = follow_over(&blocks, &[7]);
+        let c = &m.net.ble_connections[0].connection;
+        let six = c.events().iter().find(|e| e.counter == 6).unwrap();
+        assert_eq!(six.account, Account::FeedLost, "{six:?}");
+        let later = c.events().iter().find(|e| e.counter == 11).unwrap();
+        assert_eq!(later.account, Account::Followed, "{later:?}");
     }
 
     /// Surveying, a position whose centre is not a BLE channel still decodes

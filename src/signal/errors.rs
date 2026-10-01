@@ -9,8 +9,6 @@
 //! transcribed mechanically from the SIG's HTML copy on 2026-10-01, the
 //! reserved and previously used codes as the table words them. A test holds
 //! the table to running 0x00 to 0x47 once each.
-// Read only by its tests until the NET worker follows a connection.
-#![allow(dead_code)]
 
 /// Table 1.1: each code and its name.
 pub const ERRORS: &[(u8, &str)] = &[

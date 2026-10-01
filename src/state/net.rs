@@ -344,6 +344,10 @@ pub struct NetState {
     /// Advertising channel PDUs decoded so far this session, newest first,
     /// capped at [`BLE_PACKET_LIMIT`].
     pub ble_packets: std::collections::VecDeque<BlePacket>,
+    /// The connections whose CONNECT_IND was heard, followed through the
+    /// events the radio's window holds (`signal::ble::follow`), newest
+    /// first, at most [`CONNECTIONS_KEPT`].
+    pub ble_connections: Vec<FollowedConnection>,
     /// Packets that have entered [`Self::ble_packets`] this session: each
     /// one's [`BlePacket::seq`] is the count at its arrival.
     pub ble_heard: u64,
@@ -741,6 +745,53 @@ pub struct NetDecodeHealth {
     /// Classic access-code hits since the section opened, every one, where
     /// `bt_hops` keeps only the latest few hundred.
     pub bt_hits: u64,
+}
+
+/// How many connections [`NetState::ble_connections`] keeps: enough for a
+/// room's phones and their watches, few enough that each is worth a look.
+pub const CONNECTIONS_KEPT: usize = 16;
+
+/// One connection followed.
+#[derive(Clone, Debug)]
+pub struct FollowedConnection {
+    pub connection: crate::signal::ble::follow::Connection,
+}
+
+impl NetState {
+    /// Start following the connection a CONNECT_IND set up, unless one with
+    /// its access address is followed already: `true` when it is new. Past
+    /// [`CONNECTIONS_KEPT`] the oldest ended one is let go, or the oldest
+    /// when none has ended.
+    pub fn follow(
+        &mut self,
+        c: &crate::signal::ble::connect::ConnectIndData,
+        ch_sel: bool,
+        end_pair: f64,
+        raw_rate: f64,
+    ) -> bool {
+        use crate::signal::ble::follow::{Connection, State};
+        if self
+            .ble_connections
+            .iter()
+            .any(|f| f.connection.access_address() == c.access_address)
+        {
+            return false;
+        }
+        let Some(connection) = Connection::new(c, ch_sel, end_pair, raw_rate) else {
+            return false;
+        };
+        self.ble_connections
+            .insert(0, FollowedConnection { connection });
+        if self.ble_connections.len() > CONNECTIONS_KEPT {
+            let ended = self
+                .ble_connections
+                .iter()
+                .rposition(|f| *f.connection.state() != State::Following);
+            let at = ended.unwrap_or(self.ble_connections.len() - 1);
+            self.ble_connections.remove(at);
+        }
+        true
+    }
 }
 
 /// How many recent PDUs [`NetState::ble_packets`] keeps. A bench instrument
@@ -1213,6 +1264,66 @@ impl BandOccupancy {
 
 #[cfg(test)]
 mod tests {
+
+    fn connect_ind(aa: u32) -> crate::signal::ble::connect::ConnectIndData {
+        crate::signal::ble::connect::ConnectIndData {
+            init_a: [0; 6],
+            adv_a: [0; 6],
+            access_address: aa,
+            crc_init: 0x12_3456,
+            win_size: 1,
+            win_offset: 0,
+            interval: 6,
+            latency: 0,
+            timeout: 100,
+            channel_map: (1u64 << 37) - 1,
+            hop_increment: 7,
+            sca: 0,
+        }
+    }
+
+    /// One connection an access address; the newest first; at most
+    /// [`CONNECTIONS_KEPT`], the ended ones let go before the followed.
+    #[test]
+    fn connections_are_followed_once_each_and_kept_to_a_number() {
+        let mut net = NetState::default();
+        assert!(net.follow(&connect_ind(1), false, 0.0, 20e6));
+        assert!(
+            !net.follow(&connect_ind(1), false, 9.0, 20e6),
+            "heard twice"
+        );
+        assert_eq!(net.ble_connections.len(), 1);
+        // The first one ends: LL_TERMINATE_IND at its first anchor.
+        let mut c = net.ble_connections[0].connection.clone();
+        let at = c.next_due().anchor_pair;
+        let terminate = crate::signal::ble::data::DataPdu {
+            llid: 3,
+            nesn: false,
+            sn: false,
+            md: false,
+            cte_info: None,
+            payload: vec![0x02, 0x13],
+            crc_ok: true,
+        };
+        let timing = crate::signal::ble::receive::DataTiming {
+            start_pair: at,
+            end_pair: at + 1_000.0,
+        };
+        c.account(true, false, vec![(terminate, timing)]);
+        net.ble_connections[0].connection = c;
+        for aa in 2..=(CONNECTIONS_KEPT as u32 + 1) {
+            assert!(net.follow(&connect_ind(aa), false, 0.0, 20e6));
+        }
+        assert_eq!(net.ble_connections.len(), CONNECTIONS_KEPT);
+        assert_eq!(
+            net.ble_connections[0].connection.access_address(),
+            CONNECTIONS_KEPT as u32 + 1
+        );
+        assert!(net
+            .ble_connections
+            .iter()
+            .all(|c| c.connection.access_address() != 1));
+    }
     use super::*;
 
     /// Masked hides every part of an address, not the address alone: the
