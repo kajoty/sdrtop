@@ -149,6 +149,17 @@ fn event_window(
     (from, to)
 }
 
+/// Whether an advertising PDU is one a CONNECT_IND answers: connectable
+/// (ADV_IND or ADV_DIRECT_IND, Core 5.4 Vol 6 Part B 4.5) and from its AdvA.
+fn answered_by(
+    t: crate::signal::ble::pdu::PduType,
+    adv_addr: Option<[u8; 6]>,
+    c: &crate::signal::ble::connect::ConnectIndData,
+) -> bool {
+    use crate::signal::ble::pdu::PduType;
+    matches!(t, PduType::AdvInd | PduType::AdvDirectInd) && adv_addr == Some(c.adv_a)
+}
+
 /// Where a CONNECT_IND's packet ended, pairs: the end of its CRC, from where
 /// its PDU's first bit was centred and how many bits the PDU is, on LE 1M.
 fn connect_end_pair(p: &crate::signal::ble::pdu::Packet, rate_hz: f64) -> Option<f64> {
@@ -1117,20 +1128,37 @@ impl NetWorker {
                     let advertised: Vec<_> = packets.iter().filter_map(advertised_of).collect();
                     // Each connection a passing CONNECT_IND set up, and where
                     // its packet ended: the origin of its transmit window.
+                    // With the ChSel of the advertising PDU each answered, as
+                    // far as this block heard it: the algorithm needs both.
+                    use crate::signal::ble::pdu::PduType;
                     let connects: Vec<_> = packets
                         .iter()
-                        .filter(|p| {
-                            p.crc_ok && p.pdu_type == crate::signal::ble::pdu::PduType::ConnectInd
-                        })
-                        .filter_map(|p| {
+                        .enumerate()
+                        .filter(|(_, p)| p.crc_ok && p.pdu_type == PduType::ConnectInd)
+                        .filter_map(|(i, p)| {
                             let c = crate::signal::ble::connect::decode_octets(&p.payload)?;
+                            let answered = packets[..i]
+                                .iter()
+                                .rev()
+                                .find(|q| answered_by(q.pdu_type, q.adv_addr, &c))
+                                .map(|q| q.ch_sel);
                             let flags = (p.ch_sel, p.tx_add_random, p.rx_add_random);
-                            Some((c, flags, connect_end_pair(p, rate_hz)?))
+                            Some((c, flags, answered, connect_end_pair(p, rate_hz)?))
                         })
                         .collect();
                     let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    for (c, flags, end) in &connects {
-                        m.net.follow(c, *flags, *end, rate_hz, now);
+                    for (c, (ch_sel, init_random, adv_random), answered, end) in &connects {
+                        // Not in this block: the newest kept, from the ring.
+                        let answered = answered.or_else(|| {
+                            m.net
+                                .ble_packets
+                                .iter()
+                                .find(|q| answered_by(q.pdu_type, q.adv_addr, c))
+                                .map(|q| q.ch_sel)
+                        });
+                        let csa2 = crate::signal::ble::follow::uses_csa2(*ch_sel, answered);
+                        m.net
+                            .follow(c, (csa2, *init_random, *adv_random), *end, rate_hz, now);
                     }
                     for (address, said) in advertised {
                         m.net.advertised.entry(address).or_default().merge(said);
@@ -1850,6 +1878,17 @@ mod tests {
     /// after. Returns the stream's eight-bit bytes, block by block, and the
     /// access address.
     fn a_connection_on_the_air(events: u16) -> (Vec<Vec<u8>>, u32) {
+        a_connection_with_chsel(events, false, None)
+    }
+
+    /// [`a_connection_on_the_air`] with the CONNECT_IND's ChSel bit, and,
+    /// when given, an ADV_DIRECT_IND from its AdvA with that ChSel 150 us
+    /// before it, the PDU it answers.
+    fn a_connection_with_chsel(
+        events: u16,
+        connect_ch_sel: bool,
+        advertised: Option<bool>,
+    ) -> (Vec<Vec<u8>>, u32) {
         use crate::signal::ble::connect::Csa1;
         use crate::signal::ble::data::{encode as encode_data, DataPdu};
         use crate::signal::ble::detect::{
@@ -1896,11 +1935,29 @@ mod tests {
         payload.extend(&CRC.to_le_bytes()[..3]);
         payload.extend([1, 0, 0, 6, 0, 0, 0, 100, 0, 0xff, 0xff, 0xff, 0xff, 0x1f, 7]);
         let connect_at = us(2_000.0) as usize;
+        if let Some(adv_ch_sel) = advertised {
+            // ADV_DIRECT_IND: AdvA then TargetA (the initiator), air order.
+            let direct: Vec<u8> = payload[6..12]
+                .iter()
+                .chain(&payload[..6])
+                .copied()
+                .collect();
+            let header = 0x01 | (adv_ch_sel as u8) << 5;
+            // 8 + 32 + 16 + 12 * 8 + 24 bits, then T_IFS.
+            let before = (8 + 32 + 16 + 12 * 8 + 24) * SPS + us(150.0) as usize;
+            put(
+                connect_at - before,
+                38,
+                ADVERTISING_ACCESS_ADDRESS,
+                encode(38, header, &direct),
+            );
+        }
+        let header = 0x05 | (connect_ch_sel as u8) << 5;
         put(
             connect_at,
             38,
             ADVERTISING_ACCESS_ADDRESS,
-            encode(38, 0x05, &payload),
+            encode(38, header, &payload),
         );
         // Preamble 8, address 32, header 16, 34 octets, CRC 24, 20 pairs a bit.
         let connect_end = connect_at + (8 + 32 + 16 + 34 * 8 + 24) * SPS;
@@ -1995,6 +2052,187 @@ mod tests {
         );
     }
 
+    /// Replays a recording (`SDRTOP_REPLAY=path.sigmf-data`, ci8 at 20 Msps
+    /// tuned to 2426 MHz) through the worker on LE 2, locked, and prints the
+    /// connections followed. By hand, in release.
+    #[test]
+    #[ignore]
+    fn replay_a_recording() {
+        use std::io::Read;
+        let Ok(path) = std::env::var("SDRTOP_REPLAY") else {
+            return;
+        };
+        let mut m = SdrMetrics::fixture().streaming();
+        m.ui.section = "le".to_string();
+        m.ui.active_preset = "net_ble".to_string();
+        m.net.mode = crate::state::NetMode::Lock;
+        m.radio.frequency = 2_426_000_000;
+        m.radio.config_sample_rate = 20e6;
+        m.radio.bb_filter_hz = 0;
+        let state = Arc::new(Mutex::new(m));
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let st = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            NetWorker::new(rx, st, eight_bit(), SAFE_BT_CHANNELS).run();
+        });
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut seq = 1u64;
+        loop {
+            let mut buf = vec![0u8; 131_072 * 2];
+            let mut got = 0;
+            while got < buf.len() {
+                let n = f.read(&mut buf[got..]).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            if got < buf.len() {
+                break;
+            }
+            tx.send(stamped(&state, seq, false, buf)).unwrap();
+            seq += 1;
+        }
+        drop(tx);
+        worker.join().unwrap();
+        let m = state.lock().unwrap();
+        let connects = m
+            .net
+            .ble_packets
+            .iter()
+            .filter(|p| p.pdu_type == crate::signal::ble::pdu::PduType::ConnectInd)
+            .count();
+        eprintln!(
+            "blocks {} · packets kept {} · CONNECT_IND kept {connects}",
+            seq - 1,
+            m.net.ble_packets.len()
+        );
+        // A second pass, with no follower: every packet with the link's
+        // access address on the eight data channels in view, and the
+        // CONNECT_IND on 38, from `SDRTOP_REPLAY_FROM` pairs on.
+        if let Some(f) = m.net.ble_connections.first() {
+            use crate::signal::ble::receive::{Link, Receiver};
+            let (aa, crc) = (f.connection.access_address(), f.connection.crc_init());
+            let from: u64 = std::env::var("SDRTOP_REPLAY_FROM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let mut adv = Receiver::new(20e6, 38, crate::signal::ble::Phy::OneM, 2_426e6).unwrap();
+            let mut links: Vec<(u8, Receiver)> = (7..=14u8)
+                .map(|ch| {
+                    (
+                        ch,
+                        Receiver::for_link(
+                            20e6,
+                            ch,
+                            crate::signal::ble::Phy::OneM,
+                            2_426e6,
+                            Link::Data {
+                                access_address: aa,
+                                crc_init: crc,
+                            },
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let mut f = std::fs::File::open(&path).unwrap();
+            use std::io::Seek;
+            f.seek(std::io::SeekFrom::Start(from * 2)).unwrap();
+            let mut at = from;
+            let mut heard = Vec::new();
+            loop {
+                let mut buf = vec![0u8; 131_072 * 2];
+                let mut got = 0;
+                while got < buf.len() {
+                    let n = f.read(&mut buf[got..]).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                }
+                if got < buf.len() {
+                    break;
+                }
+                let mut iq = Vec::new();
+                crate::signal::demod::decode(&buf, eight_bit(), usize::MAX, &mut iq);
+                for p in adv.push_iq_at(&iq, at) {
+                    if p.pdu_type == crate::signal::ble::pdu::PduType::ConnectInd {
+                        let end = p.pdu_pair.map(|c| {
+                            c + (crate::signal::ble::pdu::used_bits(p.length) as f64 - 0.5) * 20.0
+                        });
+                        eprintln!(
+                            "CONNECT_IND crc {} pdu_pair {:?} end {:?}",
+                            p.crc_ok, p.pdu_pair, end
+                        );
+                    }
+                }
+                for (ch, rx) in links.iter_mut() {
+                    rx.push_iq_at(&iq, at);
+                    for (d, timing) in rx.take_data() {
+                        heard.push((timing.start_pair, *ch, d.llid, d.payload.len(), d.crc_ok));
+                    }
+                }
+                at += 131_072;
+                if at > from + 200_000_000 {
+                    break;
+                }
+            }
+            heard.sort_by(|a, b| a.0.total_cmp(&b.0));
+            eprintln!("heard with AA {aa:08x}: {}", heard.len());
+            for h in heard.iter().take(60) {
+                eprintln!(
+                    "  start {:.1} ch{} llid {} len {} crc {}",
+                    h.0, h.1, h.2, h.3, h.4
+                );
+            }
+        }
+        for f in &m.net.ble_connections {
+            let c = &f.connection;
+            let p = c.params();
+            eprintln!(
+                "AA {:08x} CSA#{} interval {} win {}+{} sca {} state {:?}",
+                c.access_address(),
+                c.algorithm(),
+                p.interval,
+                p.win_offset,
+                p.win_size,
+                p.sca,
+                c.state()
+            );
+            for e in c.events().iter().rev() {
+                let ctl: Vec<String> = e
+                    .pdus
+                    .iter()
+                    .filter_map(|h| {
+                        h.control
+                            .as_ref()
+                            .map(|k| format!("{:?} {}", k.name, k.words))
+                    })
+                    .collect();
+                if !ctl.is_empty() || (125..=150).contains(&e.counter) {
+                    eprintln!(
+                        "  {:>4} ch{:>2} {:?} {:?} {:?}",
+                        e.counter,
+                        e.channel,
+                        e.account,
+                        e.pdus
+                            .iter()
+                            .map(|h| (h.sender, h.pdu.llid, h.pdu.payload.len(), h.pdu.crc_ok))
+                            .collect::<Vec<_>>(),
+                        ctl
+                    );
+                }
+            }
+            eprintln!(
+                "encrypted from {:?} · clock {:?} · t_ifs {:?}",
+                c.encrypted_from(),
+                c.clock_ppm(),
+                c.t_ifs()
+            );
+        }
+    }
+
     /// **A connection heard set up is followed.** Its CONNECT_IND on
     /// channel 38 starts it; every event on a channel the 20 MHz window
     /// holds (data channels 7 to 14) is followed, its Central placed at the
@@ -2030,6 +2268,29 @@ mod tests {
                 .filter(|e| e.account == Account::Followed)
                 .count()
                 >= 5
+        );
+    }
+
+    /// **The advertising PDU's ChSel counts too.** A CONNECT_IND with ChSel
+    /// set answering an ADV_DIRECT_IND without it is a CSA #1 connection,
+    /// and is followed as one; with the advertising PDU never heard, which
+    /// algorithm is unknown and the connection says so.
+    #[test]
+    fn the_answered_advertisings_chsel_picks_the_algorithm() {
+        use crate::signal::ble::follow::{Account, State};
+        let (blocks, _) = a_connection_with_chsel(24, true, Some(false));
+        let m = follow_over(&blocks, &[]);
+        let c = &m.net.ble_connections[0].connection;
+        assert_eq!(c.algorithm(), 1);
+        assert!(c.events().iter().any(|e| e.account == Account::Followed));
+
+        let (blocks, _) = a_connection_with_chsel(24, true, None);
+        let m = follow_over(&blocks, &[]);
+        let c = &m.net.ble_connections[0].connection;
+        assert!(
+            matches!(c.state(), State::NotFollowed { .. }),
+            "{:?}",
+            c.state()
         );
     }
 

@@ -466,7 +466,8 @@ mod tests {
             hop_increment: 7,
             sca: 0,
         };
-        m.net.follow(&c, (false, false, false), 0.0, 20e6, now);
+        m.net
+            .follow(&c, (Some(false), false, false), 0.0, 20e6, now);
         m.net.ble_connections[0]
             .connection
             .account(true, false, Vec::new());

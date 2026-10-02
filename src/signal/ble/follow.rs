@@ -290,6 +290,12 @@ impl Connection {
         &self.params
     }
 
+    /// Follow no further, and say why: for a connection whose schedule
+    /// cannot be known from what was heard.
+    pub fn refuse(&mut self, why: &'static str) {
+        self.state = State::NotFollowed { why };
+    }
+
     /// Which Channel Selection Algorithm the connection hops by, 1 or 2,
     /// as its CONNECT_IND's ChSel named it.
     pub fn algorithm(&self) -> u8 {
@@ -661,6 +667,22 @@ impl Connection {
             None => self.missed(),
         }
     }
+}
+
+/// Whether a connection hops by Channel Selection Algorithm #2, from the
+/// ChSel bits of its CONNECT_IND and of the advertising PDU it answered:
+/// "If the initiator sent a CONNECT_IND PDU in response to an ADV_IND or
+/// ADV_DIRECT_IND PDU and either or both devices' PDU had the ChSel field set
+/// to 0, then Channel Selection Algorithm #1 ... shall be used on the
+/// connection. Otherwise, Channel Selection Algorithm #2" (Core 5.4 Vol 6
+/// Part B 4.5). The initiator may set its bit when the advertiser does not
+/// support #2 (2.3.3.1), so the CONNECT_IND alone does not say. `None`: its
+/// bit is set and the advertising PDU was not heard.
+pub fn uses_csa2(connect_ch_sel: bool, advertised_ch_sel: Option<bool>) -> Option<bool> {
+    if !connect_ch_sel {
+        return Some(false);
+    }
+    advertised_ch_sel
 }
 
 /// The instant an update takes effect at, for the ones that have one.
@@ -1067,6 +1089,19 @@ mod tests {
         c.account(true, false, heard);
         assert_eq!(c.per_channel()[ch as usize], (2, 1));
         assert_eq!(c.per_channel().iter().map(|p| p.0).sum::<u32>(), 2);
+    }
+
+    /// CSA #2 only when both PDUs set ChSel (Vol 6 Part B 4.5); the
+    /// initiator may set it alone, as a TV box answering its remote did on
+    /// the air, and then it is CSA #1. The advertising PDU not heard, with
+    /// the CONNECT_IND's set, leaves it unknown.
+    #[test]
+    fn the_algorithm_needs_both_chsel_bits() {
+        assert_eq!(uses_csa2(false, None), Some(false));
+        assert_eq!(uses_csa2(false, Some(true)), Some(false));
+        assert_eq!(uses_csa2(true, Some(false)), Some(false));
+        assert_eq!(uses_csa2(true, Some(true)), Some(true));
+        assert_eq!(uses_csa2(true, None), None);
     }
 
     /// A map with no used channel is no connection to follow.

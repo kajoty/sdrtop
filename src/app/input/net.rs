@@ -906,7 +906,8 @@ mod tests {
         let now = Instant::now();
         for aa in [0x1111_1111u32, 0x2222_2222] {
             let c = crate::signal::ble::connect::decode_octets(&connect_payload(aa)).unwrap();
-            m.net.follow(&c, (false, false, false), 0.0, 20e6, now);
+            m.net
+                .follow(&c, (Some(false), false, false), 0.0, 20e6, now);
         }
         m.net.ble_packets.push_front(crate::state::BlePacket {
             seq: 1,
@@ -1112,7 +1113,8 @@ mod tests {
                 sca: 0,
             };
             let now = std::time::Instant::now();
-            m.net.follow(&c, (false, false, false), 0.0, 20e6, now);
+            m.net
+                .follow(&c, (Some(false), false, false), 0.0, 20e6, now);
             // Missed, so each is a row of its own (a run out of view is one).
             for _ in 0..3 {
                 m.net.ble_connections[0]

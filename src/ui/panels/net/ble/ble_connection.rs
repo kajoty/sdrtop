@@ -649,7 +649,7 @@ mod tests {
             sca: 0,
         };
         m.net
-            .follow(&c, (false, true, false), 0.0, RATE, Instant::now());
+            .follow(&c, (Some(false), true, false), 0.0, RATE, Instant::now());
         let conn = &mut m.net.ble_connections[0].connection;
         let a = conn.next_due().anchor_pair;
         let version = at(a, 6);

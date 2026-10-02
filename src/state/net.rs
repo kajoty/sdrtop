@@ -800,7 +800,7 @@ impl NetState {
     pub fn follow(
         &mut self,
         c: &crate::signal::ble::connect::ConnectIndData,
-        (ch_sel, init_random, adv_random): (bool, bool, bool),
+        (csa2, init_random, adv_random): (Option<bool>, bool, bool),
         end_pair: f64,
         raw_rate: f64,
         now: std::time::Instant,
@@ -813,9 +813,15 @@ impl NetState {
         {
             return false;
         }
-        let Some(connection) = Connection::new(c, ch_sel, end_pair, raw_rate) else {
+        let Some(mut connection) = Connection::new(c, csa2.unwrap_or(false), end_pair, raw_rate)
+        else {
             return false;
         };
+        if csa2.is_none() {
+            connection.refuse(
+                "the advertising PDU it answered was not heard: which channel selection algorithm is not known",
+            );
+        }
         self.ble_connections.insert(
             0,
             FollowedConnection {
@@ -1331,9 +1337,9 @@ mod tests {
     fn connections_are_followed_once_each_and_kept_to_a_number() {
         let now = std::time::Instant::now();
         let mut net = NetState::default();
-        assert!(net.follow(&connect_ind(1), (false, false, false), 0.0, 20e6, now));
+        assert!(net.follow(&connect_ind(1), (Some(false), false, false), 0.0, 20e6, now));
         assert!(
-            !net.follow(&connect_ind(1), (false, false, false), 9.0, 20e6, now),
+            !net.follow(&connect_ind(1), (Some(false), false, false), 9.0, 20e6, now),
             "heard twice"
         );
         assert_eq!(net.ble_connections.len(), 1);
@@ -1356,7 +1362,13 @@ mod tests {
         c.account(true, false, vec![(terminate, timing)]);
         net.ble_connections[0].connection = c;
         for aa in 2..=(CONNECTIONS_KEPT as u32 + 1) {
-            assert!(net.follow(&connect_ind(aa), (false, false, false), 0.0, 20e6, now));
+            assert!(net.follow(
+                &connect_ind(aa),
+                (Some(false), false, false),
+                0.0,
+                20e6,
+                now
+            ));
         }
         assert_eq!(net.ble_connections.len(), CONNECTIONS_KEPT);
         assert_eq!(

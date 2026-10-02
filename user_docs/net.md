@@ -488,10 +488,18 @@ ends it with its reason; a move to LE Coded, or a subrate change, is
 - **T_IFS**: the turns heard, pooled, against 150 ± 2 µs (4.2.1).
 - **CRC**: packets and passes per data channel heard.
 
-Tested against synthetic connections, end to end through the receiver; the
-first real pair heard will be noted here. Until then, take the view as a
-well-tested opinion about other people's radios. Keys: `↑↓` scroll, `End`
-back to the newest, `← →` the previous or next connection.
+**On the air**, a TV box and its BLE remote, the remote taken out of its
+batteries and put back: the box's `CONNECT_IND` set ChSel, the remote's
+`ADV_DIRECT_IND` did not, so the link hopped by Algorithm #1, as the Core
+says it must when either bit is 0 (the view reads both). Every event in view
+was followed, both ends placed: `LL_FEATURE_REQ`, then `LL_ENC_REQ` and
+`LL_START_ENC_REQ` by event 10, after which the link was encrypted; T_IFS
+150.31 ±0.04 µs over 26 turns, the box's clock −5.1 ±0.1 ppm against the
+radio's. At event 138 the two changed their timing in a PDU nobody else
+could read, and the view said so: lost after event 138. A device that
+reconnects over classic Bluetooth (most earbuds) never shows here at all.
+Keys: `↑↓` scroll, `End` back to the newest, `← →` the previous or next
+connection.
 
 ---
 
