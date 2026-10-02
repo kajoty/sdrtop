@@ -522,7 +522,11 @@ mod tests {
         let c = capabilities(&a).unwrap().caps;
         let stages = c.gain.stages();
         let names: Vec<&str> = stages.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["LNA", "VGA"], "nothing was answered, so nothing moved");
+        assert_eq!(
+            names,
+            ["LNA", "VGA"],
+            "nothing was answered, so nothing moved"
+        );
         assert!(!c.gain.has_boost());
     }
 

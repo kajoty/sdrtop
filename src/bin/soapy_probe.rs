@@ -97,7 +97,10 @@ fn main() {
         let Some(r) = (unsafe { api.gain_element_range(dev, name) }) else {
             continue;
         };
-        if r.step > 0.0 || !(r.maximum.is_finite() && r.minimum.is_finite()) || r.maximum <= r.minimum {
+        if r.step > 0.0
+            || !(r.maximum.is_finite() && r.minimum.is_finite())
+            || r.maximum <= r.minimum
+        {
             println!("  {name:<8} skipped (step present or range not a range)");
             continue;
         }
