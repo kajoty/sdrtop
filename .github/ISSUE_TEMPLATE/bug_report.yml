@@ -1,0 +1,82 @@
+name: Bug report
+description: Something in sdrtop is broken, or says something that isn't true.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Two minutes in the [troubleshooting guide](https://github.com/musithang/sdrtop/blob/main/user_docs/troubleshooting.md) first might save you the report.
+
+        A number on screen that is wrong while looking right is the most serious kind of bug sdrtop can have ([Rule Two](https://github.com/musithang/sdrtop/blob/main/POLICY.md#two)). If that's what you found, it goes to the top of the list.
+
+  - type: input
+    id: version
+    attributes:
+      label: sdrtop version
+      description: "`sdrtop --version`. The commit hash matters: it tells a release from a build off `main`."
+      placeholder: sdrtop 0.6.2 (a1b2c3d)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: device
+    attributes:
+      label: Radio
+      options:
+        - HackRF One
+        - PortaPack H4M (HackRF mode)
+        - RTL-SDR
+        - tinySA / tinySA Ultra
+        - Through SoapySDR (name it below)
+        - None, or observer mode
+    validations:
+      required: true
+
+  - type: input
+    id: device-details
+    attributes:
+      label: Radio details
+      description: Model and firmware. For an RTL-SDR, the tuner (`rtl_test -t` prints it). Through SoapySDR, the driver.
+      placeholder: "HackRF One, firmware 2024.02.1"
+
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: Distribution, CPU, and how you installed sdrtop.
+      placeholder: "Ubuntu 24.04, an old i3, cargo install"
+    validations:
+      required: true
+
+  - type: input
+    id: settings
+    attributes:
+      label: Where you were
+      description: Frequency, sample rate and layout.
+      placeholder: "92.8 MHz, 2 Msps, Lab 4"
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      placeholder: |
+        1. Start sdrtop with ...
+        2. Press ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: If a number looks wrong, say what you think it should be, and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The part of `~/.config/sdrtop/sdrtop.log` from around when it happened. If you include only one thing, include this.
+      render: text
