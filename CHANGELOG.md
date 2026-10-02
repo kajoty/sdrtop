@@ -16,6 +16,30 @@ checkpoint instead of by version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The AMP is a switch again on a HackRF reached over SoapyRemote.** The
+  driver reports `AMP [0, 14, step 14]` locally, but the step does not survive
+  the RPC: over `driver=remote` the same element arrives as `[0, 14, step 0]`,
+  which looks exactly like a continuous control. sdrtop therefore offered a
+  0-14 AMP knob and answered `[A]` with "this device has no front end boost to
+  toggle". The bounds alone cannot tell the two apart — `[0, 40, step 0]` (the
+  LNA) has the same shape — so the element is now **asked** directly: it is set
+  to a value strictly between its bounds and read back, and a switch is one
+  that snaps to an end instead of holding the middle. The original setting is
+  restored, and an element the device will not answer about stays a stage
+  rather than being guessed at.
+- **The LNA and VGA keys no longer move the AMP behind your back.** On a
+  SoapyHackRF, `set_lna_gain` used to call the driver's whole-chain `setGain`,
+  which spreads the value across LNA, VGA and AMP and switches the AMP on by
+  itself once the total passes 51 dB. The AMP is a switch, not a knob, so it
+  now stays where `[A]` put it. Both named setters address their stage by the
+  name the driver reported (`set_gain_element`) instead of asking the driver to
+  guess.
+- **`[` and `]` move the VGA again.** `set_vga_gain` was a no-op that reported
+  success, left over from when every Soapy device was assumed to have a single
+  gain knob. A SoapyHackRF has a VGA stage, and the keys now reach it.
+
 ## [0.6.2] - 2026-09-27
 
 **NET, measured the way the test suites measure.**
