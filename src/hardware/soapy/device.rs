@@ -35,6 +35,9 @@ pub struct SoapyDevice {
     /// The driver's own wire format, kept because `setupStream` wants the name
     /// and `caps` only kept what the name meant.
     native_format: String,
+    /// Whether the driver supplied a usable named gain element. If it did not,
+    /// the synthetic `RF` stage is backed by the whole-chain API instead.
+    named_gain_elements: bool,
     streaming: super::stream::Streaming,
     /// What `caps` declined to use, in words, for the startup log.
     notes: Vec<String>,
@@ -67,6 +70,10 @@ impl SoapyDevice {
                 anyhow::bail!("SoapySDR device {args} cannot be used: {why}");
             }
         };
+        let named_gain_elements = answers
+            .gain_elements
+            .iter()
+            .any(|element| element.is_usable());
         let caps = built.caps;
         let info = unsafe { describe(api, dev, args) };
 
@@ -77,6 +84,7 @@ impl SoapyDevice {
             info,
             args: args.to_string(),
             native_format: answers.native_format,
+            named_gain_elements,
             streaming: super::stream::Streaming::default(),
             // `caps` refuses an element by name rather than silently keeping it.
             // There is no log to say so to yet, so it is carried out to the
@@ -130,6 +138,14 @@ impl SoapyDevice {
                 .map_err(|e| anyhow::anyhow!("{}: {e}", self.args)),
             None => Ok(()),
         }
+    }
+
+    /// Set the synthetic fallback stage through SoapySDR's whole-chain API.
+    /// Drivers that expose named elements use the exact element path instead;
+    /// drivers that expose none have no valid name to pass to setGainElement.
+    fn set_whole_gain(&self, db: f64) -> anyhow::Result<()> {
+        unsafe { self.api.set_gain(self.dev, db) }
+            .map_err(|e| anyhow::anyhow!("{}: {e}", self.args))
     }
 }
 
@@ -218,7 +234,11 @@ impl SdrDevice for SoapyDevice {
     /// knob deterministic and the AMP a switch.
     fn set_lna_gain(&self, db: u32) -> anyhow::Result<()> {
         let (clamped, _) = self.caps.gain.clamp_gains(db, 0);
-        self.set_named_stage(0, clamped as f64)
+        if self.named_gain_elements {
+            self.set_named_stage(0, clamped as f64)
+        } else {
+            self.set_whole_gain(clamped as f64)
+        }
     }
 
     /// The second stage, by the name the driver gave it.
@@ -227,7 +247,11 @@ impl SdrDevice for SoapyDevice {
     /// `Ok(())` here was written when every Soapy device was assumed to be a
     /// single knob, and it made `[` / `]` report success while moving nothing.
     fn set_vga_gain(&self, db: u32) -> anyhow::Result<()> {
-        self.set_named_stage(1, db as f64)
+        if self.named_gain_elements {
+            self.set_named_stage(1, db as f64)
+        } else {
+            self.set_whole_gain(db as f64)
+        }
     }
 
     /// Address the element by the name the driver gave it, with the exact value.
@@ -237,8 +261,12 @@ impl SdrDevice for SoapyDevice {
     /// reverses itself twice across the range, dropping the LNA by 13 dB at one
     /// point while the user is turning the gain **up**.
     fn set_stage_gain(&self, _index: usize, name: &str, db: f64) -> anyhow::Result<()> {
-        unsafe { self.api.set_gain_element(self.dev, name, db) }
-            .map_err(|e| anyhow::anyhow!("{}: {e}", self.args))
+        if self.named_gain_elements {
+            unsafe { self.api.set_gain_element(self.dev, name, db) }
+                .map_err(|e| anyhow::anyhow!("{}: {e}", self.args))
+        } else {
+            self.set_whole_gain(db)
+        }
     }
 
     fn set_amp_enable(&self, on: bool) -> anyhow::Result<()> {

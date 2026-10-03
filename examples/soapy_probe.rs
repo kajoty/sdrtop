@@ -12,7 +12,7 @@
 //! Run it against the same argument string sdrtop opens with:
 //!
 //! ```text
-//! cargo run --bin soapy_probe -- "driver=hackrf"
+//! cargo run --example soapy_probe -- "driver=hackrf"
 //! ```
 //!
 //! With no argument it enumerates and probes the first device it finds.
@@ -20,7 +20,7 @@
 // The whole API surface is included so the probe asks exactly what the app
 // asks, but it only calls a handful of it. The rest is not dead: it is the same
 // file the app compiles.
-#[path = "../hardware/soapy/api.rs"]
+#[path = "../src/hardware/soapy/api.rs"]
 #[allow(dead_code)]
 mod api;
 
