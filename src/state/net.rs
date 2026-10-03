@@ -1254,6 +1254,26 @@ impl BandOccupancy {
         self.record_column(now);
     }
 
+    /// While the band is not being measured, keep its time axis moving: a
+    /// column of "nobody looked" (`-1`, as an unobserved cell is drawn) when
+    /// one is due, so the columns stay one interval apart and a column counted
+    /// back is that long ago. Nothing before the first measurement, and the
+    /// readings are left as they were, dated by their own `measured`.
+    pub fn mark_unobserved(&mut self, now: std::time::Instant) {
+        let due = self
+            .last_column
+            .is_none_or(|t| now.saturating_duration_since(t) >= COLUMN_INTERVAL);
+        if !due || self.cells.is_empty() {
+            return;
+        }
+        self.last_column = Some(now);
+        self.history.push_back(vec![-1.0; self.cells.len()]);
+        self.columns_taken += 1;
+        while self.history.len() > HISTORY_COLUMNS {
+            self.history.pop_front();
+        }
+    }
+
     /// Push the band as it stands onto the history, if it is time for a column.
     fn record_column(&mut self, now: std::time::Instant) {
         let due = self
@@ -1698,6 +1718,29 @@ mod tests {
             };
         }
         out
+    }
+
+    /// While the band is not being measured, the time axis still moves: a
+    /// column of "nobody looked" every interval, so a column counted back
+    /// is still that many half-seconds ago. Before anything was measured
+    /// there is no axis to keep, and the readings themselves are untouched.
+    #[test]
+    fn time_away_is_marked_as_unobserved_columns() {
+        let t0 = Instant::now();
+        let mut band = BandOccupancy::default();
+        band.mark_unobserved(t0);
+        assert!(band.history.is_empty(), "nothing measured, no axis");
+
+        band.absorb(dwell(&[(10, 0.4, 8_000)]), t0);
+        assert_eq!(band.history.len(), 1);
+        band.mark_unobserved(t0 + Duration::from_millis(200));
+        assert_eq!(band.history.len(), 1, "not due yet");
+        band.mark_unobserved(t0 + Duration::from_millis(500));
+        band.mark_unobserved(t0 + Duration::from_millis(1000));
+        assert_eq!(band.history.len(), 3);
+        assert!(band.history[2].iter().all(|&v| v < 0.0), "nobody looked");
+        assert_eq!(band.cells[10].duty, 0.4);
+        assert_eq!(band.cells[10].measured, Some(t0));
     }
 
     /// **This is what makes a survey a survey.** Each dwell sees one slice; the

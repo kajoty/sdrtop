@@ -31,6 +31,11 @@ use crate::state::LockTarget;
 /// the advertising decoder feeds.
 pub const ADVERTISING_VIEWS: &[&str] = &["net_ble", "net_census"];
 
+/// The view the band is measured for: the survey's occupancy and
+/// coexistence panels are the only ones that show it, so elsewhere its cost
+/// would buy nothing on screen.
+pub const SURVEY_VIEW: &str = "net_survey";
+
 /// The views the classic receiver runs for: the Classic, Piconet and Bench
 /// views read the same receiver, so they watch the same channels,
 /// step the radio by the same block, and say the same thing in the menu.

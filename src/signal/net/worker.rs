@@ -72,10 +72,6 @@ use crate::state::{BlePacket, BtHop, SdrMetrics};
 use super::lock::CLASSIC_VIEWS;
 use super::scan::Scan;
 
-/// The survey's preset, where the classic receiver runs on as many channels
-/// as the measured load leaves room for ([`SURVEY_LOAD_HIGH`]).
-const NET_SURVEY_PRESET: &str = "net_survey";
-
 /// The survey watches one classic channel fewer once its measured load
 /// passes this, and one more once it falls under [`SURVEY_LOAD_LOW`], up to
 /// the Classic view's own cap. The survey is there to measure the band: a
@@ -637,7 +633,7 @@ impl NetWorker {
                     m.ui.is_net_section(),
                     span.min(rate_hz),
                     CLASSIC_VIEWS.contains(&m.ui.active_preset.as_str()),
-                    m.ui.active_preset == NET_SURVEY_PRESET,
+                    m.ui.active_preset == super::lock::SURVEY_VIEW,
                     m.net.ble_phy,
                     m.net.mode == crate::state::NetMode::Lock,
                     m.net.ble_connections.iter().any(|f| {
@@ -645,24 +641,6 @@ impl NetWorker {
                     }),
                 )
             };
-
-            // Retuning invalidates every cell mapping, so the scan is rebuilt
-            // and whatever it had accumulated goes with it: half a dwell at one
-            // frequency and half at another is a measurement of neither.
-            if !scan
-                .as_ref()
-                .is_some_and(|s| s.matches(centre_hz, rate_hz, span_hz))
-            {
-                scan = Some(Scan::new(centre_hz, rate_hz, span_hz));
-            }
-            if let Some(scan) = scan.as_mut() {
-                scan.push(&bytes, self.geometry);
-                if scan.observed_s() >= DWELL_S {
-                    let band = scan.take();
-                    let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    m.net.band.absorb(band, now);
-                }
-            }
 
             // Decoded once, by the first receiver that needs it, and shared by
             // the BLE receiver and every classic channel: each used to turn the
@@ -748,8 +726,38 @@ impl NetWorker {
             // Decoded once, before either decoder runs, so both read it at once.
             let classic_here = still_open && (is_net_bt || is_survey);
             let follow_here = still_open && following;
-            if ble_on.is_some() || classic_here || follow_here {
+            // The band is measured on the survey, the one view that shows
+            // it; elsewhere its cost would buy nothing on screen, and its
+            // time axis is kept moving with "nobody looked" instead.
+            let scan_here = still_open && is_survey;
+            if ble_on.is_some() || classic_here || follow_here || scan_here {
                 decoded_block(&mut iq, &bytes, self.geometry);
+            }
+            if scan_here {
+                // Retuning invalidates every cell mapping, so the scan is
+                // rebuilt and whatever it had accumulated goes with it: half a
+                // dwell at one frequency and half at another is a measurement
+                // of neither.
+                if !scan
+                    .as_ref()
+                    .is_some_and(|s| s.matches(centre_hz, rate_hz, span_hz))
+                {
+                    scan = Some(Scan::new(centre_hz, rate_hz, span_hz));
+                }
+                if let (Some(scan), Some(block)) = (scan.as_mut(), iq.as_deref()) {
+                    scan.push_iq(block);
+                    if scan.observed_s() >= DWELL_S {
+                        let band = scan.take();
+                        let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        m.net.band.absorb(band, now);
+                    }
+                }
+            } else {
+                scan = None;
+                if still_open {
+                    let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    m.net.band.mark_unobserved(now);
+                }
             }
             let block: &[num_complex::Complex<f32>] = iq.as_deref().unwrap_or(&[]);
             let mut ble_packets: Option<Vec<crate::signal::ble::pdu::Packet>> = None;
@@ -1414,7 +1422,7 @@ mod tests {
     fn the_survey_runs_no_classic_channel_until_its_load_leaves_room() {
         let mut m = SdrMetrics::fixture().streaming();
         m.ui.section = crate::signal::net::SECTION.to_string();
-        m.ui.active_preset = NET_SURVEY_PRESET.to_string();
+        m.ui.active_preset = super::super::lock::SURVEY_VIEW.to_string();
         m.radio.frequency = 2_441_000_000;
         m.radio.config_sample_rate = 8e6;
         m.radio.bb_filter_hz = 0;
@@ -1636,6 +1644,8 @@ mod tests {
         let mut rng = Rng::new(0xB0_1234);
         let mut m = SdrMetrics::fixture().streaming();
         m.ui.section = crate::signal::net::SECTION.to_string();
+        // The band is measured on the survey, the view that shows it.
+        m.ui.active_preset = super::super::lock::SURVEY_VIEW.to_string();
         m.radio.frequency = CENTRE;
         m.radio.config_sample_rate = RATE;
         m.radio.bb_filter_hz = 18_000_000;
@@ -2224,6 +2234,48 @@ mod tests {
                 c.t_ifs()
             );
         }
+    }
+
+    /// **The band is measured where it is shown.** On the survey a dwell of
+    /// noise fills the band; on the Advertising view the same samples leave
+    /// it unmeasured, and the receiver it was costing time runs alone.
+    #[test]
+    fn the_band_is_measured_on_the_survey_only() {
+        use crate::signal::dsp::testkit::Rng;
+        let block: Vec<u8> = Rng::new(7)
+            .noise(131_072, 0.02)
+            .iter()
+            .flat_map(|z| {
+                let q = |v: f32| (v * 128.0).clamp(-127.0, 127.0) as i8 as u8;
+                [q(z.re), q(z.im)]
+            })
+            .collect();
+        let run = |section: &str, preset: &str| {
+            let mut m = SdrMetrics::fixture().streaming();
+            m.ui.section = section.to_string();
+            m.ui.active_preset = preset.to_string();
+            m.radio.frequency = 2_426_000_000;
+            m.radio.config_sample_rate = 20e6;
+            m.radio.bb_filter_hz = 0;
+            let state = Arc::new(Mutex::new(m));
+            let (tx, rx) = crossbeam_channel::unbounded();
+            // A dwell is 50 ms of windows, a block 6.5 ms: a dozen is enough.
+            for seq in 1..=12 {
+                tx.send(stamped(&state, seq, false, block.clone())).unwrap();
+            }
+            drop(tx);
+            NetWorker::new(rx, Arc::clone(&state), eight_bit(), SAFE_BT_CHANNELS).run();
+            let m = state.lock().unwrap().clone();
+            m
+        };
+        let survey = run("net", super::super::lock::SURVEY_VIEW);
+        assert!(
+            !survey.net.band.cells.is_empty(),
+            "the survey measures the band"
+        );
+        let ble = run("le", "net_ble");
+        assert!(ble.net.band.cells.is_empty(), "LE 2 does not");
+        assert_eq!(ble.net.ble_channel, Some(38), "and its receiver still runs");
     }
 
     /// **A connection heard set up is followed.** Its CONNECT_IND on
@@ -2947,7 +2999,7 @@ mod tests {
 
         let mut m = SdrMetrics::fixture().streaming();
         m.ui.section = crate::signal::net::SECTION.to_string();
-        m.ui.active_preset = NET_SURVEY_PRESET.to_string();
+        m.ui.active_preset = super::super::lock::SURVEY_VIEW.to_string();
         m.radio.frequency = channel_hz;
         m.radio.config_sample_rate = RAW_RATE;
         m.radio.bb_filter_hz = 0;

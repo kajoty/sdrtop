@@ -240,7 +240,11 @@ only from the facts drawn below it:
 
 ## Survey · `NET 2`
 
-What is in the band, measured one megahertz at a time.
+What is in the band, measured one megahertz at a time. The band is measured
+only while this view is open: the other views do not show it, and on the
+old laptop sdrtop is tuned on, measuring it anyway cost the Bluetooth
+receivers about a fifth of their time. Time spent elsewhere shows on the
+Coexistence canvas as "nobody looked", so its seconds stay seconds.
 
 ### Occupancy *(focus `j`)*
 
@@ -790,7 +794,7 @@ only then do readings give way from the bottom, and it says that too.
 
 | File | One row per |
 |------|-------------|
-| `net-band-*.csv` | megahertz of the band: duty, its uncertainty, coverage, power |
+| `net-band-*.csv` | megahertz of the band: duty, its uncertainty, coverage, power (from NET 2 only: elsewhere the band is not being measured, and the file says so instead) |
 | `net-census-*.csv` | counted device, in the order the Census shows them |
 | `net-ble-*.csv` | packet, in the list's order, as it was shown (held or filtered) |
 | `net-fer-*.csv` | SNR bin of the frame error curve, for all traffic and each device |
