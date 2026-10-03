@@ -54,6 +54,13 @@ about the device. Lower the LNA or VGA, or move the radio further from the
 transmitter. A BLE remote held next to a HackRF at LNA 32 does exactly
 this, and is very sure of itself about it.
 
+A clip lasts a fraction of a second and you may look a moment later, so
+once the reading falls back below 1 %, a clip that reached 5 % leaves
+`⚠ last clip 3s` in its place: red for six seconds, then grey, then gone
+after half a minute. It is the same line the Command Rail keeps under its
+SAT, drawn by the same code, so the two never disagree about when the
+radio last shouted.
+
 ### Survey or lock (`m`)
 
 The radio can see a slice of the band at a time, not all 83 MHz of it.

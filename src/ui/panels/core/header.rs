@@ -593,17 +593,25 @@ fn net_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
     }
     // A clipping ADC makes every number after it doubtful, so it comes first
     // and is the last to give way: the reading every SAT readout shows, on
-    // its scale, and only from the level that scale calls worth a look.
+    // its scale, and only from the level that scale calls worth a look. Once
+    // the reading falls back, a clip is remembered the way the rail does it.
     let sat = state.signal.adc_saturation_pct;
-    if sat >= crate::state::SAT_WARN_PCT {
-        fields.insert(
-            0,
-            BandField::new(
-                format!("SAT {sat:.1} %"),
-                Style::default().fg(crate::ui::widgets::micro_common::sat_color(sat, theme)),
-                u8::MAX,
-            ),
-        );
+    let clip = if sat >= crate::state::SAT_WARN_PCT {
+        Some(BandField::new(
+            format!("SAT {sat:.1} %"),
+            Style::default().fg(crate::ui::widgets::micro_common::sat_color(sat, theme)),
+            u8::MAX,
+        ))
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        crate::ui::widgets::micro_common::last_clip(state.signal.last_clip_at, now, theme)
+            .map(|span| BandField::spans(vec![span], u8::MAX))
+    };
+    if let Some(clip) = clip {
+        fields.insert(0, clip);
     }
     let section = crate::ui::menu::model::section_title(&state.ui.section);
     compose_net_band(&section, state.net.mode, &fields, theme, inner_width)
@@ -1416,6 +1424,54 @@ mod tests {
         let (_, spans) = net_band_text(&m, 191);
         let sat = spans.iter().find(|s| s.content.contains("SAT")).unwrap();
         assert_eq!(sat.style.fg, Some(theme.status_crit));
+    }
+
+    /// **A clip that has passed is remembered the way the rail remembers it**:
+    /// the same `last clip` line, loud while fresh, then grey, then gone. The
+    /// live reading takes its place while the ADC is still over the line.
+    #[test]
+    fn the_net_band_remembers_a_clip_like_the_rail() {
+        let theme = crate::Theme::sdr();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut m = net_fixture();
+        m.signal.adc_saturation_pct = 0.2;
+
+        m.signal.last_clip_at = Some(now - 2);
+        let (text, spans) = net_band_text(&m, 191);
+        assert!(text.contains("\u{26a0} last clip "), "{text}");
+        let clip = spans
+            .iter()
+            .find(|s| s.content.contains("last clip"))
+            .unwrap();
+        assert_eq!(clip.style.fg, Some(theme.status_crit));
+
+        m.signal.last_clip_at = Some(now - 20);
+        let (_, spans) = net_band_text(&m, 191);
+        let clip = spans
+            .iter()
+            .find(|s| s.content.contains("last clip"))
+            .unwrap();
+        assert_eq!(clip.style.fg, Some(theme.stale));
+
+        m.signal.last_clip_at = Some(now - 120);
+        assert!(!net_band_text(&m, 191).0.contains("clip"));
+
+        // Still over the line: the reading itself, not the memory of it.
+        m.signal.last_clip_at = Some(now);
+        m.signal.adc_saturation_pct = 6.0;
+        let (text, _) = net_band_text(&m, 191);
+        assert!(
+            text.contains("SAT 6.0 %") && !text.contains("last clip"),
+            "{text}"
+        );
+
+        // The memory gives way last too.
+        m.signal.adc_saturation_pct = 0.2;
+        let (text, _) = net_band_text(&m, 30);
+        assert!(text.contains("last clip"), "{text}");
     }
 
     /// Narrow, everything else gives way before it: a clipping ADC makes

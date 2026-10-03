@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 MusiThang <viktor.laszlo92@protonmail.com>
 
-//! The S-meter: an S1..S9+60 bar under the frequency hero, plus the clip
-//! alert-memory line that fades under the SAT metric.
+//! The S-meter: an S1..S9+60 bar under the frequency hero.
 //!
 //! S-units are a radio convention, not a linear dB scale: S1 to S9 is 6 dB per
 //! unit, and everything above S9 is quoted as "S9 + n dB". The bar therefore
@@ -12,32 +11,6 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-
-/// How long a clip is remembered, and the window in which it's still "fresh"
-/// (loud red) before it fades to a dim memory line.
-const CLIP_FRESH_SECS: u64 = 6;
-
-const CLIP_MEMORY_SECS: u64 = 30;
-
-/// Compact relative age for the alert-memory: `"4s"`, `"2m"`, `"1h"`. Pure.
-pub(super) fn fmt_since(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{}h", secs / 3600)
-    }
-}
-
-/// The SAT clip alert-memory state: `Some((age_secs, fresh))` while a clip is
-/// still remembered, `None` once it's older than [`CLIP_MEMORY_SECS`]. A fresh
-/// clip (≤ [`CLIP_FRESH_SECS`]) renders loud; afterwards it fades. Pure over the
-/// clock so it's testable, and it only ever fades - it never flickers.
-pub(super) fn clip_alert(last_clip_at: Option<u64>, now: u64) -> Option<(u64, bool)> {
-    let since = now.saturating_sub(last_clip_at?);
-    (since <= CLIP_MEMORY_SECS).then_some((since, since <= CLIP_FRESH_SECS))
-}
 
 const S9_DBFS: f32 = -52.0;
 
@@ -191,44 +164,9 @@ pub(super) fn s_meter_lines(
     [row0, row1, row2]
 }
 
-pub(super) fn clip_decay_bg(since: u64) -> Option<Color> {
-    if since > CLIP_MEMORY_SECS {
-        return None;
-    }
-    let t = if since <= CLIP_FRESH_SECS {
-        1.0_f64
-    } else {
-        1.0 - (since - CLIP_FRESH_SECS) as f64 / (CLIP_MEMORY_SECS - CLIP_FRESH_SECS) as f64
-    };
-    let r = (45.0 * t) as u8;
-    if r == 0 {
-        None
-    } else {
-        Some(Color::Rgb(r, 0, 0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fmt_since_scales_units() {
-        assert_eq!(fmt_since(4), "4s");
-        assert_eq!(fmt_since(59), "59s");
-        assert_eq!(fmt_since(120), "2m");
-        assert_eq!(fmt_since(7200), "2h");
-    }
-
-    #[test]
-    fn clip_alert_is_fresh_then_fades_then_expires() {
-        assert_eq!(clip_alert(None, 100), None); // never clipped
-        assert_eq!(clip_alert(Some(100), 103), Some((3, true))); // fresh & loud
-        assert_eq!(clip_alert(Some(100), 115), Some((15, false))); // remembered, dim
-        assert_eq!(clip_alert(Some(100), 140), None); // older than memory
-                                                      // Clock skew (clip "in the future") must not panic or misread.
-        assert_eq!(clip_alert(Some(100), 90), Some((0, true)));
-    }
 
     #[test]
     fn power_to_s_frac_s1_is_zero() {
@@ -280,33 +218,5 @@ mod tests {
         assert_eq!(frac_to_s_label(6.0 / 14.0), "S7");
         assert_eq!(frac_to_s_label(8.0 / 14.0), "S9");
         assert_eq!(frac_to_s_label(1.0), "S9+60");
-    }
-
-    #[test]
-    fn clip_decay_bg_fresh_is_max_red() {
-        let bg = clip_decay_bg(0);
-        assert!(bg.is_some());
-        if let Some(Color::Rgb(r, g, b)) = bg {
-            assert!(r > 0, "red component must be positive");
-            assert_eq!((g, b), (0, 0));
-        }
-    }
-
-    #[test]
-    fn clip_decay_bg_at_memory_limit_is_none() {
-        assert_eq!(clip_decay_bg(CLIP_MEMORY_SECS), None);
-    }
-
-    #[test]
-    fn clip_decay_bg_fades_monotonically() {
-        let mut prev_r = u8::MAX;
-        for t in 0..=CLIP_MEMORY_SECS {
-            let r = match clip_decay_bg(t) {
-                Some(Color::Rgb(r, _, _)) => r,
-                _ => 0,
-            };
-            assert!(r <= prev_r, "should fade at t={t}: {r} > {prev_r}");
-            prev_r = r;
-        }
     }
 }

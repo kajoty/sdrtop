@@ -13,9 +13,7 @@ use ratatui::{
 
 use crate::state::SdrMetrics;
 use crate::ui::widgets::charts::{ema_smooth, mini_braille_line};
-use crate::ui::widgets::micro_common::{sat_color, snr_color};
-
-use super::smeter::{clip_alert, clip_decay_bg, fmt_since};
+use crate::ui::widgets::micro_common::{last_clip, sat_color, snr_color};
 
 /// Short-term trend of a metric history: mean of the recent half minus the older
 /// half (same shape as `SignalState::snr_delta`). `None` until ≥4 samples.
@@ -245,21 +243,8 @@ pub(super) fn lines(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    out.push(match clip_alert(sig.last_clip_at, now) {
-        Some((since, fresh)) => {
-            let mut style = Style::default().fg(if fresh {
-                theme.status_crit
-            } else {
-                theme.stale
-            });
-            if let Some(bg) = clip_decay_bg(since) {
-                style = style.bg(bg);
-            }
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(format!("\u{26a0} last clip {}", fmt_since(since)), style),
-            ])
-        }
+    out.push(match last_clip(sig.last_clip_at, now, theme) {
+        Some(clip) => Line::from(vec![Span::raw(" "), clip]),
         None => Line::raw(""),
     });
     out
