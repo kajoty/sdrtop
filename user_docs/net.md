@@ -43,6 +43,17 @@ view itself uses, so it never promises more than the screen delivers.
 A few things are the same on every NET panel, and they are the difference
 between a number and a claim you can trust.
 
+### SAT: when the radio is shouting
+
+When `SAT 4.4 %` appears first on the header's band line, that share of the
+samples is pinned at the converter's limit: the same reading and colours as
+every SAT in sdrtop, amber from 1 %, red from 5 %, and absent below 1 %.
+A clipped packet is a distorted one. It fails its CRC while its SNR still
+looks fine, so while SAT shows, the failures say more about the radio than
+about the device. Lower the LNA or VGA, or move the radio further from the
+transmitter. A BLE remote held next to a HackRF at LNA 32 does exactly
+this, and is very sure of itself about it.
+
 ### Survey or lock (`m`)
 
 The radio can see a slice of the band at a time, not all 83 MHz of it.

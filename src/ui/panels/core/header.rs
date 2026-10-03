@@ -591,6 +591,20 @@ fn net_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
         };
         fields.push(BandField::new(format!("gaps {}", health.gaps), style, 4));
     }
+    // A clipping ADC makes every number after it doubtful, so it comes first
+    // and is the last to give way: the reading every SAT readout shows, on
+    // its scale, and only from the level that scale calls worth a look.
+    let sat = state.signal.adc_saturation_pct;
+    if sat >= crate::state::SAT_WARN_PCT {
+        fields.insert(
+            0,
+            BandField::new(
+                format!("SAT {sat:.1} %"),
+                Style::default().fg(crate::ui::widgets::micro_common::sat_color(sat, theme)),
+                u8::MAX,
+            ),
+        );
+    }
     let section = crate::ui::menu::model::section_title(&state.ui.section);
     compose_net_band(&section, state.net.mode, &fields, theme, inner_width)
 }
@@ -1373,6 +1387,46 @@ mod tests {
         m.radio.frequency = 2_437_000_000;
         m.radio.config_sample_rate = 20_000_000.0;
         m
+    }
+
+    fn net_band_text(m: &SdrMetrics, width: u16) -> (String, Vec<Span<'static>>) {
+        let theme = crate::Theme::sdr();
+        let line = net_band_line(m, &theme, width);
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        (text, line.spans)
+    }
+
+    /// **The ADC's saturation, when it matters, first on the band line**: the
+    /// same reading and scale every other SAT readout uses, amber from 1 %,
+    /// red from 5 %, and nothing below 1 %, where there is nothing to say.
+    #[test]
+    fn the_net_band_says_when_the_adc_clips() {
+        let theme = crate::Theme::sdr();
+        let mut m = net_fixture();
+        m.signal.adc_saturation_pct = 0.5;
+        assert!(!net_band_text(&m, 191).0.contains("SAT"));
+
+        m.signal.adc_saturation_pct = 4.4;
+        let (text, spans) = net_band_text(&m, 191);
+        assert!(text.contains(" · SAT 4.4 % · "), "{text}");
+        let sat = spans.iter().find(|s| s.content.contains("SAT")).unwrap();
+        assert_eq!(sat.style.fg, Some(theme.status_warn));
+
+        m.signal.adc_saturation_pct = 6.0;
+        let (_, spans) = net_band_text(&m, 191);
+        let sat = spans.iter().find(|s| s.content.contains("SAT")).unwrap();
+        assert_eq!(sat.style.fg, Some(theme.status_crit));
+    }
+
+    /// Narrow, everything else gives way before it: a clipping ADC makes
+    /// every number after it doubtful.
+    #[test]
+    fn saturation_is_the_last_field_to_give_way() {
+        let mut m = net_fixture();
+        m.signal.adc_saturation_pct = 4.4;
+        let (text, _) = net_band_text(&m, 30);
+        assert!(text.contains("SAT 4.4 %"), "{text}");
+        assert!(!text.contains("MHz"), "{text}");
     }
 
     /// The band line names the section it is in: the band's own, or either
