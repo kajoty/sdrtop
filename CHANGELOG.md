@@ -16,6 +16,83 @@ checkpoint instead of by version.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-03
+
+**Following a BLE connection, and recording the radio.**
+
+sdrtop now follows a BLE connection from the CONNECT_IND that sets it up,
+event by event, without retuning, and records the raw IQ stream as SigMF
+with every lost sample in its place. Classic Bluetooth gets a view of one
+piconet packet by packet, and a bench of its own.
+
+### Added
+
+- **LE 3, Connection.** A CONNECT_IND heard on an advertising channel is
+  followed: its schedule and hops (CSA #1 or #2), every event in view
+  accounted for as followed, missed or lost to the feed, its control PDUs
+  until encryption starts, and its T_IFS and clock measured against this
+  radio. `Enter` on a CONNECT_IND in the Advertising list opens it.
+- **`Ctrl+R` records the IQ stream** as a SigMF pair (ci8, cu8, ci16_le)
+  from any layout. Every gap, retune and gain change is annotated, and a
+  recording that ran short of real time says so. Limits are set in a new
+  `[record]` config section; see `user_docs/recording.md`.
+- **A HackRF's own drops are counted.** Samples the radio drops in its own
+  buffer leave no hole in the stream. The count is now read from the radio,
+  shown on the Timing bench and marked in a recording.
+- **Classic 2, Packets, and Classic 3, Bench.** One piconet packet by
+  packet, with who sent each (master or slave), its header, its own
+  modulation and carrier, and its payload's verdict; and its two ends side
+  by side.
+- **`t` narrows the Advertising list** to CONNECT, SCAN or ADV packets.
+- **SAT on the NET band line** when the ADC clips, and the rail's
+  `⚠ last clip` memory after it.
+- Classic UAPs are resolved from DM payloads as well as DH, checked on the
+  air against two devices whose addresses were read off them.
+- Contributing guide, code of conduct, security policy, and issue and pull
+  request templates.
+
+### Changed
+
+- **The menu has three Bluetooth-era sections**: NET (Capability, Survey),
+  LE (Census, Advertising, Connection) and Classic (Piconets, Packets,
+  Bench), each numbered from one. Preset names are unchanged, so a config
+  or user preset that names them still works.
+- The Piconets panel is lighter: the roster and a summary. The detail moved
+  to Packets and Bench.
+- The BLE list keeps the newest 200 of each kind of packet, not 200
+  overall, so a CONNECT_IND outlives the advertising after it.
+- The band is measured on the Survey only. Elsewhere the coexistence
+  history marks those seconds as not looked at.
+
+### Fixed
+
+- **A HackRF lost up to a third of its samples at 20 Msps**, inside the
+  radio, with every stream position downstream still unbroken: the
+  per-block work ran on the driver's own thread. It now runs behind a
+  queue, and a block the queue refuses is a counted drop at a known place.
+  Live: no shortfall in 30 s at 20 Msps.
+- **A connection's hopping algorithm** was read from the CONNECT_IND's
+  ChSel bit alone. It is CSA #2 only when the advertisement it answered set
+  its bit too (Core 5.4 Vol 6 Part B 4.5); a real remote control hopped by
+  #1 and was never heard.
+- Classic headers were read at the first clock that fitted, and about one
+  in five fits two. They are read at the piconet's own clock now, and one
+  that still reads two ways is left unread.
+- A SoapyRemote device was listed but could not be opened. Contributed by
+  @kajoty.
+
+### Performance
+
+On the i3 this is developed on:
+
+| | 0.6.2 | 0.6.3 |
+|---|---|---|
+| HackRF block fold, against a 6.55 ms block | 5.24 ms | 1.64 ms |
+| LE views at 20 Msps, share of real time | 0.91x | 0.72x |
+
+Config: a new `[record]` section (`max_seconds`, `max_gb`). Nothing else
+changes, and a config without it loads as before.
+
 ## [0.6.2] - 2026-09-27
 
 **NET, measured the way the test suites measure.**
@@ -826,7 +903,8 @@ sdrtop stopped being a one-radio program.
   image rejection ratio, wavelength and antenna metrics.
 - Config file with atomic save on quit, and the CLI flags that override it.
 
-[Unreleased]: https://github.com/musithang/sdrtop/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/musithang/sdrtop/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/musithang/sdrtop/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/musithang/sdrtop/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/musithang/sdrtop/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/musithang/sdrtop/compare/v0.5.1...v0.6.0
