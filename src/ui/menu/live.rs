@@ -42,6 +42,10 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
         && match preset {
             "net_ble" | "net_census" => net.ble_channel.is_some(),
             "net_bt" | "net_piconet" | "net_bench" => !net.bt_channels_watched.is_empty(),
+            "net_connection" => net
+                .ble_connections
+                .iter()
+                .any(|f| *f.connection.state() == crate::signal::ble::follow::State::Following),
             _ => m.ui.active_preset == preset,
         };
     let quiet = |text: String| Live {
@@ -69,7 +73,7 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
         "net_survey" => Some(survey(
             m,
             streaming
-                && m.ui.section == crate::signal::net::SECTION
+                && crate::signal::net::is_net(&m.ui.section)
                 && net.mode == crate::state::NetMode::Survey,
         )),
         "net_census" => {
@@ -155,6 +159,31 @@ pub fn line(preset: &str, m: &SdrMetrics, now: Instant) -> Option<Live> {
                     index(&s.slave.deviation)
                 ),
                 net.bt_refused.as_ref(),
+            ))
+        }
+        "net_connection" => {
+            use crate::signal::ble::follow::Account;
+            let Some(f) = crate::ui::panels::net::ble::ble_connection::selected(m) else {
+                return Some(said(
+                    "no connection followed this session".to_string(),
+                    None,
+                ));
+            };
+            let events = f.connection.events();
+            let in_view = events
+                .iter()
+                .filter(|e| e.account != Account::NotInView)
+                .count();
+            let followed = events
+                .iter()
+                .filter(|e| e.account == Account::Followed)
+                .count();
+            Some(said(
+                format!(
+                    "{}: {followed} of {in_view} events in view followed",
+                    net.show_access_address(f.connection.access_address())
+                ),
+                None,
             ))
         }
         "net_piconet" => {
@@ -357,7 +386,7 @@ mod tests {
         assert_eq!(l.text, "2 piconets heard, 1 UAP resolved");
     }
 
-    /// NET 6's line: the piconet it would show and the packets it has, as
+    /// Classic 2's line: the piconet it would show and the packets it has, as
     /// the address mode shows it, or that none is selected.
     #[test]
     fn the_piconet_view_has_a_live_line() {
@@ -387,7 +416,7 @@ mod tests {
         assert!(l.text.ends_with("; not listening now"), "{}", l.text);
     }
 
-    /// NET 7's line: the piconet it would show and each end's index, as the
+    /// Classic 3's line: the piconet it would show and each end's index, as the
     /// address mode shows it; a dash for an end not read yet.
     #[test]
     fn the_bench_view_has_a_live_line() {
@@ -410,6 +439,44 @@ mod tests {
             .unwrap()
             .text
             .ends_with("; not listening now"));
+    }
+
+    /// LE 3's line: the connection it would show and how many of its
+    /// events in view were followed; running while any connection is.
+    #[test]
+    fn the_connection_view_has_a_live_line() {
+        let mut m = at("net_connection", true);
+        let now = Instant::now();
+        let l = line("net_connection", &m, now).unwrap();
+        assert_eq!(
+            l.text,
+            "no connection followed this session; not listening now"
+        );
+        let c = crate::signal::ble::connect::ConnectIndData {
+            init_a: [0; 6],
+            adv_a: [0; 6],
+            access_address: 0x5065_4b6a,
+            crc_init: 0x3a_5b7c,
+            win_size: 1,
+            win_offset: 0,
+            interval: 6,
+            latency: 0,
+            timeout: 100,
+            channel_map: (1u64 << 37) - 1,
+            hop_increment: 7,
+            sca: 0,
+        };
+        m.net
+            .follow(&c, (Some(false), false, false), 0.0, 20e6, now);
+        m.net.ble_connections[0]
+            .connection
+            .account(true, false, Vec::new());
+        m.net.ble_connections[0]
+            .connection
+            .account(false, false, Vec::new());
+        let l = line("net_connection", &m, now).unwrap();
+        assert_eq!(l.text, "0x50654b6a: 0 of 1 events in view followed");
+        assert!(l.running);
     }
 
     #[test]

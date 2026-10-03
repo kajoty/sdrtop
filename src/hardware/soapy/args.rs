@@ -66,10 +66,22 @@ pub fn label(args: &[(String, String)], index: usize) -> String {
 /// So: the driver key, plus the first identifier that is safe to round trip.
 /// `serial` and `device_id` are hex or digits by convention and never contain a
 /// separator; `label` is the last resort and the one that could.
+///
+/// Networked devices also need their address back. A SoapyRemote enumeration
+/// reports `remote = tcp://host:port`, and without it `make` has no server to
+/// connect to: the driver key alone opens nothing. The URL is host-generated
+/// (no free prose) and is what the driver itself would echo back, so it round
+/// trips safely. `remote:driver` rides along for the same reason: it names the
+/// driver on the far end and is part of the same identity.
 pub fn open_markup(args: &[(String, String)], index: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(driver) = get(args, "driver") {
         parts.push(format!("driver={driver}"));
+    }
+    for key in ["remote", "remote:driver"] {
+        if let Some(value) = get(args, key) {
+            parts.push(format!("{key}={value}"));
+        }
     }
     match get(args, "serial")
         .map(|v| ("serial", v))
@@ -248,6 +260,30 @@ mod tests {
         assert_eq!(open_markup(&only_label, 2), "driver=x, label=Thing");
         let nothing = kv(&[("driver", "x")]);
         assert_eq!(open_markup(&nothing, 2), "driver=x, device_id=2");
+    }
+
+    /// A networked device must carry its address back into the open markup, or
+    /// `make` has no server to connect to and the open fails. This is the
+    /// SoapyRemote shape, copied from a real enumeration.
+    #[test]
+    fn the_open_markup_keeps_the_remote_address() {
+        let remote = kv(&[
+            ("driver", "remote"),
+            ("remote", "tcp://192.0.2.10:55132"),
+            ("remote:driver", "hackrf"),
+            ("serial", "0000000000000000abcdef1234567890"),
+            ("label", "HackRF One #0 abcdef1234567890"),
+        ]);
+        let m = open_markup(&remote, 0);
+        assert_eq!(value_of(&m, "driver"), Some("remote"));
+        assert_eq!(value_of(&m, "remote"), Some("tcp://192.0.2.10:55132"));
+        assert_eq!(value_of(&m, "remote:driver"), Some("hackrf"));
+        assert_eq!(
+            value_of(&m, "serial"),
+            Some("0000000000000000abcdef1234567890")
+        );
+        // And the filter still matches the shape a user would type.
+        assert!(matches_filter(&m, "driver=remote"));
     }
 
     /// Reading one value back out of the markup, which is how the driver key and

@@ -454,6 +454,13 @@ impl ShapeMatcher {
         }
     }
 
+    /// Forget every value seen: the next is read as the first, with the
+    /// warm-up again.
+    pub fn reset(&mut self) {
+        self.tail = vec![0.0; self.n];
+        self.seen = 0;
+    }
+
     /// One reading per value: `None` until a full window has been seen,
     /// then the correlation of the window ending at that value. A window
     /// with no spread at all (a constant) has no shape to compare and reads
@@ -544,6 +551,23 @@ impl ShapeMatcher {
 
 #[cfg(test)]
 mod tests {
+
+    /// After `reset`, a matcher reads a block exactly as a new one does:
+    /// the warm-up again, nothing of what came before.
+    #[test]
+    fn a_reset_matcher_reads_as_a_new_one() {
+        let shape: Vec<f32> = (0..32).map(|k| ((k * 7) % 11) as f32 - 5.0).collect();
+        let signal: Vec<f32> = (0..300).map(|k| ((k * 13) % 17) as f32 - 8.0).collect();
+        let mut used = ShapeMatcher::new(&shape);
+        let mut out = Vec::new();
+        used.process_block(&signal, &mut out);
+        used.reset();
+        let mut again = Vec::new();
+        used.process_block(&signal[..100], &mut again);
+        let mut fresh = Vec::new();
+        ShapeMatcher::new(&shape).process_block(&signal[..100], &mut fresh);
+        assert_eq!(again, fresh);
+    }
     use super::*;
     use crate::signal::dsp::testkit::{at_snr, Rng};
 

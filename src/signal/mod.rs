@@ -8,6 +8,7 @@ pub mod demod;
 // rule that a value is printed to no more precision than its uncertainty
 // supports is a numerical decision the UI has to be able to ask about.
 pub mod dsp;
+pub mod errors;
 pub mod fft;
 pub mod iq;
 pub mod net;

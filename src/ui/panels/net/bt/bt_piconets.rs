@@ -437,7 +437,7 @@ fn clock_row(p: &Piconet, state: &SdrMetrics) -> String {
 
 /// A piconet's sections within `budget` rows: PICONET whole or nothing
 /// (the table's rows come first, as the census's do), then HEADERS while
-/// it fits whole, a line naming it where it does not, and the way to NET 6
+/// it fits whole, a line naming it where it does not, and the way to Classic 2
 /// last.
 fn piconet_within(
     p: &Piconet,
@@ -458,14 +458,14 @@ fn piconet_within(
         ))
     };
     let headers = sections::header_lines(p, state, iw, theme);
-    // Whole, leaving a row for the way to NET 6.
+    // Whole, leaving a row for the way to Classic 2.
     if out.len() + headers.len() < budget {
         out.extend(headers);
     } else if out.len() < budget {
         out.push(note("+ HEADERS on a taller panel"));
     }
     if out.len() < budget {
-        out.push(note("Enter: packet by packet, on NET 6"));
+        out.push(note("Enter: packet by packet, on Classic 2"));
     }
     out
 }
@@ -528,7 +528,7 @@ impl Panel for NetBtPiconetsPanel {
     fn focus_bindings(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("↑↓", "select a piconet"),
-            ("Enter", "packet by packet, on NET 6"),
+            ("Enter", "packet by packet, on Classic 2"),
         ]
     }
 
@@ -906,7 +906,10 @@ mod tests {
         let when = out.iter().find(|l| l.contains("heard")).expect(&text);
         assert!(when.contains("6 hits, first"), "{when}");
         assert!(text.contains("6 of 79: 2-5, 17, 73"), "{text}");
-        assert!(text.contains("Enter: packet by packet, on NET 6"), "{text}");
+        assert!(
+            text.contains("Enter: packet by packet, on Classic 2"),
+            "{text}"
+        );
         for gone in ["MODULATION", "CARRIER", "TIMING"] {
             assert!(!text.contains(gone), "{gone}: {text}");
         }

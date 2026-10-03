@@ -21,10 +21,13 @@ pub mod assigned;
 pub mod channel;
 pub mod coded;
 pub mod connect;
+pub mod data;
 pub mod detect;
 pub mod fer;
+pub mod follow;
 pub mod gfsk;
 pub mod interval;
+pub mod llcp;
 pub mod measure;
 pub mod pdu;
 pub mod receive;
@@ -45,7 +48,7 @@ pub mod sync;
 /// (`h = 2 * deviation / symbol_rate`) held at the same `h = 0.5`, and the
 /// same alternating-preamble rule run for twice as long - not independently
 /// looked up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Phy {
     #[default]
     OneM,

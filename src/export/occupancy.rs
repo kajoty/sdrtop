@@ -35,6 +35,12 @@ pub const HEADER: &str =
 /// The band as CSV rows, or the reason there are none.
 pub fn rows(state: &SdrMetrics) -> Result<Vec<String>, String> {
     let band = &state.net.band;
+    if state.ui.active_preset != crate::signal::net::lock::SURVEY_VIEW {
+        return Err(
+            "the band is measured on NET 2 Survey only; export from there for a current one"
+                .to_string(),
+        );
+    }
     if band.cells.is_empty() {
         return Err("no band measurement yet".to_string());
     }
@@ -99,7 +105,18 @@ mod tests {
             window_s: 6.4e-6,
             ..Default::default()
         };
+        m.ui.active_preset = crate::signal::net::lock::SURVEY_VIEW.to_string();
         m
+    }
+
+    /// The band is measured on the survey alone; exported from another view
+    /// it would be an old reading with nothing saying how old.
+    #[test]
+    fn off_the_survey_the_band_is_not_exported() {
+        let mut m = band(vec![measured(0.25, 8_000); occupancy::CELLS]);
+        m.ui.active_preset = "net_ble".to_string();
+        let why = rows(&m).unwrap_err();
+        assert!(why.contains("NET 2"), "{why}");
     }
 
     fn measured(duty: f64, windows: u64) -> CellReading {

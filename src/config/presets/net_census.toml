@@ -1,4 +1,4 @@
-# NET Census — who is here? Design section 9.3: one screen, one question. The
+# LE Census: who is here? Design section 9.3: one screen, one question. The
 # population of the band, one row per transmitter, ordered by whichever column
 # you pick.
 #
@@ -8,8 +8,8 @@
 # alone as a dial (or its one meter where the dial does not fit), then its
 # detail. Each drawn when it fits.
 
-section = "net"
-slot    = 3
+section = "le"
+slot    = 1
 title   = "Census"
 blurb   = "who is here"
 

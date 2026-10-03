@@ -591,7 +591,30 @@ fn net_band_line(state: &SdrMetrics, theme: &crate::Theme, inner_width: u16) -> 
         };
         fields.push(BandField::new(format!("gaps {}", health.gaps), style, 4));
     }
-    compose_net_band(state.net.mode, &fields, theme, inner_width)
+    // A clipping ADC makes every number after it doubtful, so it comes first
+    // and is the last to give way: the reading every SAT readout shows, on
+    // its scale, and only from the level that scale calls worth a look. Once
+    // the reading falls back, a clip is remembered the way the rail does it.
+    let sat = state.signal.adc_saturation_pct;
+    let clip = if sat >= crate::state::SAT_WARN_PCT {
+        Some(BandField::new(
+            format!("SAT {sat:.1} %"),
+            Style::default().fg(crate::ui::widgets::micro_common::sat_color(sat, theme)),
+            u8::MAX,
+        ))
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        crate::ui::widgets::micro_common::last_clip(state.signal.last_clip_at, now, theme)
+            .map(|span| BandField::spans(vec![span], u8::MAX))
+    };
+    if let Some(clip) = clip {
+        fields.insert(0, clip);
+    }
+    let section = crate::ui::menu::model::section_title(&state.ui.section);
+    compose_net_band(&section, state.net.mode, &fields, theme, inner_width)
 }
 
 /// A decode load as the band shows it: a percentage while it is one a reader
@@ -700,6 +723,7 @@ impl BandField {
 /// channel goes last, and `NET` and the mode never go, because a header that
 /// has stopped saying which mode is running is worse than no header.
 fn compose_net_band(
+    section: &str,
     mode: crate::state::NetMode,
     fields: &[BandField],
     theme: &crate::Theme,
@@ -709,7 +733,8 @@ fn compose_net_band(
 
     const SEP: &str = " \u{b7} ";
     let sep_w = SEP.chars().count();
-    let mut width = 1 + 3 + sep_w + mode.label().len(); // " NET" + sep + mode
+    // " NET" (or the section's title) + sep + mode.
+    let mut width = 1 + section.chars().count() + sep_w + mode.label().len();
 
     let mut by_importance: Vec<usize> = (0..fields.len()).collect();
     by_importance.sort_by_key(|&i| std::cmp::Reverse(fields[i].keep));
@@ -723,7 +748,10 @@ fn compose_net_band(
     }
 
     let mut spans = vec![
-        Span::styled(" NET", Style::default().fg(theme.border_accent)),
+        Span::styled(
+            format!(" {section}"),
+            Style::default().fg(theme.border_accent),
+        ),
         Span::styled(SEP, Style::default().fg(theme.label)),
         Span::styled(
             mode.label().to_string(),
@@ -1369,6 +1397,115 @@ mod tests {
         m
     }
 
+    fn net_band_text(m: &SdrMetrics, width: u16) -> (String, Vec<Span<'static>>) {
+        let theme = crate::Theme::sdr();
+        let line = net_band_line(m, &theme, width);
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        (text, line.spans)
+    }
+
+    /// **The ADC's saturation, when it matters, first on the band line**: the
+    /// same reading and scale every other SAT readout uses, amber from 1 %,
+    /// red from 5 %, and nothing below 1 %, where there is nothing to say.
+    #[test]
+    fn the_net_band_says_when_the_adc_clips() {
+        let theme = crate::Theme::sdr();
+        let mut m = net_fixture();
+        m.signal.adc_saturation_pct = 0.5;
+        assert!(!net_band_text(&m, 191).0.contains("SAT"));
+
+        m.signal.adc_saturation_pct = 4.4;
+        let (text, spans) = net_band_text(&m, 191);
+        assert!(text.contains(" · SAT 4.4 % · "), "{text}");
+        let sat = spans.iter().find(|s| s.content.contains("SAT")).unwrap();
+        assert_eq!(sat.style.fg, Some(theme.status_warn));
+
+        m.signal.adc_saturation_pct = 6.0;
+        let (_, spans) = net_band_text(&m, 191);
+        let sat = spans.iter().find(|s| s.content.contains("SAT")).unwrap();
+        assert_eq!(sat.style.fg, Some(theme.status_crit));
+    }
+
+    /// **A clip that has passed is remembered the way the rail remembers it**:
+    /// the same `last clip` line, loud while fresh, then grey, then gone. The
+    /// live reading takes its place while the ADC is still over the line.
+    #[test]
+    fn the_net_band_remembers_a_clip_like_the_rail() {
+        let theme = crate::Theme::sdr();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut m = net_fixture();
+        m.signal.adc_saturation_pct = 0.2;
+
+        m.signal.last_clip_at = Some(now - 2);
+        let (text, spans) = net_band_text(&m, 191);
+        assert!(text.contains("\u{26a0} last clip "), "{text}");
+        let clip = spans
+            .iter()
+            .find(|s| s.content.contains("last clip"))
+            .unwrap();
+        assert_eq!(clip.style.fg, Some(theme.status_crit));
+
+        m.signal.last_clip_at = Some(now - 20);
+        let (_, spans) = net_band_text(&m, 191);
+        let clip = spans
+            .iter()
+            .find(|s| s.content.contains("last clip"))
+            .unwrap();
+        assert_eq!(clip.style.fg, Some(theme.stale));
+
+        m.signal.last_clip_at = Some(now - 120);
+        assert!(!net_band_text(&m, 191).0.contains("clip"));
+
+        // Still over the line: the reading itself, not the memory of it.
+        m.signal.last_clip_at = Some(now);
+        m.signal.adc_saturation_pct = 6.0;
+        let (text, _) = net_band_text(&m, 191);
+        assert!(
+            text.contains("SAT 6.0 %") && !text.contains("last clip"),
+            "{text}"
+        );
+
+        // The memory gives way last too.
+        m.signal.adc_saturation_pct = 0.2;
+        let (text, _) = net_band_text(&m, 30);
+        assert!(text.contains("last clip"), "{text}");
+    }
+
+    /// Narrow, everything else gives way before it: a clipping ADC makes
+    /// every number after it doubtful.
+    #[test]
+    fn saturation_is_the_last_field_to_give_way() {
+        let mut m = net_fixture();
+        m.signal.adc_saturation_pct = 4.4;
+        let (text, _) = net_band_text(&m, 30);
+        assert!(text.contains("SAT 4.4 %"), "{text}");
+        assert!(!text.contains("MHz"), "{text}");
+    }
+
+    /// The band line names the section it is in: the band's own, or either
+    /// Bluetooth's, as the menu titles them.
+    #[test]
+    fn the_net_band_names_its_section() {
+        let theme = crate::Theme::sdr();
+        for (section, title) in [
+            ("net", " NET ·"),
+            ("le", " LE ·"),
+            ("classic", " Classic ·"),
+        ] {
+            let mut m = net_fixture();
+            m.ui.section = section.to_string();
+            let text: String = net_band_line(&m, &theme, 191)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(text.starts_with(title), "{section}: {text}");
+        }
+    }
+
     /// In NET the strip lights what the radio sees: the window around the
     /// tuning, the watched classic channels in their ink within it, and the
     /// BLE decoder's channel as a dot, the whole strip exactly the frame wide.
@@ -1465,7 +1602,7 @@ mod tests {
             BandField::new("gaps 0".to_string(), v, 4),
         ];
         let render = |w: u16| -> String {
-            compose_net_band(crate::state::NetMode::Lock, &fields, &theme, w)
+            compose_net_band("NET", crate::state::NetMode::Lock, &fields, &theme, w)
                 .spans
                 .iter()
                 .map(|s| s.content.as_ref())

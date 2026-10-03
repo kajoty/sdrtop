@@ -9,13 +9,24 @@
 //! questions live that no single protocol can answer, and [`gate`] is the first
 //! of them: **can this radio do any of this at all?**
 
-/// The menu section id this feature's presets are filed under.
+/// The menu sections this feature's presets are filed under: the band's own,
+/// then each Bluetooth's. One radio requirement admits or refuses all three.
 ///
-/// Named here rather than in the menu because three unrelated places need to
-/// agree on it: the section table, the startup path that drops the section when
-/// the gate refuses, and the header that renders differently inside it. A string
-/// literal in each would be three chances to disagree.
+/// Named here rather than in the menu because several unrelated places need to
+/// agree on them: the section table, the startup path that drops the sections
+/// when the gate refuses, the header that renders differently inside them, and
+/// the footer keys that only mean something there. A string literal in each
+/// would be that many chances to disagree.
+pub const SECTIONS: [&str; 3] = [SECTION, "le", "classic"];
+
+/// The band's own section (Capability, Survey), and the one a test sets when
+/// it only needs "a NET view".
 pub const SECTION: &str = "net";
+
+/// Whether a menu section is one of this feature's.
+pub fn is_net(section: &str) -> bool {
+    SECTIONS.contains(&section)
+}
 
 pub mod band;
 pub mod census;

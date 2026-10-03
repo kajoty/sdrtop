@@ -1,4 +1,4 @@
-# NET Classic — who is here, the old way? B14's own question: classic
+# Classic Piconets: who is here, the old way? B14's own question: classic
 # Bluetooth has no small, fixed set of channels to gate on the way BLE's
 # three advertising ones do, so this preset exists to be the thing a user
 # picks to mean "point the radio at classic Bluetooth" - the same job
@@ -15,9 +15,9 @@
 # LAPs were not yet counted. Each piconet wears one colour in both, and one
 # selection drives both (6.2).
 
-section = "net"
-slot    = 5
-title   = "Classic"
+section = "classic"
+slot    = 1
+title   = "Piconets"
 blurb   = "who is here, the old way"
 
 panels = [

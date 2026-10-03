@@ -423,7 +423,7 @@ impl Panel for NetBtPacketsPanel {
                 .collect::<Vec<_>>()
         };
         let Some(p) = selected(state) else {
-            let lines = note("no piconet selected: select a piconet in NET 5 and press Enter");
+            let lines = note("no piconet selected: select a piconet in Classic 1 and press Enter");
             f.render_widget(Paragraph::new(lines), inner);
             return;
         };
@@ -584,12 +584,12 @@ mod tests {
         let mut m = heard();
         m.net.bt_view.selected = None;
         let out = draw(NetBtPacketsPanel, 80, 10, &m).join("\n");
-        assert!(out.contains("select a piconet in NET 5"), "{out}");
+        assert!(out.contains("select a piconet in Classic 1"), "{out}");
 
         // Selected, but aged out of the roster: the same, not a panic.
         m.net.bt_view.selected = Some(0x12_3456);
         let out = draw(NetBtPacketsPanel, 80, 10, &m).join("\n");
-        assert!(out.contains("select a piconet in NET 5"), "{out}");
+        assert!(out.contains("select a piconet in Classic 1"), "{out}");
     }
 
     /// Every column, newest first, each verdict in its own words, and the

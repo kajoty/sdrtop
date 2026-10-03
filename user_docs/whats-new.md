@@ -32,7 +32,36 @@ in time.
 
 ---
 
-## 📏 Checkpoint 24: Measured like a tester *(you are here)*
+## 🔗 Checkpoint 25: Following the conversation *(you are here)*
+
+**0.6.3.** Until now sdrtop listened to Bluetooth devices introducing
+themselves. This time it listens to two of them talking. A BLE connection
+is set up by one packet, the CONNECT_IND, which says everything a listener
+needs: the connection's address, its timing, and how it will hop. The new
+**Connection** view (`LE 3`) takes that packet and follows the connection
+event by event, on the channels the radio already sees, without retuning.
+
+The first real one it met was a TV box and its remote control, and it
+followed them perfectly through 268 events without hearing a single one.
+The box had set a bit that said "hop the new way", and sdrtop believed it.
+The specification, a page further on, says the remote gets a vote too, and
+the remote had voted no. With both bits read, every event in view was
+there. The whole hunt is in the [connection notes](net.md#connection--le-3-focus-e).
+
+Two more things a bench should have had long ago. **`Ctrl+R` records** the
+raw IQ stream as SigMF, with every gap, retune and gain change written down
+([Recording](recording.md)). And recording showed that a HackRF at 20 Msps
+had been quietly losing up to a third of its samples inside the radio,
+because sdrtop did its sums on the driver's own thread. It doesn't any more.
+
+Classic Bluetooth got a view of one piconet packet by packet and a bench
+with both ends side by side, and the menu grew to three sections to hold it
+all: **NET**, **LE** and **Classic**. The full list is in the
+[changelog](../CHANGELOG.md).
+
+---
+
+## 📏 Checkpoint 24: Measured like a tester
 
 **0.6.2.** 0.6.1 made the NET figures honest. Honest is not the same as
 right, so this time I went and read how the Bluetooth SIG's own test suites

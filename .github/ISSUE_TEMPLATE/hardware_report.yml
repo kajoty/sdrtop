@@ -1,0 +1,68 @@
+name: Hardware report
+description: How sdrtop did on your radio, working or not.
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Every radio that hasn't been on my desk is reasoned, not verified ([Rule One](https://github.com/musithang/sdrtop/blob/main/POLICY.md#one)), and stays grey in [the hardware table](https://github.com/musithang/sdrtop/blob/main/user_docs/hardware.md) until somebody who owns one reports back. That's what this form is for.
+
+        Working or not, it's equally useful: a crash tells me where it broke, and a working report tells me where it held.
+
+  - type: input
+    id: version
+    attributes:
+      label: sdrtop version
+      description: "`sdrtop --version`"
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Radio
+      description: Model, revision, firmware, and how sdrtop reached it (native, a SoapySDR driver, SoapyRemote).
+      placeholder: "Airspy Mini, through SoapySDR (soapysdr-module-airspy)"
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      placeholder: "Raspberry Pi 4, Raspberry Pi OS Bookworm 64-bit"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: How it went
+      options:
+        - It works
+        - It works, with problems
+        - It doesn't work
+    validations:
+      required: true
+
+  - type: textarea
+    id: tested
+    attributes:
+      label: What you tried
+      description: Sample rates, frequencies, layouts, gain stages, whatever you did. A number that looked off is worth mentioning even if everything else was fine.
+    validations:
+      required: true
+
+  - type: textarea
+    id: find
+    attributes:
+      label: SoapySDRUtil output
+      description: For a SoapySDR radio, what `SoapySDRUtil --find` printed. It is the first thing I'll ask for.
+      render: text
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The relevant part of `~/.config/sdrtop/sdrtop.log`.
+      render: text

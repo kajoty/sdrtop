@@ -1,16 +1,16 @@
-# NET Piconet: one piconet, packet by packet. The Classic view says who is
+# Classic Packets: one piconet, packet by packet. The Piconets view says who is
 # here and where they hop; this view takes the piconet selected there (the
 # selection is the section's, `NetState::bt_view`) and lists its packets,
 # newest first, each with who sent it, its header, its own modulation and
 # carrier readings, its place on the piconet's slot grid, and what became
 # of its payload, the whole screen; the two ends' figures are the Bench
-# view's (NET 7). The classic receiver runs here exactly as on the Classic
-# view (`signal::net::lock::CLASSIC_VIEWS`), so the two views read one
+# view's (Classic 3). The classic receiver runs here exactly as on the
+# Piconets view (`signal::net::lock::CLASSIC_VIEWS`), so the two views read one
 # stream of hits.
 
-section = "net"
-slot    = 6
-title   = "Piconet"
+section = "classic"
+slot    = 2
+title   = "Packets"
 blurb   = "one piconet, packet by packet"
 
 panels = [

@@ -31,8 +31,9 @@
 //! `■` BT). Everything unmarked is energy nobody decoded: the ramp does not
 //! imply Wi-Fi, or anything else. A failed-CRC packet is not marked, because it
 //! is not identified. The marks go back as far as the packet and hit lists
-//! hold (`BLE_PACKET_LIMIT`, `BT_HOP_LIMIT`), and the legend counts what is
-//! drawn, so an old stretch without marks reads as "not kept", not "none".
+//! hold every packet (`NetState::ble_complete_since`, `BT_HOP_LIMIT`), and the
+//! legend counts what is drawn, so an old stretch without marks reads as "not
+//! kept", not "none".
 
 use ratatui::{
     layout::Rect,
@@ -112,11 +113,15 @@ fn marks(state: &SdrMetrics, moments: usize, width: usize) -> Vec<(usize, usize,
         hz.and_then(|hz| crate::signal::net::occupancy::cell_of(hz as f64))
             .map(|cell| band_axis::column_of(cell, width))
     };
+    // Behind the moment the list stops being every packet, only its rarer
+    // kinds remain, and marking those would draw a cut stretch as a quiet one.
+    let whole_since = state.net.ble_complete_since();
     let ble = state
         .net
         .ble_packets
         .iter()
         .filter(|p| p.crc_ok)
+        .filter(|p| whole_since.is_none_or(|t| p.seen >= t))
         .filter_map(|p| {
             Some((
                 step(p.seen),
@@ -549,6 +554,43 @@ mod tests {
             drift: None,
             seen,
         }
+    }
+
+    /// **Marks go back only as far as the list is every packet.** The list
+    /// keeps each kind's newest, so behind the oldest advertisement it kept
+    /// only the rarer kinds remain; marking those would draw a stretch the
+    /// advertising was cut from as a quiet one.
+    #[test]
+    fn marks_stop_where_the_list_stops_being_whole() {
+        use crate::signal::ble::pdu::PduType;
+        let now = std::time::Instant::now();
+        let mut m = with(vec![column(0); 10]);
+        m.net.band.last_column = Some(now);
+        let mut connect = packet(37, true, now - std::time::Duration::from_millis(1500));
+        connect.pdu_type = PduType::ConnectInd;
+        m.net.ble_packets.push_front(connect);
+        // More advertising than the list keeps, so that kind is cut.
+        for _ in 0..300 {
+            m.net.ble_packets.push_front(packet(38, true, now));
+        }
+        m.net.trim_ble_packets();
+        let kept = m.net.ble_packets.len() - 1;
+        assert!(kept < 300);
+        let ble = |m: &SdrMetrics| {
+            marks(m, 10, 90)
+                .iter()
+                .filter(|(_, _, p)| matches!(p, Proto::Ble))
+                .count()
+        };
+        assert_eq!(ble(&m), kept, "the advertising, without the CONNECT_IND");
+
+        // Uncut, the same CONNECT_IND is marked.
+        let mut advs = 0;
+        m.net.ble_packets.retain(|p| {
+            advs += (p.pdu_type == PduType::AdvInd) as usize;
+            p.pdu_type == PduType::ConnectInd || advs <= 4
+        });
+        assert_eq!(ble(&m), 5);
     }
 
     /// **Identified traffic is marked where and when it was heard.** A BLE

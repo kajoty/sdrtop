@@ -1,0 +1,19 @@
+# LE Connection: one connection, event by event. Every connection whose
+# CONNECT_IND is heard is followed through the events whose channels the
+# radio's band holds (`signal::ble::follow`), without retuning: at 20 Msps on
+# 2426 MHz that is advertising channel 38 and data channels 7 to 14. This
+# view shows the one selected, or the newest: its parameters, each event as
+# followed, missed, not in view or lost to the feed, and the packets heard,
+# who sent each and what the link layer said.
+
+section = "le"
+slot    = 3
+title   = "Connection"
+blurb   = "one connection, event by event"
+
+panels = [
+    { name = "header",             position = "top", height = 5 },
+    { name = "net_ble_connection", position = "body" },
+    { name = "log",                position = "bottom", height = 5 },
+    { name = "footer",             position = "bottom" },
+]

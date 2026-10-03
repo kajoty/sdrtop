@@ -148,6 +148,10 @@ pub enum Tag {
     /// `[FILTERED]` - a list narrowed to one thing the user picked; the rows
     /// say which, and the tag says the list is not everything.
     Filtered,
+    /// `[CONNECT]` - a list narrowed to one kind of row, named. A tag of its
+    /// own rather than [`Tag::Filtered`], because the two narrow together and
+    /// one tag for both would hide which is on.
+    Kind(&'static str),
     /// `[+N NEW]` - arrivals a paused list is not showing, so its pause says
     /// what it is costing.
     Behind(u64),

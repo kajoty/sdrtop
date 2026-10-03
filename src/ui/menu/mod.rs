@@ -420,33 +420,36 @@ mod tests {
     #[test]
     fn net_views_carry_a_live_line() {
         let menu = model::build(&LayoutConfig::default_config().presets);
-        let net = menu.sections.iter().position(|s| s.id == "net").unwrap();
+        let section = |id: &str| menu.sections.iter().position(|s| s.id == id).unwrap();
         let mut m = SdrMetrics::fixture().streaming();
         m.ui.active_preset = "net_ble".to_string();
         m.net.ble_channel = Some(37);
         m.net.ble_channel_packets = [300, 100, 12];
         m.net.ble_channel_crc_ok = [290, 95, 11];
-        let all = draw_with_metrics(100, 30, &at(net, 3), &m).join("\n");
+        let le = draw_with_metrics(100, 30, &at(section("le"), 1), &m).join("\n");
         assert!(
-            all.contains("\u{25cf} 412 packets this session, 96 % CRC ok"),
-            "{all}"
+            le.contains("\u{25cf} 412 packets this session, 96 % CRC ok"),
+            "{le}"
         );
-        assert!(
-            all.contains("\u{25cb} no piconet heard this session; not listening now"),
-            "{all}"
-        );
-        assert!(all.contains("NET"), "{all}");
-        assert!(all.contains("7 views"), "{all}");
-        // A letter two views' panels share is one key, named once.
-        let heading = all.lines().find(|l| l.contains("7 views")).unwrap();
-        let vs = heading
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| *w == "v")
-            .count();
-        assert_eq!(vs, 1, "{heading}");
+        assert!(le.contains("LE"), "{le}");
+        assert!(le.contains("3 views"), "{le}");
         // The selected view wears the bar, not a triangle.
-        assert!(all.contains("\u{258c} 4  BLE"), "{all}");
-        assert!(!all.contains("\u{25b8}"), "{all}");
+        assert!(le.contains("\u{258c} 2  Advertising"), "{le}");
+        assert!(!le.contains("\u{25b8}"), "{le}");
+        let classic = draw_with_metrics(100, 30, &at(section("classic"), 0), &m).join("\n");
+        assert!(
+            classic.contains("\u{25cb} no piconet heard this session; not listening now"),
+            "{classic}"
+        );
+        assert!(classic.contains("3 views"), "{classic}");
+        // A letter two views' panels share is one key, named once: the
+        // Piconets panel's and the Bench's `c`.
+        let heading = classic.lines().find(|l| l.contains("3 views")).unwrap();
+        let cs = heading
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| *w == "c")
+            .count();
+        assert_eq!(cs, 1, "{heading}");
         let lab = draw(100, 30, &at(1, 0)).join("\n");
         // Only the header's own stopped mark; no view line.
         assert_eq!(lab.matches('\u{25cb}').count(), 1, "{lab}");
@@ -473,17 +476,25 @@ mod tests {
     #[test]
     fn keys_from_a_section_list_its_panels_controls_first() {
         let menu = model::build(&LayoutConfig::default_config().presets);
-        let net = menu.sections.iter().position(|s| s.id == "net").unwrap();
-        let state = MenuState {
-            section: net,
-            entry: 0,
-            pane: MenuPane::Keys,
-            scroll: 0,
+        let keys_of = |id: &str| {
+            let section = menu.sections.iter().position(|s| s.id == id).unwrap();
+            let state = MenuState {
+                section,
+                entry: 0,
+                pane: MenuPane::Keys,
+                scroll: 0,
+            };
+            draw(110, 40, &state).join("\n")
         };
-        let all = draw(110, 40, &state).join("\n");
-        assert!(all.contains("NET: FOCUS KEYS"), "{all}");
+        let le = keys_of("le");
+        assert!(le.contains("LE: FOCUS KEYS"), "{le}");
+        assert!(
+            le.contains("BLE Advertising") && le.contains("select a packet"),
+            "{le}"
+        );
+        let all = keys_of("classic");
+        assert!(all.contains("CLASSIC: FOCUS KEYS"), "{all}");
         for (key, title, what) in [
-            ('v', "BLE Advertising", "select a packet"),
             ('c', "Piconets", "select a piconet"),
             ('b', "Classic Bluetooth Hops", "zoom in time"),
         ] {
@@ -494,13 +505,18 @@ mod tests {
             assert!(row.contains(&format!("  {key}  ")), "{row}");
             assert!(all.contains(what), "{what}:\n{all}");
         }
-        let block = all.find("NET: FOCUS KEYS").unwrap();
+        let block = all.find("CLASSIC: FOCUS KEYS").unwrap();
         let radio = all.find("THE RADIO").unwrap();
         assert!(block < radio, "the section's block comes first");
 
-        let views = draw(110, 30, &at(net, 0)).join("\n");
-        let heading = views.lines().find(|l| l.contains("7 views")).unwrap();
-        for key in ['v', 'c', 'b', 'u'] {
+        let classic = menu
+            .sections
+            .iter()
+            .position(|s| s.id == "classic")
+            .unwrap();
+        let views = draw(110, 30, &at(classic, 0)).join("\n");
+        let heading = views.lines().find(|l| l.contains("3 views")).unwrap();
+        for key in ['v', 'c', 'b'] {
             assert!(heading.contains(&format!(" {key}")), "{key}: {heading}");
         }
     }

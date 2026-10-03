@@ -1,14 +1,14 @@
-# NET Bench: one piconet, each end of it side by side. The piconet is the
-# one selected in the Classic view (the selection is the section's,
-# `NetState::bt_view`), and `7` opens it here as `Enter` and `6` open the
+# Classic Bench: one piconet, each end of it side by side. The piconet is the
+# one selected in the Piconets view (the selection is the section's,
+# `NetState::bt_view`), and `3` opens it here as `Enter` and `2` open the
 # packet list. Three sections, MODULATION, CARRIER and TIMING, each end's
 # figures against the limits they are held to, with room on a screen of
 # their own for the plots: the master in the piconet's colour, the slave in
 # the ordinary ink. The classic receiver runs here exactly as on the
-# Classic view (`signal::net::lock::CLASSIC_VIEWS`).
+# Piconets view (`signal::net::lock::CLASSIC_VIEWS`).
 
-section = "net"
-slot    = 7
+section = "classic"
+slot    = 3
 title   = "Bench"
 blurb   = "each end of one piconet, side by side"
 

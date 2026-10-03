@@ -57,6 +57,9 @@ pub fn note(state: &SdrMetrics) -> Option<String> {
     if view.filter.is_some() {
         parts.push("the list was filtered to one advertiser address".to_string());
     }
+    if let Some(kind) = view.kind {
+        parts.push(format!("the list was narrowed to {} packets", kind.label()));
+    }
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
@@ -424,5 +427,8 @@ mod tests {
             said.contains("filtered to one advertiser address"),
             "{said}"
         );
+        m.net.ble_view.kind = Some(crate::state::PduKind::Connect);
+        let said = note(&m).unwrap();
+        assert!(said.contains("narrowed to CONNECT packets"), "{said}");
     }
 }

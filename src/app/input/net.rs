@@ -297,6 +297,50 @@ pub(super) fn net_bt_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction
     KeyAction::Continue
 }
 
+/// The Connection view: `↑↓` scroll through the events kept, as far as the
+/// oldest one's last row; `End` goes back to the newest; `← →` step to the
+/// previous or next connection followed.
+pub(super) fn net_ble_connection(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
+    let mut m = metrics(ctx.state);
+    let rows = crate::ui::panels::net::ble::ble_connection::selected(&m).map_or(0, |f| {
+        crate::ui::panels::net::ble::ble_connection::row_count(&f.connection)
+    });
+    let order: Vec<u32> = m
+        .net
+        .ble_connections
+        .iter()
+        .map(|f| f.connection.access_address())
+        .collect();
+    let view = &mut m.net.connection_view;
+    match key.code {
+        KeyCode::Up => view.first_visible = view.first_visible.saturating_sub(1),
+        KeyCode::Down => view.first_visible = (view.first_visible + 1).min(rows.saturating_sub(1)),
+        KeyCode::End => view.first_visible = 0,
+        // The previous or next connection in the order they were heard,
+        // newest first, each from its newest event; no wrapping.
+        KeyCode::Left | KeyCode::Right if !order.is_empty() => {
+            let at = view
+                .selected
+                .and_then(|aa| order.iter().position(|&o| o == aa))
+                .unwrap_or(0);
+            let to = if key.code == KeyCode::Right {
+                (at + 1).min(order.len() - 1)
+            } else {
+                at.saturating_sub(1)
+            };
+            *view = crate::state::ConnectionView {
+                selected: Some(order[to]),
+                first_visible: 0,
+            };
+        }
+        _ => {
+            drop(m);
+            return global::handle(key, ctx);
+        }
+    }
+    KeyAction::Continue
+}
+
 /// `← →` in the Piconet view, the list's or the bench's: the previous or
 /// next piconet in the roster's order, the list starting afresh on it. With
 /// none heard, nothing, rather than a cleared selection.
@@ -358,8 +402,9 @@ pub(super) fn net_bt_hops(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
 
 /// The BLE packet list: the arrows move the cursor through the packets in the
 /// order the panel draws them (`NetState::ble_shown`), newest first; `Enter`
-/// narrows the list to the selected packet's address and back; `h` holds the
-/// list and lets it run again; `p` switches the PHY (it shadows the next
+/// opens a CONNECT_IND's connection on LE 3, and on any other packet narrows
+/// the list to its address and back; `t` narrows it to one kind of PDU in
+/// turn and back to all; `h` holds the list and lets it run again; `p` switches the PHY (it shadows the next
 /// layout only while the list is focused, as the census shadows `s` and
 /// `r`). Anything else goes on to the global keys.
 pub(super) fn net_ble_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
@@ -368,7 +413,34 @@ pub(super) fn net_ble_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyActio
     match key.code {
         KeyCode::Up => m.net.ble_view.selection.move_by(&order, -1),
         KeyCode::Down => m.net.ble_view.selection.move_by(&order, 1),
-        KeyCode::Enter => filter_to_selected(&mut m),
+        // On a CONNECT_IND, its connection, on LE 3; on any other packet,
+        // only its advertiser, or all again. A CONNECT_IND carries no
+        // advertiser address first, so it never had a filter to lose.
+        KeyCode::Enter => match selected_connection(&m) {
+            Some(aa) => {
+                let followed = m
+                    .net
+                    .ble_connections
+                    .iter()
+                    .any(|f| f.connection.access_address() == aa);
+                if !followed {
+                    m.push_log(
+                        "BLE list: that connection is not followed (its CONNECT_IND failed its CRC, or it was let go)",
+                    );
+                    return KeyAction::Continue;
+                }
+                m.net.connection_view = crate::state::ConnectionView {
+                    selected: Some(aa),
+                    first_visible: 0,
+                };
+                drop(m);
+                return global::presets::try_set_preset(ctx.engine, ctx.state, "net_connection");
+            }
+            None => filter_to_selected(&mut m),
+        },
+        KeyCode::Char('t') => {
+            m.net.ble_view.kind = crate::state::PduKind::step(m.net.ble_view.kind);
+        }
         // `h` is the spectrum's hold everywhere else; no NET layout shows a
         // spectrum, and holding a list is the same idea.
         KeyCode::Char('h') => {
@@ -386,10 +458,23 @@ pub(super) fn net_ble_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyActio
     KeyAction::Continue
 }
 
+/// The access address of the connection the selected packet set up, when it
+/// is a CONNECT_IND.
+fn selected_connection(m: &SdrMetrics) -> Option<u32> {
+    let selected = m.net.ble_view.selection.selected?;
+    m.net
+        .ble_shown()
+        .into_iter()
+        .find(|p| p.seq == selected)
+        .filter(|p| p.pdu_type == crate::signal::ble::pdu::PduType::ConnectInd)
+        .and_then(|p| crate::signal::ble::connect::decode_octets(&p.payload))
+        .map(|c| c.access_address)
+}
+
 /// `Enter` on the packet list: show only the selected packet's advertiser, or,
 /// when already filtered, everything again. A packet that carries no
-/// advertiser address (a SCAN_REQ, a CONNECT_IND) has nothing to filter by,
-/// and the log says so.
+/// advertiser address (a SCAN_REQ) has nothing to filter by, and the log
+/// says so; a CONNECT_IND opens its connection instead (`net_ble_packets`).
 fn filter_to_selected(m: &mut SdrMetrics) {
     if m.net.ble_view.filter.take().is_some() {
         return;
@@ -785,6 +870,74 @@ mod tests {
         assert_eq!(metrics(&state).net.ble_shown().len(), 4, "live again");
     }
 
+    /// **`t` steps the list through the kinds of PDU and back to all**, and
+    /// the kind and the address narrow it together.
+    #[test]
+    fn t_steps_the_packet_list_through_the_kinds() {
+        use crate::signal::ble::pdu::PduType;
+        use crate::state::PduKind;
+        let mut m = SdrMetrics::fixture().streaming();
+        let types = [
+            PduType::AdvInd,
+            PduType::ScanReq,
+            PduType::ScanRsp,
+            PduType::ConnectInd,
+            PduType::AdvNonconnInd,
+            PduType::AdvDirectInd,
+            PduType::AdvScanInd,
+            PduType::Other(0x7),
+        ];
+        for (i, pdu_type) in types.into_iter().enumerate() {
+            m.net.ble_packets.push_front(crate::state::BlePacket {
+                seq: i as u64 + 1,
+                pdu_type,
+                adv_addr: Some([i as u8 + 1; 6]),
+                ..sample_packet()
+            });
+        }
+        let state = Arc::new(Mutex::new(m));
+        let mut engine = LayoutEngine::new(
+            crate::config::LayoutConfig::default_config(),
+            PanelRegistry::new(),
+        );
+        let mut show_footer = true;
+        let focus_keys = HashMap::new();
+        let mut ctx = InputCtx {
+            state: &state,
+            device: None,
+            engine: &mut engine,
+            show_footer: &mut show_footer,
+            focus_keys: &focus_keys,
+        };
+        let mut press = |code| {
+            net_ble_packets(KeyEvent::new(code, KeyModifiers::NONE), &mut ctx);
+        };
+        let shown = |s: &Arc<Mutex<SdrMetrics>>| -> Vec<u64> {
+            metrics(s).net.ble_shown().iter().map(|p| p.seq).collect()
+        };
+        let kind = |s: &Arc<Mutex<SdrMetrics>>| metrics(s).net.ble_view.kind;
+
+        assert_eq!(shown(&state).len(), 8);
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), Some(PduKind::Connect));
+        assert_eq!(shown(&state), vec![4]);
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), Some(PduKind::Scan));
+        assert_eq!(shown(&state), vec![3, 2]);
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), Some(PduKind::Advertising));
+        assert_eq!(shown(&state), vec![7, 6, 5, 1]);
+
+        // With an address as well: both have to hold.
+        metrics(&state).net.ble_view.filter = Some([1; 6]);
+        assert_eq!(shown(&state), vec![1]);
+        metrics(&state).net.ble_view.filter = None;
+
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), None);
+        assert_eq!(shown(&state).len(), 8);
+    }
+
     /// A packet with no advertiser address has nothing to filter by.
     #[test]
     fn filtering_on_a_packet_without_an_address_says_why() {
@@ -803,6 +956,95 @@ mod tests {
             .log
             .iter()
             .any(|l| l.text.contains("no advertiser address")));
+    }
+
+    /// A CONNECT_IND's payload: InitA, AdvA, then LLData with `aa`.
+    fn connect_payload(aa: u32) -> Vec<u8> {
+        let mut p = vec![
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+        ];
+        p.extend(aa.to_le_bytes());
+        p.extend([
+            0x7c, 0x5b, 0x3a, 1, 0, 0, 6, 0, 0, 0, 100, 0, 0xff, 0xff, 0xff, 0xff, 0x1f, 7,
+        ]);
+        p
+    }
+
+    /// A state with two connections followed, newest first, and the
+    /// CONNECT_IND of `aa` selected in the BLE list.
+    fn with_connections(state: &Arc<Mutex<SdrMetrics>>, selected_aa: u32) {
+        let mut m = metrics(state);
+        let now = Instant::now();
+        for aa in [0x1111_1111u32, 0x2222_2222] {
+            let c = crate::signal::ble::connect::decode_octets(&connect_payload(aa)).unwrap();
+            m.net
+                .follow(&c, (Some(false), false, false), 0.0, 20e6, now);
+        }
+        m.net.ble_packets.push_front(crate::state::BlePacket {
+            seq: 1,
+            pdu_type: crate::signal::ble::pdu::PduType::ConnectInd,
+            length: 34,
+            adv_addr: None,
+            payload: connect_payload(selected_aa),
+            ..sample_packet()
+        });
+        m.net.ble_heard = 1;
+        m.net.ble_view.selection.selected = Some(1);
+    }
+
+    /// `Enter` on a followed CONNECT_IND opens LE 3 on its connection.
+    #[test]
+    fn enter_on_a_connect_ind_opens_its_connection() {
+        let (mut engine, keys, state) = focused_on("net_ble", "net_ble_packets");
+        with_connections(&state, 0x1111_1111);
+        key(&mut engine, &keys, &state, KeyCode::Enter);
+        assert_eq!(engine.active_preset(), "net_connection");
+        let m = metrics(&state);
+        assert_eq!(m.net.connection_view.selected, Some(0x1111_1111));
+        assert_eq!(m.net.ble_view.filter, None, "not a filter");
+    }
+
+    /// A CONNECT_IND whose connection is not followed (its CRC failed, or
+    /// it was let go) says so and stays.
+    #[test]
+    fn enter_on_an_unfollowed_connect_ind_says_so() {
+        let (mut engine, keys, state) = focused_on("net_ble", "net_ble_packets");
+        with_connections(&state, 0x3333_3333);
+        key(&mut engine, &keys, &state, KeyCode::Enter);
+        assert_eq!(engine.active_preset(), "net_ble");
+        assert!(metrics(&state)
+            .ui
+            .log
+            .iter()
+            .any(|l| l.text.contains("not followed")));
+    }
+
+    /// `← →` on LE 3 step through the connections followed, newest first,
+    /// each from its newest event.
+    #[test]
+    fn the_arrows_step_between_connections() {
+        let (mut engine, keys, state) = focused_on("net_connection", "net_ble_connection");
+        with_connections(&state, 0x1111_1111);
+        metrics(&state).net.connection_view.first_visible = 3;
+        key(&mut engine, &keys, &state, KeyCode::Right);
+        let view = metrics(&state).net.connection_view;
+        assert_eq!(
+            view.selected,
+            Some(0x1111_1111),
+            "from the newest to the next"
+        );
+        assert_eq!(view.first_visible, 0);
+        key(&mut engine, &keys, &state, KeyCode::Right);
+        assert_eq!(
+            metrics(&state).net.connection_view.selected,
+            Some(0x1111_1111),
+            "the last stays"
+        );
+        key(&mut engine, &keys, &state, KeyCode::Left);
+        assert_eq!(
+            metrics(&state).net.connection_view.selected,
+            Some(0x2222_2222)
+        );
     }
 
     fn sample_packet() -> crate::state::BlePacket {
@@ -920,6 +1162,51 @@ mod tests {
         );
     }
 
+    /// The Connection view scrolls through the rows its events make, no
+    /// further than the last, and `End` goes back to the newest.
+    #[test]
+    fn the_connection_view_scrolls_its_events() {
+        let (mut engine, keys, state) = focused_on("net_connection", "net_ble_connection");
+        {
+            let mut m = metrics(&state);
+            let c = crate::signal::ble::connect::ConnectIndData {
+                init_a: [0; 6],
+                adv_a: [0; 6],
+                access_address: 0x5065_4b6a,
+                crc_init: 0x3a_5b7c,
+                win_size: 1,
+                win_offset: 0,
+                interval: 6,
+                latency: 0,
+                timeout: 100,
+                channel_map: (1u64 << 37) - 1,
+                hop_increment: 7,
+                sca: 0,
+            };
+            let now = std::time::Instant::now();
+            m.net
+                .follow(&c, (Some(false), false, false), 0.0, 20e6, now);
+            // Missed, so each is a row of its own (a run out of view is one).
+            for _ in 0..3 {
+                m.net.ble_connections[0]
+                    .connection
+                    .account(true, false, Vec::new());
+            }
+        }
+        for _ in 0..5 {
+            key(&mut engine, &keys, &state, KeyCode::Down);
+        }
+        assert_eq!(
+            metrics(&state).net.connection_view.first_visible,
+            2,
+            "three rows"
+        );
+        key(&mut engine, &keys, &state, KeyCode::Up);
+        assert_eq!(metrics(&state).net.connection_view.first_visible, 1);
+        key(&mut engine, &keys, &state, KeyCode::End);
+        assert_eq!(metrics(&state).net.connection_view.first_visible, 0);
+    }
+
     /// **Leaving focus leaves no trace**:
     /// every NET position goes on `Esc`, every mode chosen on purpose stays.
     #[test]
@@ -1018,7 +1305,7 @@ mod tests {
         }
     }
 
-    /// NET 6 with two piconets heard, the first with `n` packets kept, one
+    /// Classic 2 with two piconets heard, the first with `n` packets kept, one
     /// a slot apart on stream 1, and the packet list focused.
     fn piconet_view(n: u32) -> (LayoutEngine, crate::app::FocusKeys, Arc<Mutex<SdrMetrics>>) {
         use crate::signal::bt::piconet::{observe, observe_packet, BtPacket, PayloadVerdict};
@@ -1123,7 +1410,7 @@ mod tests {
         assert!(m.net.lock_at.is_none(), "the radio did not move");
     }
 
-    /// Unfocused, `← →` step a locked radio in NET 6 exactly as in NET 5:
+    /// Unfocused, `← →` step a locked radio in Classic 2 exactly as in Classic 1:
     /// the same classic receiver, the same block.
     #[test]
     fn the_piconet_view_steps_the_radio_as_the_classic_view_does() {

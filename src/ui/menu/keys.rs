@@ -194,32 +194,32 @@ pub const GLOBAL: &[(&str, &[Binding])] = &[
             f(
                 "M",
                 Some('m'),
-                "NET: survey the band, or lock where you are",
-                Footer::Section(&["net"], "mode"),
+                "NET, LE and Classic: survey the band, or lock where you are",
+                Footer::Section(&crate::signal::net::SECTIONS, "mode"),
             ),
             f(
                 "I",
                 Some('i'),
-                "in NET: addresses in full, by vendor and kind, or masked",
-                Footer::Section(&["net"], "addresses"),
+                "in NET, LE and Classic: addresses in full, by vendor and kind, or masked",
+                Footer::Section(&crate::signal::net::SECTIONS, "addresses"),
             ),
             f(
                 "\u{2190} \u{2192}",
                 None,
-                "in NET, locked: the next advertising channel, or the next block of the band",
-                Footer::Section(&["net"], "channel"),
+                "in NET, LE and Classic, locked: the next advertising channel, or the next block of the band",
+                Footer::Section(&crate::signal::net::SECTIONS, "channel"),
             ),
             f(
                 "O",
                 Some('o'),
-                "in NET: write the band, the census, the BLE packets, their error curve and the classic hits to files",
-                Footer::Section(&["net"], "Export"),
+                "in NET, LE and Classic: write the band, the census, the BLE packets, their error curve and the classic hits to files",
+                Footer::Section(&crate::signal::net::SECTIONS, "Export"),
             ),
             f(
                 "Y",
                 Some('y'),
                 "on a standard station: set the frequency reference",
-                Footer::Section(&["lab", "net"], "Reference"),
+                Footer::Section(&["lab", "net", "le", "classic"], "Reference"),
             ),
             f(
                 "W",
@@ -452,6 +452,25 @@ pub fn row_count_for(caps: &DeviceCapabilities, controls: &[Control]) -> usize {
 mod tests {
     use super::*;
     use crate::hardware::native::{hackrf, rtlsdr};
+
+    /// The reference is set on the Lab and in every NET section: the row
+    /// that lists them by hand names each NET section, so a section added to
+    /// the feature cannot lose the key there.
+    #[test]
+    fn the_reference_key_reaches_every_net_section() {
+        let row = GLOBAL
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find_map(|b| match b.footer {
+                Footer::Section(sections, "Reference") => Some(sections),
+                _ => None,
+            })
+            .expect("the Reference row");
+        for s in crate::signal::net::SECTIONS {
+            assert!(row.contains(&s), "{s} is missing from {row:?}");
+        }
+        assert!(row.contains(&"lab"));
+    }
 
     /// Every character key `input/global/mod.rs` claims is documented here.
     ///

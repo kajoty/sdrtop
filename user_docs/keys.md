@@ -78,7 +78,7 @@ each layout, and the footer shows the numbers for the section you are in.
 | `a` | Toggle the front end boost: RF amplifier (HackRF) / tuner AGC (RTL-SDR). Absent on a device that reports neither |
 | `w` | Pause or resume the waterfall |
 | `h` | Freeze the spectrum (hold the current frame behind the live one) |
-| a letter | Focus the panel whose title highlights it. `e` `l` `c` `i` `d` `t` `v` `x` `m` `n` `g` `b`, and in NET `k` `j` `z` `u` `v` `b` `c`, all listed [below](#focus-modes) |
+| a letter | Focus the panel whose title highlights it. `e` `l` `c` `i` `d` `t` `v` `x` `m` `n` `g` `b`, and in NET, LE and Classic `k` `j` `z` `u` `v` `b` `c`, all listed [below](#focus-modes) |
 | `y` | On a standard station (WWV at 2.5, 5, 10, 15 or 20 MHz): measure our own oscillator's error and take it out of every offset in the app. See [what an offset is worth](net.md#what-an-offset-is-worth) |
 | `1` to `9` | The nth layout **of the section you are in** |
 | `p` | Next layout in the same section, wrapping at the end |
@@ -90,16 +90,16 @@ each layout, and the footer shows the numbers for the section you are in.
 `q` **saves**. Quitting is how your frequency, gains, markers and sweep band
 persist to the [config file](config.md); `Ctrl+C` exits without saving anything.
 
-**In the NET section** three letters and the side arrows mean something of
-their own, and do nothing outside it, so they never get in the way of the same
+**In NET, LE and Classic** three letters and the side arrows mean something
+of their own, and do nothing outside them, so they never get in the way of the same
 key elsewhere:
 
-| Key | In NET |
+| Key | In NET, LE and Classic |
 |-----|--------|
 | `m` | Survey the band, or lock where you are ([survey or lock](net.md#survey-or-lock-m)) |
 | `i` | Show addresses in full, by vendor and kind, or masked ([addresses](net.md#addresses-i)) |
 | `o` | Write the band, the census, the BLE packets, their error curve and the classic hits to files ([taking the data away](net.md#taking-the-data-away-o)) |
-| `←` `→` | Locked: the previous or next place this view listens. On BLE and Census, advertising channel 37, 38, 39 and round again; elsewhere one block of the band along ([stepping](net.md#stepping-while-locked)) |
+| `←` `→` | Locked: the previous or next place this view listens. On Advertising and Census, advertising channel 37, 38, 39 and round again; elsewhere one block of the band along ([stepping](net.md#stepping-while-locked)) |
 
 `p` stays inside the section. It used to walk every preset in the app in
 alphabetical order, which meant leaving the benches for a micro view halfway
@@ -181,7 +181,7 @@ Leaving puts the panel back the way it was before the first key: a cursor, a
 selection, a history scrolled back or a time scrubbed away all go, so nothing
 is left hanging on a panel you have stopped steering. What you *chose* stays: a
 filter, a hold, a sort, a zoom. The one selection that survives is the
-Census's, and only long enough to travel: switch to the BLE view and the list
+Census's, and only long enough to travel: switch to the Advertising view and the list
 arrives filtered to the device you had picked. Switching to a layout that does
 not show the focused panel leaves its focus the same way. Anything the focused panel does not claim falls
 straight through to the general keys above, so you can still change gain, retune,
@@ -358,7 +358,8 @@ just as importantly, what it does not.
 ## NET panel focus modes
 
 A focus letter belongs to its section: `v` is Hardware Vitals on the Lab
-timing bench and a packet list in NET (BLE's, and one classic piconet's),
+timing bench and a packet list in LE and Classic (BLE's, and one classic
+piconet's),
 and no layout shows two of them. The
 alphabet has twenty-six letters and sdrtop has rather more panels than that,
 so they share, carefully. What
@@ -369,12 +370,13 @@ each panel's numbers mean is on [the NET page](net.md).
 | `k` | Band Capability | `NET 1` | `K` time the tuning call |
 | `j` | Band Occupancy | `NET 2` | `←→` move the cursor 1 MHz · `B` cursor to the busiest cell · `L` lock the receiver here |
 | `z` | Coexistence | `NET 2` | `↓` back in time: the profile shows that moment · `↑` forward in time · `N` back to now |
-| `u` | Band Census | `NET 3` | `↑↓` select · `S` sort by the next column · `R` reverse · `T` trust as frequency reference, or let it go |
-| `v` | BLE Advertising | `NET 4` | `↑↓` select a packet · `Enter` only this address, or all again · `H` hold the list, or let it run |
-| `b` | Classic Bluetooth Hops | `NET 5` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
-| `c` | Piconets | `NET 5` | `↑↓` select a piconet · `Enter` packet by packet, on NET 6 |
-| `c` | Bench | `NET 7` | `← →` the previous or next piconet |
-| `v` | Packets | `NET 6` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
+| `u` | Band Census | `LE 1` | `↑↓` select · `S` sort by the next column · `R` reverse · `T` trust as frequency reference, or let it go |
+| `e` | Connection | `LE 3` | `↑↓` scroll the events · `End` back to the newest · `← →` the previous or next connection |
+| `v` | BLE Advertising | `LE 2` | `↑↓` select a packet · `Enter` only this address, or all again; on a CONNECT_IND, its connection · `t` only CONNECT, SCAN or ADV, or every kind · `H` hold the list, or let it run |
+| `b` | Classic Bluetooth Hops | `Classic 1` | `↑↓` select a piconet · `+ -` zoom in time · `← →` back and forward in time · `End` back to now |
+| `c` | Piconets | `Classic 1` | `↑↓` select a piconet · `Enter` packet by packet, on Classic 2 |
+| `c` | Bench | `Classic 3` | `← →` the previous or next piconet |
+| `v` | Packets | `Classic 2` | `↑↓` scroll, holding the list at its newest · `H` hold the list, or let it run · `End` back to live · `← →` the previous or next piconet |
 
 `T` in the Census asks how far the trusted device's crystal can be off, in
 ppm, as text you type; `Enter` confirms and `Esc` cancels. This table is

@@ -364,7 +364,11 @@ impl Panel for NetBlePacketsPanel {
     fn focus_bindings(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("↑↓", "select a packet"),
-            ("Enter", "only this address, or all again"),
+            (
+                "Enter",
+                "only this address, or all again; on a CONNECT_IND, its connection",
+            ),
+            ("t", "only CONNECT, SCAN or ADV, or every kind"),
             ("H", "hold the list, or let it run"),
         ]
     }
@@ -380,6 +384,10 @@ impl Panel for NetBlePacketsPanel {
             .shows_offsets()
             .shows_addresses()
             .tag_if(state.net.ble_view.filter.is_some(), Tag::Filtered)
+            .tag_if(
+                state.net.ble_view.kind.is_some(),
+                Tag::Kind(state.net.ble_view.kind.map_or("", |k| k.label())),
+            )
             // Held, the list is paused by the user, which the engine draws
             // cooled and never as stale; and it says what the pause costs.
             .tag_if(state.net.ble_view.held.is_some(), Tag::Paused)
@@ -457,11 +465,24 @@ impl Panel for NetBlePacketsPanel {
         }
 
         if shown.is_empty() {
-            // Only reachable filtered: the address has no packets in the list
-            // any more, which is a fact about the ring, not a quiet device.
+            // Only reachable narrowed: nothing in the list matches any more,
+            // which is a fact about the ring, not a quiet device.
+            let view = &state.net.ble_view;
+            let said = match (view.kind, view.filter.is_some()) {
+                (Some(k), true) => format!(
+                    "no {} packets from this address in the list; Enter or t widens it",
+                    k.label()
+                ),
+                (Some(k), false) => {
+                    format!("no {} packets in the list; t shows every kind", k.label())
+                }
+                (None, _) => {
+                    "no packets from this address in the list; Enter shows all".to_string()
+                }
+            };
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "no packets from this address in the list; Enter shows all".to_string(),
+                said,
                 Style::default().fg(theme.label),
             )));
             f.render_widget(Paragraph::new(lines), inner);
@@ -840,6 +861,34 @@ mod tests {
         m.net.ble_view.filter = Some([0xaa, 0, 0, 0, 0, 9]);
         let gone = draw(NetBlePacketsPanel, 130, 10, &m).join("\n");
         assert!(gone.contains("no packets from this address"), "{gone}");
+    }
+
+    /// **Narrowed to a kind, the frame names the kind**, and a kind with
+    /// nothing in the list says so and how to widen it, rather than looking
+    /// like a quiet room.
+    #[test]
+    fn a_kind_filter_names_itself_and_its_empty_list() {
+        let mut m = feed(4);
+        m.net.ble_view.kind = Some(crate::state::PduKind::Advertising);
+        let out = draw(NetBlePacketsPanel, 130, 10, &m);
+        assert!(out[0].contains("[ADV]"), "{}", out[0]);
+        assert!(out.join("\n").contains("00:00:00:00:04"));
+
+        m.net.ble_view.kind = Some(crate::state::PduKind::Connect);
+        let out = draw(NetBlePacketsPanel, 130, 10, &m);
+        assert!(out[0].contains("[CONNECT]"), "{}", out[0]);
+        let text = out.join("\n");
+        assert!(
+            text.contains("no CONNECT packets in the list; t shows every kind"),
+            "{text}"
+        );
+
+        m.net.ble_view.filter = Some([0xaa, 0, 0, 0, 0, 2]);
+        let text = draw(NetBlePacketsPanel, 130, 10, &m).join("\n");
+        assert!(
+            text.contains("no CONNECT packets from this address"),
+            "{text}"
+        );
     }
 
     /// **Held, the list stops and counts what it is missing**, and says it is

@@ -1,0 +1,53 @@
+name: Feature request
+description: A new measurement, panel, decoder or radio.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. Two things are worth knowing before you write one up: sdrtop decodes signals with its own code, and it doesn't do audio, transmit or mouse input. Both are in [CONTRIBUTING.md](https://github.com/musithang/sdrtop/blob/main/CONTRIBUTING.md).
+
+        If you'd like to build it yourself, describe how here first, and let's agree on it before you start.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's missing
+      description: What do you want to measure, see or do that sdrtop can't today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What it could look like
+      description: How it would work, and where it would sit in the interface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: How you'd build it
+      description: If you plan to build it, how? Name the specification you'd work from. If you think it needs a new dependency, say which one and why.
+
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you build it?
+      options:
+        - "Yes"
+        - "Yes, with some help"
+        - "No, just the idea"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before you send it
+      options:
+        - label: "I've read that sdrtop does its own signal processing and decoding ([rule 1](https://github.com/musithang/sdrtop/blob/main/CONTRIBUTING.md#1-sdrtop-decodes-signals-itself)): no crate does it beyond `rustfft` and `num-complex`."
+          required: true
+        - label: "I've read that audio, transmit and mouse input are out of scope ([rule 6](https://github.com/musithang/sdrtop/blob/main/CONTRIBUTING.md#6-what-sdrtop-does-not-do))."
+          required: true

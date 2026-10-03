@@ -38,6 +38,79 @@ pub fn sat_color(pct: f32, theme: &crate::Theme) -> Color {
         theme.status_crit
     }
 }
+// ── Clip memory ─────────────────────────────────────────────────────────────
+//
+// A clip lasts a poll; a reader may look a few seconds later. So a clip
+// leaves a `last clip` line that is loud while fresh, then fades to the stale
+// ink over a dimming red ground, then goes. It is one line drawn in two
+// places, the Command Rail under SAT and the NET band line, so both read it
+// from here and cannot age a clip differently.
+
+/// How long a clip stays loud before it fades to a memory.
+const CLIP_FRESH_SECS: u64 = 6;
+
+/// How long a clip is remembered at all.
+const CLIP_MEMORY_SECS: u64 = 30;
+
+/// Compact relative age for the alert-memory: `"4s"`, `"2m"`, `"1h"`. Pure.
+fn fmt_since(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+/// The SAT clip alert-memory state: `Some((age_secs, fresh))` while a clip is
+/// still remembered, `None` once it's older than [`CLIP_MEMORY_SECS`]. A fresh
+/// clip (≤ [`CLIP_FRESH_SECS`]) renders loud; afterwards it fades. Pure over the
+/// clock so it's testable, and it only ever fades - it never flickers.
+fn clip_alert(last_clip_at: Option<u64>, now: u64) -> Option<(u64, bool)> {
+    let since = now.saturating_sub(last_clip_at?);
+    (since <= CLIP_MEMORY_SECS).then_some((since, since <= CLIP_FRESH_SECS))
+}
+
+fn clip_decay_bg(since: u64) -> Option<Color> {
+    if since > CLIP_MEMORY_SECS {
+        return None;
+    }
+    let t = if since <= CLIP_FRESH_SECS {
+        1.0_f64
+    } else {
+        1.0 - (since - CLIP_FRESH_SECS) as f64 / (CLIP_MEMORY_SECS - CLIP_FRESH_SECS) as f64
+    };
+    let r = (45.0 * t) as u8;
+    if r == 0 {
+        None
+    } else {
+        Some(Color::Rgb(r, 0, 0))
+    }
+}
+
+/// The `⚠ last clip Xs` line for a clip at `last_clip_at` (unix seconds), or
+/// `None` when nothing is remembered. `now` is passed in so it stays pure.
+pub fn last_clip(
+    last_clip_at: Option<u64>,
+    now: u64,
+    theme: &crate::Theme,
+) -> Option<Span<'static>> {
+    let (since, fresh) = clip_alert(last_clip_at, now)?;
+    let mut style = Style::default().fg(if fresh {
+        theme.status_crit
+    } else {
+        theme.stale
+    });
+    if let Some(bg) = clip_decay_bg(since) {
+        style = style.bg(bg);
+    }
+    Some(Span::styled(
+        format!("\u{26a0} last clip {}", fmt_since(since)),
+        style,
+    ))
+}
+
 pub fn drop_color(drops: u64, theme: &crate::Theme) -> Color {
     if drops == 0 {
         theme.status_ok
@@ -275,5 +348,64 @@ mod tests {
         // Clamps above 1.0.
         let [filled, _] = bar_spans(2.0, 8, t.status_ok, &t);
         assert_eq!(filled.content.chars().count(), 8);
+    }
+
+    #[test]
+    fn fmt_since_scales_units() {
+        assert_eq!(fmt_since(4), "4s");
+        assert_eq!(fmt_since(59), "59s");
+        assert_eq!(fmt_since(120), "2m");
+        assert_eq!(fmt_since(7200), "2h");
+    }
+
+    #[test]
+    fn clip_alert_is_fresh_then_fades_then_expires() {
+        assert_eq!(clip_alert(None, 100), None); // never clipped
+        assert_eq!(clip_alert(Some(100), 103), Some((3, true))); // fresh & loud
+        assert_eq!(clip_alert(Some(100), 115), Some((15, false))); // remembered, dim
+        assert_eq!(clip_alert(Some(100), 140), None); // older than memory
+                                                      // Clock skew (clip "in the future") must not panic or misread.
+        assert_eq!(clip_alert(Some(100), 90), Some((0, true)));
+    }
+
+    #[test]
+    fn clip_decay_bg_fresh_is_max_red() {
+        let bg = clip_decay_bg(0);
+        assert!(bg.is_some());
+        if let Some(Color::Rgb(r, g, b)) = bg {
+            assert!(r > 0, "red component must be positive");
+            assert_eq!((g, b), (0, 0));
+        }
+    }
+
+    #[test]
+    fn clip_decay_bg_at_memory_limit_is_none() {
+        assert_eq!(clip_decay_bg(CLIP_MEMORY_SECS), None);
+    }
+
+    #[test]
+    fn clip_decay_bg_fades_monotonically() {
+        let mut prev_r = u8::MAX;
+        for t in 0..=CLIP_MEMORY_SECS {
+            let r = match clip_decay_bg(t) {
+                Some(Color::Rgb(r, _, _)) => r,
+                _ => 0,
+            };
+            assert!(r <= prev_r, "should fade at t={t}: {r} > {prev_r}");
+            prev_r = r;
+        }
+    }
+
+    #[test]
+    fn last_clip_is_loud_then_grey_then_gone() {
+        let t = crate::Theme::sdr();
+        let fresh = last_clip(Some(100), 103, &t).unwrap();
+        assert_eq!(fresh.content, "\u{26a0} last clip 3s");
+        assert_eq!(fresh.style.fg, Some(t.status_crit));
+        assert!(fresh.style.bg.is_some());
+        let faded = last_clip(Some(100), 115, &t).unwrap();
+        assert_eq!(faded.style.fg, Some(t.stale));
+        assert!(last_clip(Some(100), 140, &t).is_none());
+        assert!(last_clip(None, 140, &t).is_none());
     }
 }

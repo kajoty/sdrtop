@@ -84,6 +84,7 @@ impl App {
         registry.register(ui::NetBtHopsPanel);
         registry.register(ui::NetBtPiconetsPanel);
         registry.register(ui::NetBtPacketsPanel);
+        registry.register(ui::NetBleConnectionPanel);
         registry.register(ui::NetBtBenchPanel);
         registry.register(ui::NetBleDetailPanel);
         registry.register(ui::NetCensusPanel);
@@ -95,7 +96,7 @@ impl App {
         if !net_admitted {
             layout
                 .presets
-                .retain(|_, p| p.section.as_deref() != Some(ui::menu::model::NET));
+                .retain(|_, p| !p.section.as_deref().is_some_and(crate::signal::net::is_net));
         }
         let mut warnings = Self::filter_incompatible_layouts(&mut layout, &registry, acquisition)?;
         // Harvested against the presets that will actually be offered, user
@@ -341,7 +342,7 @@ mod tests {
         let mut net: Vec<_> = cfg
             .presets
             .iter()
-            .filter(|(_, p)| p.section.as_deref() == Some(ui::menu::model::NET))
+            .filter(|(_, p)| p.section.as_deref().is_some_and(crate::signal::net::is_net))
             .collect();
         net.sort_by_key(|(name, _)| name.as_str());
         assert!(net.len() >= 5, "the NET section went missing: {net:?}");
@@ -1239,6 +1240,34 @@ mod tests {
         // Every other section is untouched: the gate removes one thing.
         for other in ["command_rail", "lab", "sweep", "micro"] {
             assert!(refused.menu().section(other).is_some(), "{other} went too");
+        }
+    }
+
+    /// The gate holds for every section the NET feature files presets under,
+    /// the user's own included: one radio requirement for all of them.
+    #[test]
+    fn the_gate_holds_for_every_net_section() {
+        let census = crate::config::LayoutConfig::default_config().presets["net_census"].clone();
+        let mut user = HashMap::new();
+        for (name, section) in [
+            ("my_net", "net"),
+            ("my_le", "le"),
+            ("my_classic", "classic"),
+        ] {
+            let mut p = census.clone();
+            p.section = Some(section.to_string());
+            p.slot = Some(9);
+            user.insert(name.to_string(), p);
+        }
+        let (admitted, _) = App::build_ui("command_rail", &user, None, true);
+        let (refused, _) = App::build_ui("command_rail", &user, None, false);
+        for name in ["my_net", "my_le", "my_classic"] {
+            assert!(admitted.has_preset(name), "{name} kept on an able radio");
+            assert!(!refused.has_preset(name), "{name} dropped on a refused one");
+        }
+        for section in ["net", "le", "classic"] {
+            assert!(admitted.menu().section(section).is_some(), "{section}");
+            assert!(refused.menu().section(section).is_none(), "{section}");
         }
     }
 

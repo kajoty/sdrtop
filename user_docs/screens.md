@@ -39,14 +39,19 @@ marked with a bar at its left edge.
 | **Lab** | The four measurement benches |
 | **Sweep** | The band sweep, full size and compact |
 | **Micro** | The four field views for a small screen |
-| **NET** | The 2.4 GHz band, BLE and classic Bluetooth: seven views, on a radio that reaches the band ([the NET page](net.md)) |
+| **NET** | The 2.4 GHz band itself: what the radio can reach, and what is on the air |
+| **LE** | Bluetooth Low Energy: who is here, what they advertise, and one connection followed |
+| **Classic** | Classic Bluetooth: the piconets, one piconet's packets, and each end of it on a bench |
+
+The last three are one feature, shown only on a radio that reaches the band;
+[the NET page](net.md) is about all of them.
 
 Each layout shows its **number** beside its name, and that number is the key that
 opens it while you are in that section. The number is the same one the footer
 shows you on the deck, because both read the same table. There is no second copy
 to go stale.
 
-Every NET view has a third line: what that screen would tell you now, built by
+Every view in NET, LE and Classic has a third line: what that screen would tell you now, built by
 the view's own rules. `●` means the receiver feeding it is running; `○` means it
 is not, and the line gives the session's figures as the session's.
 

@@ -5,26 +5,31 @@
 **NET** is sdrtop's look at the 2.4 GHz band: who is on the air, what they
 are saying, and how well their transmitters do it. It listens to Bluetooth
 Low Energy advertising and to classic Bluetooth, and it measures the band
-itself. It never transmits, never joins or follows a connection, and never
-plays audio: the guest at the party who says nothing all evening and leaves
-knowing everyone's address.
+itself. It never transmits, never joins a connection (it follows the ones
+it hears being set up, from the sidelines), and never plays audio: the guest
+at the party who says nothing all evening and leaves knowing everyone's
+address.
 
 The section only appears on a radio that reaches the band and can sample fast
 enough for its cheapest mode. On one that cannot, the section is hidden and
 the log says why in one line.
 
-Seven views, one question each. The key is the number to press while the NET
-section is active:
+It lives in three sections of the menu: **NET** for the band itself, **LE**
+for Bluetooth Low Energy and **Classic** for classic Bluetooth. They come and
+go together, because one radio requirement admits all three, and everything
+on this page holds in all of them. Eight views, one question each; the key is
+the number to press while that section is active:
 
 | Key | View | The question it answers |
 |-----|------|--------------------------|
 | `NET 1` | **Capability** | What can this radio reach and receive here? |
 | `NET 2` | **Survey** | What is in this band, and who is spending the airtime? |
-| `NET 3` | **Census** | Who is here? |
-| `NET 4` | **BLE** | What is this device advertising, and is its transmitter any good? |
-| `NET 5` | **Classic** | Who is running a classic Bluetooth piconet near me? |
-| `NET 6` | **Piconet** | What is this one piconet saying, packet by packet? |
-| `NET 7` | **Bench** | How good is each end of it, side by side? |
+| `LE 1` | **Census** | Who is here? |
+| `LE 2` | **Advertising** | What is this device advertising, and is its transmitter any good? |
+| `LE 3` | **Connection** | What are two connected devices saying to each other, event by event? |
+| `Classic 1` | **Piconets** | Who is running a classic Bluetooth piconet near me? |
+| `Classic 2` | **Packets** | What is this one piconet saying, packet by packet? |
+| `Classic 3` | **Bench** | How good is each end of it, side by side? |
 
 The panels with controls announce them with a highlighted letter in the
 title; the full list is in [Keyboard Shortcuts](keys.md#net-panel-focus-modes).
@@ -37,6 +42,24 @@ view itself uses, so it never promises more than the screen delivers.
 
 A few things are the same on every NET panel, and they are the difference
 between a number and a claim you can trust.
+
+### SAT: when the radio is shouting
+
+When `SAT 4.4 %` appears first on the header's band line, that share of the
+samples is pinned at the converter's limit: the same reading and colours as
+every SAT in sdrtop, amber from 1 %, red from 5 %, and absent below 1 %.
+A clipped packet is a distorted one. It fails its CRC while its SNR still
+looks fine, so while SAT shows, the failures say more about the radio than
+about the device. Lower the LNA or VGA, or move the radio further from the
+transmitter. A BLE remote held next to a HackRF at LNA 32 does exactly
+this, and is very sure of itself about it.
+
+A clip lasts a fraction of a second and you may look a moment later, so
+once the reading falls back below 1 %, a clip that reached 5 % leaves
+`⚠ last clip 3s` in its place: red for six seconds, then grey, then gone
+after half a minute. It is the same line the Command Rail keeps under its
+SAT, drawn by the same code, so the two never disagree about when the
+radio last shouted.
 
 ### Survey or lock (`m`)
 
@@ -65,13 +88,13 @@ introduced.)
 Census views a step is the next advertising channel, 37, 38, 39 and round
 again, because that is the only place advertising happens and anywhere in
 between is an expensive way to hear nothing. On the other views it is one
-block of the band along: the span, or on the Classic view the most channels
+block of the band along: the span, or on the classic views the most channels
 it watches at once (`[net].bt_channels`) if that is fewer, wrapping round at
 the ends. Surveying, the survey owns the tuning, and the keys
 just remind you that `m` locks.
 
 A lock carries across views, so a Survey locked on a Wi-Fi channel would
-arrive at the BLE view parked where no advertising ever comes. Opening an
+arrive at the Advertising view parked where no advertising ever comes. Opening an
 advertising view off the three channels therefore moves the radio to the
 nearest of them, once, and the log says so. Tune somewhere else afterwards
 (a data channel, to catch secondary advertising, say) and it stays where you
@@ -203,9 +226,10 @@ signals. Where it matters, the screen says which:
   another once the link has switched to EDR, which most audio links do,
   and the header alone cannot say which. Your headphones' music is the
   second name. The export's `packet_type` column says the same.
-- **"predicted, not followed"** beside a BLE connection's hop sequence means
-  sdrtop worked out which channels the connection will use from its own
-  parameters, and did not follow it there. It never does.
+- **"predicted, not followed"** beside a `CONNECT_IND` in the packet detail
+  means the channels there were worked out from its parameters. The
+  connection itself is followed on [LE 3](#connection--le-3-focus-e), through
+  the events whose channels the radio's window holds, and only those.
 
 ---
 
@@ -225,7 +249,8 @@ only from the facts drawn below it:
   VHT80 misses by a postcode.
 - **Retune** (`K`, focus `k`): times the radio's tuning call across the band.
   A call slower than the shortest BLE connection interval rules following a
-  connection out; a faster one is necessary but not proof, because the call
+  connection *by retuning* out (LE 3 follows without retuning, so it does
+  not wait on this); a faster one is necessary but not proof, because the call
   does not include the synthesiser settling. The panel says which of the two
   it is and never "fast enough", because optimism is not a measurement.
 
@@ -233,7 +258,11 @@ only from the facts drawn below it:
 
 ## Survey · `NET 2`
 
-What is in the band, measured one megahertz at a time.
+What is in the band, measured one megahertz at a time. The band is measured
+only while this view is open: the other views do not show it, and on the
+old laptop sdrtop is tuned on, measuring it anyway cost the Bluetooth
+receivers about a fifth of their time. Time spent elsewhere shows on the
+Coexistence canvas as "nobody looked", so its seconds stay seconds.
 
 ### Occupancy *(focus `j`)*
 
@@ -277,8 +306,8 @@ key says what it is counting from. `■ BT 12` is every channel in view,
 `■ BT 12 on 1 ch` is one channel because the load allows no more, and
 `■ BT: not running, load` means the survey has the machine to itself, which
 is not the same as a quiet band. On an old i3 that is about one channel at
-8 Msps and none at 20; the Classic and Piconet views (`NET 5`, `NET 6`)
-always run their full set.
+8 Msps and none at 20; the classic views (`Classic 1` to `3`) always run
+their full set.
 
 ### Decode health
 
@@ -290,7 +319,7 @@ panels is only as complete as this panel says the feed was.
 
 ---
 
-## Census · `NET 3` *(focus `u`)*
+## Census · `LE 1` *(focus `u`)*
 
 One row per transmitter the BLE decoder has confirmed: an address is only
 counted from a packet whose CRC passed, because a corrupted address would be
@@ -325,7 +354,7 @@ the table.
 
 ---
 
-## BLE · `NET 4`
+## Advertising · `LE 2`
 
 Real BLE advertising packets, CRC-checked, as they arrive. The radio has to be
 on an advertising channel (2402, 2426 or 2480 MHz); the header says which
@@ -342,6 +371,13 @@ terminal.
 - `Enter` narrows the list to the selected packet's address, and back.
   **[FILTERED]** says the list is not everything. Selecting a device in the
   Census and switching here narrows the list to it for you.
+- `t` narrows it to one kind of packet, then the next, then every kind
+  again: **CONNECT** (a connection being set up), **SCAN** (`SCAN_REQ` and
+  `SCAN_RSP`) or **ADV** (the advertising that is nearly everything else).
+  The frame names the kind, and it works together with `Enter`, so one
+  device's CONNECTs are two keys away. The list keeps the newest 200 of
+  each kind, not 200 overall, so a lone CONNECT_IND is still there after
+  the advertising flood that followed it.
 - `H` holds the list still; the title counts what has arrived since.
 
 The list hears **LE 1M**, and the frame says so. There used to be a key for
@@ -350,10 +386,10 @@ access address, so parked on a data channel it hears secondary advertising
 and never a connection, whose packets carry an address of their own. LE 2M
 lives almost entirely in connections, and never on the three advertising
 channels, so the key was either refused or listened very carefully to
-nothing. LE 2M comes back with connection following, which learns a
-connection's address and sees the moment it changes PHY, and then it will
-switch by itself, as it should. The decoder is already written and tested;
-it is only waiting for something worth decoding.
+nothing. LE 2M is back where it lives, in connections: a connection
+followed on [LE 3](#connection--le-3-focus-e) that moves to LE 2M is
+received on it from the moment the two devices agreed, by itself, as it
+should be.
 
 In SURVEY the line under the list gives each advertising channel's packet
 count and CRC pass rate; in LOCK, the one channel's.
@@ -369,7 +405,11 @@ The selected packet, spelled out:
 - **Connection**, for a `CONNECT_IND`: the parameters the two devices agreed
   (interval, latency, timeout, channel map, sleep-clock accuracy) and the
   first channels the connection will hop to, predicted from them with
-  Channel Selection Algorithm #1 or #2, **predicted, not followed**.
+  Channel Selection Algorithm #1 or #2, **predicted, not followed**. Which
+  of the two takes both ChSel bits, this packet's and the advertising
+  packet's it answered; with that one not heard, the detail says it does not
+  know rather than pick. A connection being followed says so here. `Enter`
+  on a `CONNECT_IND` in the list opens the connection itself on LE 3.
 - **Physics**: SNR, carrier offset in kHz and ppm, and the carrier at the
   start and end of the packet: the start is the preamble's mean frequency
   (the test suite's f0), the end the last ten bits before the CRC.
@@ -386,7 +426,7 @@ The selected packet, spelled out:
   them, which means an average under the floor is a real finding and one
   over it is not a promise. Both are read as the test suite defines them,
   from whatever bits the packet carried, the way a classic piconet's are
-  (see [the bench](#bench--net-7-focus-c) below); on LE 1M the packet is taken again
+  (see [the bench](#bench--classic-3-focus-c) below); on LE 1M the packet is taken again
   from the raw samples and timed from the access address, on LE 2M read
   through the receiver's own filter.
 
@@ -412,7 +452,90 @@ is not noise, and this curve is where that shows.
 
 ---
 
-## Classic · `NET 5`
+## Connection · `LE 3` *(focus `e`)*
+
+Every connection whose `CONNECT_IND` sdrtop hears is followed, and this
+view shows one of them: the one opened with `Enter` on its `CONNECT_IND` in
+the Advertising list, or the newest. `← →` step through the others.
+
+**Without retuning.** The radio stays where it is and listens to the band it
+already has: at 20 Msps on 2426 MHz that is advertising channel 38 and data
+channels 7 to 14, which the top line counts (`8 in view (7-14)`). The
+`CONNECT_IND` says when the connection's events will be and which channel
+each will hop to (Core 5.4 Vol 6 Part B 4.5.3, 4.5.8), so sdrtop listens to
+the events that land in its window and writes down the rest as out of view.
+With all 37 channels in use that is about one event in five. It is like
+following a conversation through a wall that lets every fifth sentence
+through: you learn who talks, how fast and in what language, rather less
+of the gossip.
+
+**Catching one.** The `CONNECT_IND` has to be heard, on the advertising
+channel in view; a device that connects picks whichever channel it last
+heard the other on, so it can take a few reconnects. A connection already
+running when you started listening cannot be picked up halfway, yet.
+
+**The top lines** are the connection's parameters now in force (the
+`CONNECT_IND`'s, with every update since), the two addresses (masked with
+`i` like every other), when it was set up, the PHY each way, and whether
+it is encrypted.
+
+**Every event has one of four accounts:**
+
+- **followed**: a packet with the connection's access address was heard;
+- **missed**: its channel was in view and nothing was heard. Not a claim
+  about why: a Peripheral may skip events, and a Central may have nothing
+  to send;
+- **not in view**: its channel is outside the band; runs of these fold into
+  one row (`36-33  not in view (4)`), so the events heard lead the list;
+- **feed lost**: the samples were not there to listen to.
+
+**Who sent it**: the Central opens each event at its anchor point and the two
+take turns 150 µs apart (4.5.1, 4.1.1), so the first packet at the anchor
+is the Central's (`C→P`, in the connection's colour) and its answer the
+Peripheral's (`P→C`). A packet neither rule accounts for gets a dot.
+
+**What it said.** Link-layer control PDUs are named from Table 2.20 and their
+parameters read in words: versions, features, the PHY requests, channel
+maps, connection updates, terminate reasons. Each is read only at the length
+its own table entry gives, so an encrypted packet is not mistaken for one.
+The keys and random numbers of encryption setup are named, never printed.
+From `LL_START_ENC_REQ` on, the link is encrypted and only the length and
+the CRC are left. L2CAP payloads are not read at all.
+
+**Changes the two agree on** take effect at an *instant*, an event counter
+named in the PDU: a new channel map, a move to LE 2M, a new interval. sdrtop
+applies each it hears. One sent while its channel was out of view cannot be
+heard, and the connection then goes quiet in the window: after the
+supervision timeout with its events in view still silent, it is marked
+**lost after event N**, not followed on a stale schedule. `LL_TERMINATE_IND`
+ends it with its reason; a move to LE Coded, or a subrate change, is
+**not followed**, and says so.
+
+### Measured
+
+- **clock**: the Central's clock against this radio's, in ppm, from a line
+  through the anchors heard. Without a frequency reference it is relative,
+  and says so; with one, it is held against the sleep clock accuracy the
+  Central declared in its `CONNECT_IND` (inside, at the edge, outside).
+- **T_IFS**: the turns heard, pooled, against 150 ± 2 µs (4.2.1).
+- **CRC**: packets and passes per data channel heard.
+
+**On the air**, a TV box and its BLE remote, the remote taken out of its
+batteries and put back: the box's `CONNECT_IND` set ChSel, the remote's
+`ADV_DIRECT_IND` did not, so the link hopped by Algorithm #1, as the Core
+says it must when either bit is 0 (the view reads both). Every event in view
+was followed, both ends placed: `LL_FEATURE_REQ`, then `LL_ENC_REQ` and
+`LL_START_ENC_REQ` by event 10, after which the link was encrypted; T_IFS
+150.31 ±0.04 µs over 26 turns, the box's clock −5.1 ±0.1 ppm against the
+radio's. At event 138 the two changed their timing in a PDU nobody else
+could read, and the view said so: lost after event 138. A device that
+reconnects over classic Bluetooth (most earbuds) never shows here at all.
+Keys: `↑↓` scroll, `End` back to the newest, `← →` the previous or next
+connection.
+
+---
+
+## Piconets · `Classic 1`
 
 Classic Bluetooth hops across 79 one-megahertz channels, 1600 times a second,
 in a sequence a passive listener does not know in advance. What can be found
@@ -481,7 +604,7 @@ shows `32 left`, `2 left` or the value.
 
 The selected piconet is spelled out under the roster, as a whole: the rule
 of the three classic views is that the piconet as one thing is here, its
-packets on NET 6 and each of its two ends on NET 7.
+packets on Classic 2 and each of its two ends on Classic 3.
 
 - **PICONET**: its LAP, its **UAP** and what that rests on ("resolved by a
   payload CRC" and how many CRCs pass under it, or the candidates left, two
@@ -496,7 +619,7 @@ packets on NET 6 and each of its two ends on NET 7.
   its sample clock share one crystal, which is true of a HackRF and an
   RTL-SDR. The Classic export carries it as `clock_ppm`. Beside it, the
   grid's rms: every member's hits together, so it is not a jitter (the two
-  ends' offset from each other is in it; NET 7 has each end's). Last, one
+  ends' offset from each other is in it; Classic 3 has each end's). Last, one
   line of pooled readings, the modulation `index` and the carrier `f0`,
   every member's.
 - **HEADERS**: once the UAP is one value, what the piconet's headers say
@@ -507,24 +630,24 @@ packets on NET 6 and each of its two ends on NET 7.
   is read or guessed.
 
 
-`Enter` opens [the Piconet view](#piconet--net-6) on the selected piconet,
-and `7` [the Bench](#bench--net-7-focus-c). An inquiry code or a page is not a
+`Enter` opens [the Packets view](#packets--classic-2) on the selected piconet,
+and `3` [the Bench](#bench--classic-3-focus-c). An inquiry code or a page is not a
 piconet either could open, so their whole account stays here. A short panel
 keeps what fits whole and names the rest.
 
 ---
 
-## Piconet · `NET 6`
+## Packets · `Classic 2`
 
 One piconet, packet by packet: its packet list, the whole screen. If the
-Classic view is the room, this is one conversation in it: overheard, timed
+Piconets view is the room, this is one conversation in it: overheard, timed
 and measured, and still not understood, which is the polite way round. It
-is the piconet selected in the Classic view: `Enter` on the roster brings it
-here, and so does `6` with a piconet selected. `← →`, with the list
+is the piconet selected in the Piconets view: `Enter` on the roster brings it
+here, and so does `2` with a piconet selected. `← →`, with the list
 focused, step to the previous or next piconet in the roster's order. With
 none heard, or none selected, the list says which of those it is.
 
-The classic receiver runs here exactly as on the Classic view, same channels,
+The classic receiver runs here exactly as on the Piconets view, same channels,
 same `← →` steps for a locked radio when nothing is focused, so the three
 classic views are three readings of one stream of hits.
 
@@ -569,7 +692,7 @@ blank, and so is `SLOT µs` for a packet from before the grid was fitted:
 times from another run of the stream are on another clock.
 
 `MOD` and `f0` are single readings from one header, noisier than [the
-bench's](#bench--net-7-focus-c)
+bench's](#bench--classic-3-focus-c)
 and printed to the places their own uncertainty allows, a dash where it
 allows none. A value outside its limit turns amber or red, as on the bench;
 everything inside keeps the ordinary ink, so a problem is the thing that
@@ -603,15 +726,15 @@ and the ones not yet placed.
 
 ---
 
-## Bench · `NET 7` *(focus `c`)*
+## Bench · `Classic 3` *(focus `c`)*
 
 The same piconet, each end of it side by side: three columns, MODULATION,
 CARRIER and TIMING, every reading two rows, `▶` the master's in the
 piconet's colour and `◀` the slave's in the ordinary ink, each with its bar
 on the same row, held against the limit the column's heading cites. The
 heading also says what the readings rest on (`258 hdr`, `1204 hits`). A side
-with nothing yet says so in words, never a zero. `7` opens it on the
-piconet selected in the Classic view; `← →`, with the bench focused, step
+with nothing yet says so in words, never a zero. `3` opens it on the
+piconet selected in the Piconets view; `← →`, with the bench focused, step
 through the piconets.
 
 - **Modulation**: each end's BR modulation index and deviation against
@@ -652,14 +775,14 @@ through the piconets.
   decided again from the measurement itself, never taken from the part of
   the receiver that finds packets, because one wrong bit there looked like
   30 kHz of drift. Noise makes drift too, as it does on BLE: see the
-  Modulation note in the BLE view's detail.
+  Modulation note in the Advertising view's detail.
 - **Timing**: each end's timing on the piconet's 625 µs slot grid, fitted to
   every member's hits. Below eight hits it is collecting; hits that do not
   line up on a grid beyond chance are refused as one, never forced onto it.
   Given enough periods to try, a dozen points will line up with almost
   anything, and the panel would rather say "no grid" than find one it
   wanted to find. (The piconet's clock from the same grid is the whole
-  piconet's, so it is on NET 5.)
+  piconet's, so it is on Classic 1.)
 
   Each end's **jitter** is its own packets' scatter about their own average
   timing, which is how 2.2.5 states it, held against its 1 µs. The grid
@@ -696,7 +819,7 @@ only then do readings give way from the bottom, and it says that too.
 
 | File | One row per |
 |------|-------------|
-| `net-band-*.csv` | megahertz of the band: duty, its uncertainty, coverage, power |
+| `net-band-*.csv` | megahertz of the band: duty, its uncertainty, coverage, power (from NET 2 only: elsewhere the band is not being measured, and the file says so instead) |
 | `net-census-*.csv` | counted device, in the order the Census shows them |
 | `net-ble-*.csv` | packet, in the list's order, as it was shown (held or filtered) |
 | `net-fer-*.csv` | SNR bin of the frame error curve, for all traffic and each device |
@@ -728,5 +851,12 @@ shape. A preset of your own that names them needs updating:
 | `net_ble_rf` | `net_ble_detail` (the packet detail) |
 | `net_bt_census` | `net_bt_piconets` (the piconet roster) |
 | the `net_coexist` preset | part of `net_survey`; the `net_coexist` panel itself is unchanged |
+
+The built-in views moved too: Census and the BLE view (now Advertising)
+went from `section = "net"` to `"le"`, the three classic views to
+`"classic"`. A preset of yours still filed under `"net"` keeps working and
+stays in NET; move it with `section` and `slot` if you want it beside its
+kind. All three sections are hidden together on a radio that cannot reach
+the band.
 
 How presets are written is in [Layout presets](presets.md).

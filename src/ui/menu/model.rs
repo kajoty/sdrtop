@@ -23,11 +23,6 @@ use crate::config::PresetConfig;
 /// would say otherwise.
 pub const HIDDEN: &str = "hidden";
 
-/// The NET section, named here because the startup path has to be able to drop
-/// it: `App::build_ui` removes every preset filed under it on a radio that
-/// cannot work in the 2.4 GHz band, so the section is absent rather than empty.
-pub const NET: &str = "net";
-
 /// The section a preset lands in when it names none. Only exists when something
 /// is actually in it, so a default install never shows an empty row.
 pub const OTHER: &str = "other";
@@ -41,7 +36,12 @@ const KNOWN: &[(&str, &str)] = &[
     ("lab", "Lab"),
     ("sweep", "Sweep"),
     ("micro", "Micro"),
-    (NET, "NET"),
+    // The NET feature's three (`signal::net::SECTIONS`): `App::build_ui`
+    // removes every preset filed under them on a radio that cannot work in the
+    // 2.4 GHz band, so they are absent rather than empty.
+    (crate::signal::net::SECTIONS[0], "NET"),
+    (crate::signal::net::SECTIONS[1], "LE"),
+    (crate::signal::net::SECTIONS[2], "Classic"),
 ];
 
 /// One layout, as the menu shows it.
@@ -171,7 +171,10 @@ pub fn build(presets: &HashMap<String, PresetConfig>) -> Menu {
     Menu { sections, warnings }
 }
 
-fn section_title(id: &str) -> String {
+/// A section's title as the menu shows it: the known ones' own, `Other`, or
+/// the id itself for one a user preset invented. Also what the NET header
+/// calls the section it is in.
+pub fn section_title(id: &str) -> String {
     if let Some((_, title)) = KNOWN.iter().find(|(k, _)| *k == id) {
         return (*title).to_string();
     }
@@ -206,13 +209,76 @@ mod tests {
         }
     }
 
-    /// The built-ins land in the five sections the design names, in order.
+    /// The built-ins land in the seven sections, in order.
     #[test]
-    fn the_builtins_build_five_sections() {
+    fn the_builtins_build_seven_sections() {
         let menu = build(&LayoutConfig::default_config().presets);
         let ids: Vec<&str> = menu.sections.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["command_rail", "lab", "sweep", "micro", "net"]);
+        assert_eq!(
+            ids,
+            [
+                "command_rail",
+                "lab",
+                "sweep",
+                "micro",
+                "net",
+                "le",
+                "classic"
+            ]
+        );
         assert!(menu.warnings.is_empty(), "{:?}", menu.warnings);
+    }
+
+    /// The NET feature's sections come after Micro: the band first, then
+    /// each Bluetooth, each under its own title.
+    #[test]
+    fn the_net_sections_sort_in_order_with_their_titles() {
+        let mut presets = LayoutConfig::default_config().presets;
+        presets.insert("a_le".into(), bare_preset(Some("le"), Some(9)));
+        presets.insert("a_classic".into(), bare_preset(Some("classic"), Some(9)));
+        let menu = build(&presets);
+        let ids: Vec<&str> = menu.sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "command_rail",
+                "lab",
+                "sweep",
+                "micro",
+                "net",
+                "le",
+                "classic"
+            ]
+        );
+        assert_eq!(menu.section("le").unwrap().title, "LE");
+        assert_eq!(menu.section("classic").unwrap().title, "Classic");
+    }
+
+    /// The NET feature's views, a section each for the band and the two
+    /// Bluetooths, numbered from one in each.
+    #[test]
+    fn the_net_feature_is_three_sections() {
+        let menu = build(&LayoutConfig::default_config().presets);
+        let titles = |id: &str| -> Vec<(Option<u8>, String)> {
+            menu.section(id)
+                .unwrap()
+                .entries
+                .iter()
+                .map(|e| (e.slot, e.title.clone()))
+                .collect()
+        };
+        let want = |v: &[(u8, &str)]| -> Vec<(Option<u8>, String)> {
+            v.iter().map(|(s, t)| (Some(*s), t.to_string())).collect()
+        };
+        assert_eq!(titles("net"), want(&[(1, "Capability"), (2, "Survey")]));
+        assert_eq!(
+            titles("le"),
+            want(&[(1, "Census"), (2, "Advertising"), (3, "Connection")])
+        );
+        assert_eq!(
+            titles("classic"),
+            want(&[(1, "Piconets"), (2, "Packets"), (3, "Bench")])
+        );
     }
 
     /// Slot order, not file order and not hash order.
@@ -293,7 +359,16 @@ mod tests {
         let ids: Vec<&str> = menu.sections.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["command_rail", "lab", "sweep", "micro", "net", "nightwatch"]
+            [
+                "command_rail",
+                "lab",
+                "sweep",
+                "micro",
+                "net",
+                "le",
+                "classic",
+                "nightwatch"
+            ]
         );
         assert_eq!(menu.section("nightwatch").unwrap().title, "nightwatch");
     }
@@ -367,8 +442,8 @@ mod tests {
     #[test]
     fn a_cursor_past_the_end_is_clamped() {
         let menu = build(&LayoutConfig::default_config().presets);
-        // Five sections, and Sweep (index 2) has two entries.
-        assert_eq!(menu.clamp(99, 0), Some((4, 0)));
+        // Seven sections, and Sweep (index 2) has two entries.
+        assert_eq!(menu.clamp(99, 0), Some((6, 0)));
         assert_eq!(menu.clamp(2, 99), Some((2, 1)));
         assert_eq!(
             menu.at(2, 99).map(|e| e.preset.as_str()),

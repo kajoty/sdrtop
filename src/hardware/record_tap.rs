@@ -111,12 +111,22 @@ impl RecordTap {
     /// The writer has put `bytes` on disk, or thrown them away.
     pub fn release(&self, bytes: usize) {
         // Saturating, because a recording started after a disarm reset the
-        // budget while an old writer may still be releasing into it.
-        let _ = self
-            .in_flight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(bytes))
-            });
+        // budget while an old writer may still be releasing into it. Written
+        // as the compare-exchange loop `fetch_update` is: Rust 1.99 deprecates
+        // that name for `try_update`, which the 1.88 floor does not have.
+        let mut current = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.in_flight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Hand a reading of the radio's own drop count to a running recording.
@@ -216,5 +226,19 @@ mod tests {
         tap.release(big.len());
         tap.offer(at(9, 8), &[1; 16], vec![], false);
         assert!(matches!(rx.try_recv().unwrap(), RecordMsg::Block { .. }));
+    }
+
+    /// Releasing more than is in flight (an old writer releasing into a
+    /// budget a new recording reset) stops at zero rather than wrapping
+    /// round to a budget that refuses everything.
+    #[test]
+    fn a_release_past_zero_stops_at_zero() {
+        let tap = RecordTap::default();
+        tap.in_flight.store(10, Ordering::Relaxed);
+        tap.release(25);
+        assert_eq!(tap.in_flight.load(Ordering::Relaxed), 0);
+        tap.in_flight.store(10, Ordering::Relaxed);
+        tap.release(4);
+        assert_eq!(tap.in_flight.load(Ordering::Relaxed), 6);
     }
 }

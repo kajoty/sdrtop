@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
+#[cfg(test)]
 use crate::hardware::SampleGeometry;
 use crate::signal::dsp::{compute_window, WindowFn};
+#[cfg(test)]
 use crate::signal::fft::frame::decode_into;
 use crate::state::CellReading;
 
@@ -145,6 +147,10 @@ impl Scan {
         self.centre_hz == centre_hz && self.rate_hz == rate_hz && self.span_hz == span_hz
     }
 
+    // The worker hands over the block it has already decoded (`push_iq`);
+    // the bytes' own path is kept for the tests that build their signals as
+    // bytes, and is held to give the same answer.
+    #[cfg(test)]
     /// Fold one block of interleaved bytes into the dwell.
     ///
     /// The floor is derived per block rather than per dwell, and the counts are
@@ -154,9 +160,37 @@ impl Scan {
     /// means a gain change part way through a dwell does not poison the rest of
     /// it.
     pub fn push(&mut self, bytes: &[u8], geometry: SampleGeometry) {
-        let pair_bytes = geometry.bytes_per_pair();
-        let stride = self.n * pair_bytes;
-        let windows = bytes.len() / stride;
+        let stride = self.n * geometry.bytes_per_pair();
+        self.fold(bytes.len() / stride, |scan, w| {
+            let frame = &bytes[w * stride..(w + 1) * stride];
+            decode_into(frame, &scan.window, geometry, &mut scan.samples);
+        });
+    }
+
+    /// [`Self::push`] on a block the worker has already decoded, scaled as
+    /// `demod::decode` scales it: windowing it here gives exactly the
+    /// samples `decode_into` would (`decoded_samples_read_exactly_as_the_
+    /// bytes_do`), without decoding the bytes a second time.
+    pub fn push_iq(&mut self, iq: &[Complex<f32>]) {
+        let n = self.n;
+        self.fold(iq.len() / n, |scan, w| {
+            for ((out, &x), &win) in scan
+                .samples
+                .iter_mut()
+                .zip(&iq[w * n..(w + 1) * n])
+                .zip(&scan.window)
+            {
+                *out = Complex {
+                    re: x.re * win,
+                    im: x.im * win,
+                };
+            }
+        });
+    }
+
+    /// The dwell's work for `windows` windows, `load` putting window `w`'s
+    /// windowed samples into `self.samples`.
+    fn fold(&mut self, windows: usize, mut load: impl FnMut(&mut Self, usize)) {
         if windows == 0 || self.bin_cells.iter().all(Option::is_none) {
             return;
         }
@@ -169,8 +203,7 @@ impl Scan {
         self.plane.resize(windows * width, 0.0);
 
         for w in 0..windows {
-            let frame = &bytes[w * stride..(w + 1) * stride];
-            decode_into(frame, &self.window, geometry, &mut self.samples);
+            load(self, w);
             self.fft.process(&mut self.samples);
             let row = &mut self.plane[w * width..(w + 1) * width];
             for (bin, cell) in self.bin_cells.iter().enumerate() {
@@ -317,6 +350,34 @@ mod tests {
         let mut scan = Scan::new(CENTRE, RATE, SPAN);
         scan.push(bytes, eight_bit());
         scan.take()
+    }
+
+    /// Fed the block the worker already decoded, the scan reads exactly what
+    /// it reads from the bytes: one decoding shared, not a second
+    /// approximation of it.
+    #[test]
+    fn decoded_samples_read_exactly_as_the_bytes_do() {
+        let mut rng = Rng::new(5);
+        let noise = rng.noise(64 * 1024, 0.02);
+        let raw: Vec<u8> = noise
+            .iter()
+            .flat_map(|z| {
+                let q = |v: f32| (v * 128.0).clamp(-127.0, 127.0) as i8 as u8;
+                [q(z.re), q(z.im)]
+            })
+            .collect();
+        let mut iq = Vec::new();
+        crate::signal::demod::decode(&raw, eight_bit(), usize::MAX, &mut iq);
+        let mut from_bytes = Scan::new(CENTRE, RATE, SPAN);
+        from_bytes.push(&raw, eight_bit());
+        let mut from_iq = Scan::new(CENTRE, RATE, SPAN);
+        from_iq.push_iq(&iq);
+        let (a, b) = (from_bytes.take(), from_iq.take());
+        assert_eq!(format!("{:?}", a.cells), format!("{:?}", b.cells));
+        assert_eq!(
+            (a.noise_dbfs, a.trusted, a.tail, a.spread),
+            (b.noise_dbfs, b.trusted, b.tail, b.spread)
+        );
     }
 
     /// **A full-scale signal reads 0 dBFS, and nothing ever reads above it.**

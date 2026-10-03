@@ -344,6 +344,11 @@ pub struct NetState {
     /// Advertising channel PDUs decoded so far this session, newest first,
     /// capped at [`BLE_PACKET_LIMIT`].
     pub ble_packets: std::collections::VecDeque<BlePacket>,
+    /// The connections whose CONNECT_IND was heard, followed through the
+    /// events the radio's window holds (`signal::ble::follow`), newest
+    /// first, at most [`CONNECTIONS_KEPT`].
+    pub ble_connections: Vec<FollowedConnection>,
+    pub connection_view: ConnectionView,
     /// Packets that have entered [`Self::ble_packets`] this session: each
     /// one's [`BlePacket::seq`] is the count at its arrival.
     pub ble_heard: u64,
@@ -522,7 +527,7 @@ impl NetState {
     ///
     /// The packets the BLE list shows, newest first: the held copy while the
     /// list is held, the live ring otherwise, narrowed to the filter's
-    /// address when there is one.
+    /// address and to the chosen kind of PDU when there are those.
     ///
     /// **The one account of the list**, read by the panel that draws it and
     /// the keys that move through it, so the arrows step through exactly the
@@ -535,7 +540,49 @@ impl NetState {
         source
             .iter()
             .filter(|p| self.ble_view.filter.is_none_or(|a| p.adv_addr == Some(a)))
+            .filter(|p| {
+                self.ble_view
+                    .kind
+                    .is_none_or(|k| PduKind::of(p.pdu_type) == Some(k))
+            })
             .collect()
+    }
+
+    /// The moment back to which [`Self::ble_packets`] is every packet heard,
+    /// or `None` when it still is all the way: the oldest kept packet of each
+    /// kind at its limit, the latest of those. Before it, only the kinds not
+    /// yet cut remain, so a reader of the ring as a record of the band (the
+    /// coexistence marks) stops there.
+    ///
+    /// A kind exactly at the limit counts as cut: it may have been, and a
+    /// stretch drawn too short is a smaller error than one drawn too quiet.
+    pub fn ble_complete_since(&self) -> Option<std::time::Instant> {
+        let mut kept = [0usize; 4];
+        let mut oldest = [None; 4];
+        for p in &self.ble_packets {
+            let slot = kind_slot(p.pdu_type);
+            kept[slot] += 1;
+            oldest[slot] = Some(p.seen);
+        }
+        (0..4)
+            .filter(|&i| kept[i] >= BLE_PACKET_LIMIT)
+            .filter_map(|i| oldest[i])
+            .max()
+    }
+
+    /// Cut [`Self::ble_packets`] to the newest [`BLE_PACKET_LIMIT`] of each
+    /// [`PduKind`] (and of the types none names), keeping arrival order.
+    ///
+    /// **Per kind, not overall**: advertising arrives by the hundred and a
+    /// CONNECT_IND once, so one shared limit pushed the packet a reader was
+    /// looking for out of the list within seconds of its arrival.
+    pub fn trim_ble_packets(&mut self) {
+        let mut kept = [0usize; 4];
+        self.ble_packets.retain(|p| {
+            let slot = kind_slot(p.pdu_type);
+            kept[slot] += 1;
+            kept[slot] <= BLE_PACKET_LIMIT
+        });
     }
 
     /// Packets that have arrived since the list was held; zero when it is not.
@@ -613,6 +660,27 @@ impl NetState {
                 None => "#?".to_string(),
             },
             _ => format!("{lap:#08x}"),
+        }
+    }
+
+    /// A connection's access address as the address mode allows it: in hex,
+    /// or in `masked` as `#n`, the connection's place in the order heard, so
+    /// one connection is one number in every panel. It names a connection,
+    /// not a device, but it is unique to that pair while they are linked.
+    pub fn show_access_address(&self, aa: u32) -> String {
+        match self.address_display {
+            AddressDisplay::Masked => {
+                let heard = self.ble_connections.len();
+                match self
+                    .ble_connections
+                    .iter()
+                    .position(|f| f.connection.access_address() == aa)
+                {
+                    Some(k) => format!("#{}", heard - k),
+                    None => "#?".to_string(),
+                }
+            }
+            _ => format!("{aa:#010x}"),
         }
     }
 
@@ -743,10 +811,84 @@ pub struct NetDecodeHealth {
     pub bt_hits: u64,
 }
 
-/// How many recent PDUs [`NetState::ble_packets`] keeps. A bench instrument
-/// is read a screenful at a time, not scrolled back through a session's
-/// worth of advertising traffic; old rows fall off the end rather than
-/// growing the list forever.
+/// How many connections [`NetState::ble_connections`] keeps: enough for a
+/// room's phones and their watches, few enough that each is worth a look.
+pub const CONNECTIONS_KEPT: usize = 16;
+
+/// One connection followed, when its CONNECT_IND was heard, and whether
+/// its two addresses are random (the packet's TxAdd for InitA, RxAdd for
+/// AdvA).
+#[derive(Clone, Debug)]
+pub struct FollowedConnection {
+    pub seen: std::time::Instant,
+    pub init_random: bool,
+    pub adv_random: bool,
+    pub connection: crate::signal::ble::follow::Connection,
+}
+
+/// How the Connection view is being read: which connection, by its access
+/// address (`None`: the newest), and how far its rows are scrolled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ConnectionView {
+    pub selected: Option<u32>,
+    pub first_visible: usize,
+}
+
+impl NetState {
+    /// Start following the connection a CONNECT_IND set up, unless one with
+    /// its access address is followed already: `true` when it is new. Past
+    /// [`CONNECTIONS_KEPT`] the oldest ended one is let go, or the oldest
+    /// when none has ended.
+    pub fn follow(
+        &mut self,
+        c: &crate::signal::ble::connect::ConnectIndData,
+        (csa2, init_random, adv_random): (Option<bool>, bool, bool),
+        end_pair: f64,
+        raw_rate: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        use crate::signal::ble::follow::{Connection, State};
+        if self
+            .ble_connections
+            .iter()
+            .any(|f| f.connection.access_address() == c.access_address)
+        {
+            return false;
+        }
+        let Some(mut connection) = Connection::new(c, csa2.unwrap_or(false), end_pair, raw_rate)
+        else {
+            return false;
+        };
+        if csa2.is_none() {
+            connection.refuse(
+                "the advertising PDU it answered was not heard: which channel selection algorithm is not known",
+            );
+        }
+        self.ble_connections.insert(
+            0,
+            FollowedConnection {
+                seen: now,
+                init_random,
+                adv_random,
+                connection,
+            },
+        );
+        if self.ble_connections.len() > CONNECTIONS_KEPT {
+            let ended = self
+                .ble_connections
+                .iter()
+                .rposition(|f| *f.connection.state() != State::Following);
+            let at = ended.unwrap_or(self.ble_connections.len() - 1);
+            self.ble_connections.remove(at);
+        }
+        true
+    }
+}
+
+/// How many recent PDUs of each kind [`NetState::ble_packets`] keeps
+/// ([`NetState::trim_ble_packets`]). A bench instrument is read a screenful
+/// at a time, not scrolled back through a session's worth of advertising
+/// traffic; old rows fall off the end rather than growing the list forever.
 pub const BLE_PACKET_LIMIT: usize = 200;
 
 /// The hop scatter's zoom steps, in milliseconds: from half a second, where
@@ -910,10 +1052,73 @@ pub struct BlePacketView {
     pub selection: super::Selection<u64>,
     /// Only packets from this advertiser address, when set.
     pub filter: Option<[u8; 6]>,
+    /// Only this kind of PDU, when set. It narrows together with
+    /// [`Self::filter`], and outlives leaving the view as that does.
+    pub kind: Option<PduKind>,
     /// The list as it stood when it was held, and [`NetState::ble_heard`] at
     /// that moment: a copy, so holding the list stops nothing else. The
     /// coexistence marks and the census go on taking every packet.
     pub held: Option<(std::collections::VecDeque<BlePacket>, u64)>,
+}
+
+/// The three kinds of advertising channel PDU the BLE list can be narrowed
+/// to, by what a reader is looking for: a connection being set up, a scanner
+/// asking, or the advertising that makes up nearly all of the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PduKind {
+    /// CONNECT_IND.
+    Connect,
+    /// SCAN_REQ and SCAN_RSP.
+    Scan,
+    /// ADV_IND, ADV_DIRECT_IND, ADV_NONCONN_IND and ADV_SCAN_IND.
+    Advertising,
+}
+
+impl PduKind {
+    /// The kind a PDU type belongs to; `None` for the types none of them
+    /// names, which a kind filter therefore never shows.
+    pub fn of(pdu_type: crate::signal::ble::pdu::PduType) -> Option<Self> {
+        use crate::signal::ble::pdu::PduType;
+        match pdu_type {
+            PduType::ConnectInd => Some(Self::Connect),
+            PduType::ScanReq | PduType::ScanRsp => Some(Self::Scan),
+            PduType::AdvInd
+            | PduType::AdvDirectInd
+            | PduType::AdvNonconnInd
+            | PduType::AdvScanInd => Some(Self::Advertising),
+            PduType::Other(_) => None,
+        }
+    }
+
+    /// The next step of the list's `t` key: every kind, then each in turn.
+    pub fn step(current: Option<Self>) -> Option<Self> {
+        match current {
+            None => Some(Self::Connect),
+            Some(Self::Connect) => Some(Self::Scan),
+            Some(Self::Scan) => Some(Self::Advertising),
+            Some(Self::Advertising) => None,
+        }
+    }
+
+    /// How the frame and the list name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "CONNECT",
+            Self::Scan => "SCAN",
+            Self::Advertising => "ADV",
+        }
+    }
+}
+
+/// Where a PDU type is counted against [`BLE_PACKET_LIMIT`]: one slot per
+/// [`PduKind`], and one for the types none of them names.
+fn kind_slot(pdu_type: crate::signal::ble::pdu::PduType) -> usize {
+    match PduKind::of(pdu_type) {
+        Some(PduKind::Connect) => 0,
+        Some(PduKind::Scan) => 1,
+        Some(PduKind::Advertising) => 2,
+        None => 3,
+    }
 }
 
 /// How the census table is being read: what orders it, and where the cursor is.
@@ -1154,6 +1359,26 @@ impl BandOccupancy {
         self.record_column(now);
     }
 
+    /// While the band is not being measured, keep its time axis moving: a
+    /// column of "nobody looked" (`-1`, as an unobserved cell is drawn) when
+    /// one is due, so the columns stay one interval apart and a column counted
+    /// back is that long ago. Nothing before the first measurement, and the
+    /// readings are left as they were, dated by their own `measured`.
+    pub fn mark_unobserved(&mut self, now: std::time::Instant) {
+        let due = self
+            .last_column
+            .is_none_or(|t| now.saturating_duration_since(t) >= COLUMN_INTERVAL);
+        if !due || self.cells.is_empty() {
+            return;
+        }
+        self.last_column = Some(now);
+        self.history.push_back(vec![-1.0; self.cells.len()]);
+        self.columns_taken += 1;
+        while self.history.len() > HISTORY_COLUMNS {
+            self.history.pop_front();
+        }
+    }
+
     /// Push the band as it stands onto the history, if it is time for a column.
     fn record_column(&mut self, now: std::time::Instant) {
         let due = self
@@ -1213,6 +1438,147 @@ impl BandOccupancy {
 
 #[cfg(test)]
 mod tests {
+
+    fn ble_packet(seq: u64, pdu_type: crate::signal::ble::pdu::PduType) -> BlePacket {
+        BlePacket {
+            phy: crate::signal::ble::Phy::OneM,
+            seq,
+            channel: 37,
+            pdu_type,
+            ch_sel: false,
+            tx_add_random: false,
+            rx_add_random: false,
+            length: 6,
+            adv_addr: Some([seq as u8; 6]),
+            payload: Vec::new(),
+            crc_ok: true,
+            snr_db: None,
+            freq_offset_hz: None,
+            modulation: None,
+            drift: None,
+            seen: std::time::Instant::now(),
+        }
+    }
+
+    /// **How far back the list is every packet**: as far as the oldest kept
+    /// packet of a kind that has been cut; everything when none has.
+    #[test]
+    fn the_list_is_complete_back_to_the_oldest_cut_kind() {
+        use crate::signal::ble::pdu::PduType;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let at = |seq, t, s: u64| BlePacket {
+            seen: now - Duration::from_secs(s),
+            ..ble_packet(seq, t)
+        };
+        let mut net = NetState::default();
+        net.ble_packets.push_front(at(1, PduType::ConnectInd, 900));
+        net.ble_packets.push_front(at(2, PduType::AdvInd, 800));
+        assert_eq!(net.ble_complete_since(), None, "nothing cut yet");
+
+        for seq in 0..BLE_PACKET_LIMIT as u64 {
+            net.ble_packets
+                .push_front(at(10 + seq, PduType::AdvInd, 500 - seq));
+        }
+        net.trim_ble_packets();
+        let oldest_adv = now - Duration::from_secs(500);
+        assert_eq!(net.ble_complete_since(), Some(oldest_adv));
+    }
+
+    /// **The flood does not push the rare kinds out.** The ring keeps the
+    /// newest [`BLE_PACKET_LIMIT`] of each kind, so a CONNECT_IND heard
+    /// before three hundred advertisements is still there to filter for.
+    #[test]
+    fn the_ring_keeps_each_kinds_newest() {
+        use crate::signal::ble::pdu::PduType;
+        let mut net = NetState::default();
+        net.ble_packets
+            .push_front(ble_packet(1, PduType::ConnectInd));
+        net.ble_packets.push_front(ble_packet(2, PduType::ScanReq));
+        for seq in 3..303 {
+            net.ble_packets.push_front(ble_packet(seq, PduType::AdvInd));
+        }
+        net.trim_ble_packets();
+        let advs = net
+            .ble_packets
+            .iter()
+            .filter(|p| p.pdu_type == PduType::AdvInd)
+            .count();
+        assert_eq!(advs, BLE_PACKET_LIMIT);
+        // The newest of them, in arrival order still.
+        assert_eq!(net.ble_packets.front().map(|p| p.seq), Some(302));
+        assert!(net.ble_packets.iter().any(|p| p.seq == 1));
+        assert!(net.ble_packets.iter().any(|p| p.seq == 2));
+        assert!(!net.ble_packets.iter().any(|p| p.seq == 102));
+        assert!(net.ble_packets.iter().any(|p| p.seq == 103));
+    }
+
+    fn connect_ind(aa: u32) -> crate::signal::ble::connect::ConnectIndData {
+        crate::signal::ble::connect::ConnectIndData {
+            init_a: [0; 6],
+            adv_a: [0; 6],
+            access_address: aa,
+            crc_init: 0x12_3456,
+            win_size: 1,
+            win_offset: 0,
+            interval: 6,
+            latency: 0,
+            timeout: 100,
+            channel_map: (1u64 << 37) - 1,
+            hop_increment: 7,
+            sca: 0,
+        }
+    }
+
+    /// One connection an access address; the newest first; at most
+    /// [`CONNECTIONS_KEPT`], the ended ones let go before the followed.
+    #[test]
+    fn connections_are_followed_once_each_and_kept_to_a_number() {
+        let now = std::time::Instant::now();
+        let mut net = NetState::default();
+        assert!(net.follow(&connect_ind(1), (Some(false), false, false), 0.0, 20e6, now));
+        assert!(
+            !net.follow(&connect_ind(1), (Some(false), false, false), 9.0, 20e6, now),
+            "heard twice"
+        );
+        assert_eq!(net.ble_connections.len(), 1);
+        // The first one ends: LL_TERMINATE_IND at its first anchor.
+        let mut c = net.ble_connections[0].connection.clone();
+        let at = c.next_due().anchor_pair;
+        let terminate = crate::signal::ble::data::DataPdu {
+            llid: 3,
+            nesn: false,
+            sn: false,
+            md: false,
+            cte_info: None,
+            payload: vec![0x02, 0x13],
+            crc_ok: true,
+        };
+        let timing = crate::signal::ble::receive::DataTiming {
+            start_pair: at,
+            end_pair: at + 1_000.0,
+        };
+        c.account(true, false, vec![(terminate, timing)]);
+        net.ble_connections[0].connection = c;
+        for aa in 2..=(CONNECTIONS_KEPT as u32 + 1) {
+            assert!(net.follow(
+                &connect_ind(aa),
+                (Some(false), false, false),
+                0.0,
+                20e6,
+                now
+            ));
+        }
+        assert_eq!(net.ble_connections.len(), CONNECTIONS_KEPT);
+        assert_eq!(
+            net.ble_connections[0].connection.access_address(),
+            CONNECTIONS_KEPT as u32 + 1
+        );
+        assert!(net
+            .ble_connections
+            .iter()
+            .all(|c| c.connection.access_address() != 1));
+    }
     use super::*;
 
     /// Masked hides every part of an address, not the address alone: the
@@ -1531,6 +1897,29 @@ mod tests {
             };
         }
         out
+    }
+
+    /// While the band is not being measured, the time axis still moves: a
+    /// column of "nobody looked" every interval, so a column counted back
+    /// is still that many half-seconds ago. Before anything was measured
+    /// there is no axis to keep, and the readings themselves are untouched.
+    #[test]
+    fn time_away_is_marked_as_unobserved_columns() {
+        let t0 = Instant::now();
+        let mut band = BandOccupancy::default();
+        band.mark_unobserved(t0);
+        assert!(band.history.is_empty(), "nothing measured, no axis");
+
+        band.absorb(dwell(&[(10, 0.4, 8_000)]), t0);
+        assert_eq!(band.history.len(), 1);
+        band.mark_unobserved(t0 + Duration::from_millis(200));
+        assert_eq!(band.history.len(), 1, "not due yet");
+        band.mark_unobserved(t0 + Duration::from_millis(500));
+        band.mark_unobserved(t0 + Duration::from_millis(1000));
+        assert_eq!(band.history.len(), 3);
+        assert!(band.history[2].iter().all(|&v| v < 0.0), "nobody looked");
+        assert_eq!(band.cells[10].duty, 0.4);
+        assert_eq!(band.cells[10].measured, Some(t0));
     }
 
     /// **This is what makes a survey a survey.** Each dwell sees one slice; the
