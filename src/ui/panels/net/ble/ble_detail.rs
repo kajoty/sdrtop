@@ -529,9 +529,21 @@ fn connection_lines(
     if p.pdu_type != PduType::ConnectInd {
         return Vec::new();
     }
+    let parsed = decode_octets(&p.payload).filter(|_| p.crc_ok);
+    let followed = parsed.and_then(|c| {
+        state
+            .net
+            .ble_connections
+            .iter()
+            .find(|f| f.connection.access_address() == c.access_address)
+    });
     let mut out = vec![crate::ui::chrome::section(
         "connection",
-        "read, not followed",
+        if followed.is_some() {
+            "followed on LE 3"
+        } else {
+            "read, not followed"
+        },
         iw,
         theme,
     )];
@@ -610,26 +622,51 @@ fn connection_lines(
         theme,
     ));
     out.push(field_line("hop", c.hop_increment.to_string(), theme));
-    // ChSel says which algorithm the connection uses: #2 only when both
-    // ends support it (`pdu::Packet::ch_sel`), and each is predicted by its
-    // own rule rather than one standing in for the other.
-    let first: Option<(&str, Vec<u8>)> = if p.ch_sel {
-        Csa2::new(c.access_address, c.channel_map)
-            .map(|csa| ("CSA #2", (0..8).map(|n| csa.channel(n).0).collect()))
-    } else {
-        Csa1::new(c.hop_increment, c.channel_map)
-            .map(|mut csa| ("CSA #1", (0..8).map(|_| csa.next()).collect()))
+    // Which algorithm the connection hops by takes both ChSel bits, this
+    // packet's and the advertising PDU's it answered (`follow::uses_csa2`):
+    // the follower's answer when it is following, else the same rule over
+    // the packets heard before this one.
+    let csa2 = match followed {
+        Some(f) => Some(f.connection.algorithm() == 2),
+        None => {
+            let older = state
+                .net
+                .ble_packets
+                .iter()
+                .skip_while(|q| q.seq != p.seq)
+                .skip(1);
+            let advertised = older
+                .filter(|q| crate::signal::ble::follow::answers(q.pdu_type, q.adv_addr, &c))
+                .map(|q| q.ch_sel)
+                .next();
+            crate::signal::ble::follow::uses_csa2(p.ch_sel, advertised)
+        }
     };
-    let hops = match first {
-        Some((algorithm, channels)) => format!(
-            "{algorithm}: {} ... predicted, not followed",
+    let first: Option<(&str, Vec<u8>)> = match csa2 {
+        Some(true) => Csa2::new(c.access_address, c.channel_map)
+            .map(|csa| ("CSA #2", (0..8).map(|n| csa.channel(n).0).collect())),
+        Some(false) => Csa1::new(c.hop_increment, c.channel_map)
+            .map(|mut csa| ("CSA #1", (0..8).map(|_| csa.next()).collect())),
+        None => None,
+    };
+    let said = if followed.is_some() {
+        "followed"
+    } else {
+        "predicted, not followed"
+    };
+    let hops = match (csa2, first) {
+        (None, _) => {
+            "CSA #1 or #2 not known: the advertising PDU it answered was not heard".to_string()
+        }
+        (Some(_), Some((algorithm, channels))) => format!(
+            "{algorithm}: {} ... {said}",
             channels
                 .iter()
                 .map(u8::to_string)
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
-        None => "no channel used: nothing to predict".to_string(),
+        (Some(_), None) => "no channel used: nothing to predict".to_string(),
     };
     out.extend(wrapped("hops", &hops, iw, theme));
     out
@@ -1303,11 +1340,74 @@ mod tests {
         assert!(out.contains("ChSel    CSA #1 only"), "{out}");
     }
 
-    /// **ChSel set: Algorithm #2's sequence, never #1's**, from this
+    /// The advertising PDU a CONNECT_IND answered, heard before it: an
+    /// ADV_IND from its AdvA with `ch_sel`, older in the ring.
+    fn answered(m: &mut SdrMetrics, ch_sel: bool) {
+        let mut connect = m.net.ble_packets.pop_front().unwrap();
+        connect.seq = 2;
+        let mut adv = packet(None);
+        adv.pdu_type = PduType::AdvInd;
+        adv.adv_addr = Some([0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33]);
+        adv.ch_sel = ch_sel;
+        adv.seq = 1;
+        m.net.ble_packets.push_front(adv);
+        m.net.ble_packets.push_front(connect);
+    }
+
+    /// **CSA #2 only when both PDUs set ChSel** (Core 5.4 Vol 6 Part B 4.5):
+    /// the CONNECT_IND's bit alone is the initiator's, and it may set it
+    /// when the advertiser does not support #2.
+    #[test]
+    fn the_prediction_reads_both_chsel_bits() {
+        let mut both = connect_ind(true, true);
+        answered(&mut both, true);
+        let csa2 = draw(NetBleDetailPanel, 90, 40, &sel(&both)).join("\n");
+        assert!(csa2.contains("CSA #2:"), "{csa2}");
+
+        let mut initiator_only = connect_ind(true, true);
+        answered(&mut initiator_only, false);
+        let csa1 = draw(NetBleDetailPanel, 90, 40, &sel(&initiator_only)).join("\n");
+        assert!(
+            csa1.contains("CSA #1: 7 14 21 28 35 5 12 19 ... predicted"),
+            "{csa1}"
+        );
+
+        let unheard = draw(NetBleDetailPanel, 90, 40, &sel(&connect_ind(true, true))).join("\n");
+        assert!(
+            unheard.contains("not known: the advertising PDU it answered was not heard"),
+            "{unheard}"
+        );
+        assert!(
+            !unheard.contains("CSA #2:") && !unheard.contains("CSA #1:"),
+            "{unheard}"
+        );
+    }
+
+    /// A connection that is being followed says where, and its hops are the
+    /// follower's.
+    #[test]
+    fn a_followed_connect_ind_points_at_le_3() {
+        let mut m = connect_ind(false, true);
+        let c = crate::signal::ble::connect::decode_octets(&m.net.ble_packets[0].payload).unwrap();
+        m.net.follow(
+            &c,
+            (Some(false), false, false),
+            0.0,
+            20e6,
+            std::time::Instant::now(),
+        );
+        let out = draw(NetBleDetailPanel, 90, 40, &sel(&m)).join("\n");
+        assert!(out.contains("followed on LE 3"), "{out}");
+        assert!(!out.contains("read, not followed"), "{out}");
+    }
+
+    /// **ChSel set on both: Algorithm #2's sequence, never #1's**, from this
     /// connection's Access Address; and a failed CRC reads no parameters.
     #[test]
     fn a_connect_ind_on_csa2_is_predicted_by_csa2_and_a_failed_one_is_not_read() {
-        let csa2 = draw(NetBleDetailPanel, 90, 40, &sel(&connect_ind(true, true))).join("\n");
+        let mut both = connect_ind(true, true);
+        answered(&mut both, true);
+        let csa2 = draw(NetBleDetailPanel, 90, 40, &sel(&both)).join("\n");
         let expected = crate::signal::ble::connect::Csa2::new(0xAF9A_B12C, 0x1F_FFFF_FFFF).unwrap();
         let first: Vec<String> = (0..8).map(|n| expected.channel(n).0.to_string()).collect();
         let want = format!("CSA #2: {} ... predicted, not followed", first.join(" "));

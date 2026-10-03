@@ -32,34 +32,22 @@
 //! 5-bit width is confirmed by the text's own stated range, "5 to 16",
 //! which needs at least 5 bits and no more.
 //!
-//! **Algorithm #2 was added later** ([`Csa2`], net-ux-polish-plan 5.4.b4, at
-//! Viktor's request), held to the specification's own sample data; the
-//! paragraph below is B20's original scoping, kept as the record of why it
-//! was first left out.
+//! **Both algorithms**, each held to the specification's own sample data:
+//! [`Csa1`]'s plain modular hop and [`Csa2`]'s permutation.
 //!
-//! **Scope, decided before landing anything: Channel Selection Algorithm
-//! #1 only, not Algorithm #2.** Algorithm #2 is real, separate work - a
-//! PRNG-like permutation function with several more inputs, not a
-//! generalisation of Algorithm #1's own plain modular arithmetic.
-//! `CONNECT_IND`'s own header carries a `ChSel` bit saying which one a
-//! connection actually uses (set to 1 only if both the initiator and the
-//! advertiser support Algorithm #2); `pdu::decode` reads it since
-//! net-ux-polish-plan 5.1, and the packet detail view predicts each
-//! connection by the algorithm the bit names.
+//! **Which one a connection uses is not this packet's to say alone.** The
+//! `CONNECT_IND`'s `ChSel` bit is the initiator's: "If the initiator supports
+//! the LE Channel Selection Algorithm #2 feature but the advertiser does not,
+//! the initiator may set the ChSel field to 0 or 1" (2.3.3.1). The connection
+//! uses #2 only when the advertising PDU it answered set its bit too (4.5),
+//! and `signal::ble::follow::uses_csa2` reads the two together. Reading this
+//! packet's bit alone once sent a follower to the wrong channels for every
+//! event of a TV box and its remote.
 //!
-//! **Read, not followed.** Since net-ux-polish-plan 5.4.b3 the packet
-//! detail view decodes a received `CONNECT_IND` ([`decode_octets`]) and shows
-//! its parameters and, for Algorithm #1, the first channels [`Csa1`]
-//! predicts, labelled "predicted, not followed". No live receiver captures
-//! a `CONNECT_IND` and starts hopping; `signal::ble::receive`
-//! only ever demodulates whichever one channel the radio is tuned to.
-//! The same honest scope every large piece of this arc has landed with
-//! first (B14's own `access_code`, B16's own `header`, B18's own
-//! `coded`), for the reason this checkpoint's own write-up in
-//! `bluetooth-bench-plan.md` gives in full: B19's own retune latency has
-//! never been measured against a real backend, so whether live hopping
-//! is even physically possible on the hardware this app actually runs on
-//! is still unknown.
+//! **Followed, not only read.** The packet detail view decodes a received
+//! `CONNECT_IND` ([`decode_octets`]) and shows its parameters and first
+//! channels; `signal::ble::follow` follows the connection itself, through
+//! the events whose channels the radio's band holds, without retuning.
 
 /// One `CONNECT_IND`/`AUX_CONNECT_REQ` PDU's own payload, decoded - the
 /// initiator's and the advertiser's own addresses, and the ten `LLData`

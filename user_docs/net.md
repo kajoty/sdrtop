@@ -376,7 +376,10 @@ The selected packet, spelled out:
 - **Connection**, for a `CONNECT_IND`: the parameters the two devices agreed
   (interval, latency, timeout, channel map, sleep-clock accuracy) and the
   first channels the connection will hop to, predicted from them with
-  Channel Selection Algorithm #1 or #2, **predicted, not followed**. `Enter`
+  Channel Selection Algorithm #1 or #2, **predicted, not followed**. Which
+  of the two takes both ChSel bits, this packet's and the advertising
+  packet's it answered; with that one not heard, the detail says it does not
+  know rather than pick. A connection being followed says so here. `Enter`
   on a `CONNECT_IND` in the list opens the connection itself on LE 3.
 - **Physics**: SNR, carrier offset in kHz and ppm, and the carrier at the
   start and end of the packet: the start is the preamble's mean frequency

@@ -685,6 +685,13 @@ pub fn uses_csa2(connect_ch_sel: bool, advertised_ch_sel: Option<bool>) -> Optio
     advertised_ch_sel
 }
 
+/// Whether an advertising PDU is one a CONNECT_IND can answer: connectable
+/// (ADV_IND or ADV_DIRECT_IND, the two 4.5 names) and from its AdvA.
+pub fn answers(t: super::pdu::PduType, adv_addr: Option<[u8; 6]>, c: &ConnectIndData) -> bool {
+    use super::pdu::PduType;
+    matches!(t, PduType::AdvInd | PduType::AdvDirectInd) && adv_addr == Some(c.adv_a)
+}
+
 /// The instant an update takes effect at, for the ones that have one.
 fn instant_of(update: &llcp::Update) -> Option<u16> {
     match *update {

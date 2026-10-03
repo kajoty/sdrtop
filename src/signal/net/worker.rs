@@ -149,17 +149,6 @@ fn event_window(
     (from, to)
 }
 
-/// Whether an advertising PDU is one a CONNECT_IND answers: connectable
-/// (ADV_IND or ADV_DIRECT_IND, Core 5.4 Vol 6 Part B 4.5) and from its AdvA.
-fn answered_by(
-    t: crate::signal::ble::pdu::PduType,
-    adv_addr: Option<[u8; 6]>,
-    c: &crate::signal::ble::connect::ConnectIndData,
-) -> bool {
-    use crate::signal::ble::pdu::PduType;
-    matches!(t, PduType::AdvInd | PduType::AdvDirectInd) && adv_addr == Some(c.adv_a)
-}
-
 /// Where a CONNECT_IND's packet ended, pairs: the end of its CRC, from where
 /// its PDU's first bit was centred and how many bits the PDU is, on LE 1M.
 fn connect_end_pair(p: &crate::signal::ble::pdu::Packet, rate_hz: f64) -> Option<f64> {
@@ -1140,7 +1129,9 @@ impl NetWorker {
                             let answered = packets[..i]
                                 .iter()
                                 .rev()
-                                .find(|q| answered_by(q.pdu_type, q.adv_addr, &c))
+                                .find(|q| {
+                                    crate::signal::ble::follow::answers(q.pdu_type, q.adv_addr, &c)
+                                })
                                 .map(|q| q.ch_sel);
                             let flags = (p.ch_sel, p.tx_add_random, p.rx_add_random);
                             Some((c, flags, answered, connect_end_pair(p, rate_hz)?))
@@ -1153,7 +1144,9 @@ impl NetWorker {
                             m.net
                                 .ble_packets
                                 .iter()
-                                .find(|q| answered_by(q.pdu_type, q.adv_addr, c))
+                                .find(|q| {
+                                    crate::signal::ble::follow::answers(q.pdu_type, q.adv_addr, c)
+                                })
                                 .map(|q| q.ch_sel)
                         });
                         let csa2 = crate::signal::ble::follow::uses_csa2(*ch_sel, answered);
