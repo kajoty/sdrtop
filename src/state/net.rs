@@ -527,7 +527,7 @@ impl NetState {
     ///
     /// The packets the BLE list shows, newest first: the held copy while the
     /// list is held, the live ring otherwise, narrowed to the filter's
-    /// address when there is one.
+    /// address and to the chosen kind of PDU when there are those.
     ///
     /// **The one account of the list**, read by the panel that draws it and
     /// the keys that move through it, so the arrows step through exactly the
@@ -540,7 +540,49 @@ impl NetState {
         source
             .iter()
             .filter(|p| self.ble_view.filter.is_none_or(|a| p.adv_addr == Some(a)))
+            .filter(|p| {
+                self.ble_view
+                    .kind
+                    .is_none_or(|k| PduKind::of(p.pdu_type) == Some(k))
+            })
             .collect()
+    }
+
+    /// The moment back to which [`Self::ble_packets`] is every packet heard,
+    /// or `None` when it still is all the way: the oldest kept packet of each
+    /// kind at its limit, the latest of those. Before it, only the kinds not
+    /// yet cut remain, so a reader of the ring as a record of the band (the
+    /// coexistence marks) stops there.
+    ///
+    /// A kind exactly at the limit counts as cut: it may have been, and a
+    /// stretch drawn too short is a smaller error than one drawn too quiet.
+    pub fn ble_complete_since(&self) -> Option<std::time::Instant> {
+        let mut kept = [0usize; 4];
+        let mut oldest = [None; 4];
+        for p in &self.ble_packets {
+            let slot = kind_slot(p.pdu_type);
+            kept[slot] += 1;
+            oldest[slot] = Some(p.seen);
+        }
+        (0..4)
+            .filter(|&i| kept[i] >= BLE_PACKET_LIMIT)
+            .filter_map(|i| oldest[i])
+            .max()
+    }
+
+    /// Cut [`Self::ble_packets`] to the newest [`BLE_PACKET_LIMIT`] of each
+    /// [`PduKind`] (and of the types none names), keeping arrival order.
+    ///
+    /// **Per kind, not overall**: advertising arrives by the hundred and a
+    /// CONNECT_IND once, so one shared limit pushed the packet a reader was
+    /// looking for out of the list within seconds of its arrival.
+    pub fn trim_ble_packets(&mut self) {
+        let mut kept = [0usize; 4];
+        self.ble_packets.retain(|p| {
+            let slot = kind_slot(p.pdu_type);
+            kept[slot] += 1;
+            kept[slot] <= BLE_PACKET_LIMIT
+        });
     }
 
     /// Packets that have arrived since the list was held; zero when it is not.
@@ -843,10 +885,10 @@ impl NetState {
     }
 }
 
-/// How many recent PDUs [`NetState::ble_packets`] keeps. A bench instrument
-/// is read a screenful at a time, not scrolled back through a session's
-/// worth of advertising traffic; old rows fall off the end rather than
-/// growing the list forever.
+/// How many recent PDUs of each kind [`NetState::ble_packets`] keeps
+/// ([`NetState::trim_ble_packets`]). A bench instrument is read a screenful
+/// at a time, not scrolled back through a session's worth of advertising
+/// traffic; old rows fall off the end rather than growing the list forever.
 pub const BLE_PACKET_LIMIT: usize = 200;
 
 /// The hop scatter's zoom steps, in milliseconds: from half a second, where
@@ -1010,10 +1052,73 @@ pub struct BlePacketView {
     pub selection: super::Selection<u64>,
     /// Only packets from this advertiser address, when set.
     pub filter: Option<[u8; 6]>,
+    /// Only this kind of PDU, when set. It narrows together with
+    /// [`Self::filter`], and outlives leaving the view as that does.
+    pub kind: Option<PduKind>,
     /// The list as it stood when it was held, and [`NetState::ble_heard`] at
     /// that moment: a copy, so holding the list stops nothing else. The
     /// coexistence marks and the census go on taking every packet.
     pub held: Option<(std::collections::VecDeque<BlePacket>, u64)>,
+}
+
+/// The three kinds of advertising channel PDU the BLE list can be narrowed
+/// to, by what a reader is looking for: a connection being set up, a scanner
+/// asking, or the advertising that makes up nearly all of the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PduKind {
+    /// CONNECT_IND.
+    Connect,
+    /// SCAN_REQ and SCAN_RSP.
+    Scan,
+    /// ADV_IND, ADV_DIRECT_IND, ADV_NONCONN_IND and ADV_SCAN_IND.
+    Advertising,
+}
+
+impl PduKind {
+    /// The kind a PDU type belongs to; `None` for the types none of them
+    /// names, which a kind filter therefore never shows.
+    pub fn of(pdu_type: crate::signal::ble::pdu::PduType) -> Option<Self> {
+        use crate::signal::ble::pdu::PduType;
+        match pdu_type {
+            PduType::ConnectInd => Some(Self::Connect),
+            PduType::ScanReq | PduType::ScanRsp => Some(Self::Scan),
+            PduType::AdvInd
+            | PduType::AdvDirectInd
+            | PduType::AdvNonconnInd
+            | PduType::AdvScanInd => Some(Self::Advertising),
+            PduType::Other(_) => None,
+        }
+    }
+
+    /// The next step of the list's `t` key: every kind, then each in turn.
+    pub fn step(current: Option<Self>) -> Option<Self> {
+        match current {
+            None => Some(Self::Connect),
+            Some(Self::Connect) => Some(Self::Scan),
+            Some(Self::Scan) => Some(Self::Advertising),
+            Some(Self::Advertising) => None,
+        }
+    }
+
+    /// How the frame and the list name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "CONNECT",
+            Self::Scan => "SCAN",
+            Self::Advertising => "ADV",
+        }
+    }
+}
+
+/// Where a PDU type is counted against [`BLE_PACKET_LIMIT`]: one slot per
+/// [`PduKind`], and one for the types none of them names.
+fn kind_slot(pdu_type: crate::signal::ble::pdu::PduType) -> usize {
+    match PduKind::of(pdu_type) {
+        Some(PduKind::Connect) => 0,
+        Some(PduKind::Scan) => 1,
+        Some(PduKind::Advertising) => 2,
+        None => 3,
+    }
 }
 
 /// How the census table is being read: what orders it, and where the cursor is.
@@ -1333,6 +1438,80 @@ impl BandOccupancy {
 
 #[cfg(test)]
 mod tests {
+
+    fn ble_packet(seq: u64, pdu_type: crate::signal::ble::pdu::PduType) -> BlePacket {
+        BlePacket {
+            phy: crate::signal::ble::Phy::OneM,
+            seq,
+            channel: 37,
+            pdu_type,
+            ch_sel: false,
+            tx_add_random: false,
+            rx_add_random: false,
+            length: 6,
+            adv_addr: Some([seq as u8; 6]),
+            payload: Vec::new(),
+            crc_ok: true,
+            snr_db: None,
+            freq_offset_hz: None,
+            modulation: None,
+            drift: None,
+            seen: std::time::Instant::now(),
+        }
+    }
+
+    /// **How far back the list is every packet**: as far as the oldest kept
+    /// packet of a kind that has been cut; everything when none has.
+    #[test]
+    fn the_list_is_complete_back_to_the_oldest_cut_kind() {
+        use crate::signal::ble::pdu::PduType;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let at = |seq, t, s: u64| BlePacket {
+            seen: now - Duration::from_secs(s),
+            ..ble_packet(seq, t)
+        };
+        let mut net = NetState::default();
+        net.ble_packets.push_front(at(1, PduType::ConnectInd, 900));
+        net.ble_packets.push_front(at(2, PduType::AdvInd, 800));
+        assert_eq!(net.ble_complete_since(), None, "nothing cut yet");
+
+        for seq in 0..BLE_PACKET_LIMIT as u64 {
+            net.ble_packets
+                .push_front(at(10 + seq, PduType::AdvInd, 500 - seq));
+        }
+        net.trim_ble_packets();
+        let oldest_adv = now - Duration::from_secs(500);
+        assert_eq!(net.ble_complete_since(), Some(oldest_adv));
+    }
+
+    /// **The flood does not push the rare kinds out.** The ring keeps the
+    /// newest [`BLE_PACKET_LIMIT`] of each kind, so a CONNECT_IND heard
+    /// before three hundred advertisements is still there to filter for.
+    #[test]
+    fn the_ring_keeps_each_kinds_newest() {
+        use crate::signal::ble::pdu::PduType;
+        let mut net = NetState::default();
+        net.ble_packets
+            .push_front(ble_packet(1, PduType::ConnectInd));
+        net.ble_packets.push_front(ble_packet(2, PduType::ScanReq));
+        for seq in 3..303 {
+            net.ble_packets.push_front(ble_packet(seq, PduType::AdvInd));
+        }
+        net.trim_ble_packets();
+        let advs = net
+            .ble_packets
+            .iter()
+            .filter(|p| p.pdu_type == PduType::AdvInd)
+            .count();
+        assert_eq!(advs, BLE_PACKET_LIMIT);
+        // The newest of them, in arrival order still.
+        assert_eq!(net.ble_packets.front().map(|p| p.seq), Some(302));
+        assert!(net.ble_packets.iter().any(|p| p.seq == 1));
+        assert!(net.ble_packets.iter().any(|p| p.seq == 2));
+        assert!(!net.ble_packets.iter().any(|p| p.seq == 102));
+        assert!(net.ble_packets.iter().any(|p| p.seq == 103));
+    }
 
     fn connect_ind(aa: u32) -> crate::signal::ble::connect::ConnectIndData {
         crate::signal::ble::connect::ConnectIndData {

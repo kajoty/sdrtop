@@ -1201,7 +1201,7 @@ impl NetWorker {
                             seen: now,
                         });
                     }
-                    m.net.ble_packets.truncate(crate::state::BLE_PACKET_LIMIT);
+                    m.net.trim_ble_packets();
                 }
             }
 

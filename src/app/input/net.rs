@@ -403,8 +403,8 @@ pub(super) fn net_bt_hops(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
 /// The BLE packet list: the arrows move the cursor through the packets in the
 /// order the panel draws them (`NetState::ble_shown`), newest first; `Enter`
 /// opens a CONNECT_IND's connection on LE 3, and on any other packet narrows
-/// the list to its address and back; `h` holds the
-/// list and lets it run again; `p` switches the PHY (it shadows the next
+/// the list to its address and back; `t` narrows it to one kind of PDU in
+/// turn and back to all; `h` holds the list and lets it run again; `p` switches the PHY (it shadows the next
 /// layout only while the list is focused, as the census shadows `s` and
 /// `r`). Anything else goes on to the global keys.
 pub(super) fn net_ble_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyAction {
@@ -438,6 +438,9 @@ pub(super) fn net_ble_packets(key: KeyEvent, ctx: &mut InputCtx<'_>) -> KeyActio
             }
             None => filter_to_selected(&mut m),
         },
+        KeyCode::Char('t') => {
+            m.net.ble_view.kind = crate::state::PduKind::step(m.net.ble_view.kind);
+        }
         // `h` is the spectrum's hold everywhere else; no NET layout shows a
         // spectrum, and holding a list is the same idea.
         KeyCode::Char('h') => {
@@ -865,6 +868,74 @@ mod tests {
         press(KeyCode::Char('h'));
         assert!(metrics(&state).net.ble_view.held.is_none());
         assert_eq!(metrics(&state).net.ble_shown().len(), 4, "live again");
+    }
+
+    /// **`t` steps the list through the kinds of PDU and back to all**, and
+    /// the kind and the address narrow it together.
+    #[test]
+    fn t_steps_the_packet_list_through_the_kinds() {
+        use crate::signal::ble::pdu::PduType;
+        use crate::state::PduKind;
+        let mut m = SdrMetrics::fixture().streaming();
+        let types = [
+            PduType::AdvInd,
+            PduType::ScanReq,
+            PduType::ScanRsp,
+            PduType::ConnectInd,
+            PduType::AdvNonconnInd,
+            PduType::AdvDirectInd,
+            PduType::AdvScanInd,
+            PduType::Other(0x7),
+        ];
+        for (i, pdu_type) in types.into_iter().enumerate() {
+            m.net.ble_packets.push_front(crate::state::BlePacket {
+                seq: i as u64 + 1,
+                pdu_type,
+                adv_addr: Some([i as u8 + 1; 6]),
+                ..sample_packet()
+            });
+        }
+        let state = Arc::new(Mutex::new(m));
+        let mut engine = LayoutEngine::new(
+            crate::config::LayoutConfig::default_config(),
+            PanelRegistry::new(),
+        );
+        let mut show_footer = true;
+        let focus_keys = HashMap::new();
+        let mut ctx = InputCtx {
+            state: &state,
+            device: None,
+            engine: &mut engine,
+            show_footer: &mut show_footer,
+            focus_keys: &focus_keys,
+        };
+        let mut press = |code| {
+            net_ble_packets(KeyEvent::new(code, KeyModifiers::NONE), &mut ctx);
+        };
+        let shown = |s: &Arc<Mutex<SdrMetrics>>| -> Vec<u64> {
+            metrics(s).net.ble_shown().iter().map(|p| p.seq).collect()
+        };
+        let kind = |s: &Arc<Mutex<SdrMetrics>>| metrics(s).net.ble_view.kind;
+
+        assert_eq!(shown(&state).len(), 8);
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), Some(PduKind::Connect));
+        assert_eq!(shown(&state), vec![4]);
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), Some(PduKind::Scan));
+        assert_eq!(shown(&state), vec![3, 2]);
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), Some(PduKind::Advertising));
+        assert_eq!(shown(&state), vec![7, 6, 5, 1]);
+
+        // With an address as well: both have to hold.
+        metrics(&state).net.ble_view.filter = Some([1; 6]);
+        assert_eq!(shown(&state), vec![1]);
+        metrics(&state).net.ble_view.filter = None;
+
+        press(KeyCode::Char('t'));
+        assert_eq!(kind(&state), None);
+        assert_eq!(shown(&state).len(), 8);
     }
 
     /// A packet with no advertiser address has nothing to filter by.

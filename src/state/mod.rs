@@ -33,7 +33,7 @@ pub use micro::MicroView;
 // to be returned and destructured, and no call site has to name it.
 pub use net::{
     who_with, AddressDisplay, BandOccupancy, BlePacket, BtHop, CellReading, ConnectionView,
-    FollowedConnection, LockTarget, NetMode, NetState, PacketsView, RetuneRun, BLE_PACKET_LIMIT,
+    FollowedConnection, LockTarget, NetMode, NetState, PacketsView, PduKind, RetuneRun,
     BT_HOP_LIMIT, COLUMN_INTERVAL, FULL_ADDRESS_WIDTH, HISTORY_COLUMNS,
 };
 // Named by the NET worker's tests; the panel reads it through `SdrMetrics`.

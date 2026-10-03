@@ -371,6 +371,13 @@ terminal.
 - `Enter` narrows the list to the selected packet's address, and back.
   **[FILTERED]** says the list is not everything. Selecting a device in the
   Census and switching here narrows the list to it for you.
+- `t` narrows it to one kind of packet, then the next, then every kind
+  again: **CONNECT** (a connection being set up), **SCAN** (`SCAN_REQ` and
+  `SCAN_RSP`) or **ADV** (the advertising that is nearly everything else).
+  The frame names the kind, and it works together with `Enter`, so one
+  device's CONNECTs are two keys away. The list keeps the newest 200 of
+  each kind, not 200 overall, so a lone CONNECT_IND is still there after
+  the advertising flood that followed it.
 - `H` holds the list still; the title counts what has arrived since.
 
 The list hears **LE 1M**, and the frame says so. There used to be a key for
