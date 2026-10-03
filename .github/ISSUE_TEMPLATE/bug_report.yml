@@ -78,5 +78,5 @@ body:
     id: log
     attributes:
       label: Log
-      description: The part of `~/.config/sdrtop/sdrtop.log` from around when it happened. If you include only one thing, include this.
+      description: The part of `~/.config/sdrtop/sdrtop.log` from around when it happened. If you include only one thing, include this. From NET, LE or Classic, press `i` until addresses are masked before you copy a screen; the log is yours to trim.
       render: text

@@ -47,7 +47,7 @@ body:
     attributes:
       label: Before you send it
       options:
-        - label: I've read that sdrtop does its own signal processing and decoding, without external crates (rule 1).
+        - label: "I've read that sdrtop does its own signal processing and decoding ([rule 1](https://github.com/musithang/sdrtop/blob/main/CONTRIBUTING.md#1-sdrtop-decodes-signals-itself)): no crate does it beyond `rustfft` and `num-complex`."
           required: true
-        - label: I've read that audio, transmit and mouse input are out of scope (rule 6).
+        - label: "I've read that audio, transmit and mouse input are out of scope ([rule 6](https://github.com/musithang/sdrtop/blob/main/CONTRIBUTING.md#6-what-sdrtop-does-not-do))."
           required: true

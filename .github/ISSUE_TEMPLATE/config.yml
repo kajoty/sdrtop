@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: A question, or an idea to talk over
+    url: https://github.com/musithang/sdrtop/discussions
+    about: Not sure it's a bug, or not ready for a feature request? Start here.
   - name: Troubleshooting guide
     url: https://github.com/musithang/sdrtop/blob/main/user_docs/troubleshooting.md
     about: Most problems already have an answer here. Worth two minutes before a bug report.
