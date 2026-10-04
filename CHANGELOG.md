@@ -16,6 +16,24 @@ checkpoint instead of by version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The AMP is a switch through SoapyRemote too.** SoapyRemote can drop a
+  gain element's step, which left a HackRF's AMP a 0 to 14 stage and `A`
+  saying there was no boost to toggle; the element is now asked whether it
+  snaps to an end. `[` and `]` move the second stage by the name the driver
+  gave it, where they used to report success and move nothing, and the LNA
+  no longer switches the AMP on through the whole-chain gain. Contributed by
+  @kajoty.
+
+### Added
+
+- `--device soapy=driver=remote,remote=tcp://host:port` asks that
+  SoapyRemote host directly, rather than waiting for it to answer a LAN
+  broadcast. And `cargo run --example soapy_probe -- "driver=..."` asks a
+  SoapySDR device the questions sdrtop asks it, for a report. Contributed by
+  @kajoty.
+
 ## [0.6.3] - 2026-10-03
 
 **Following a BLE connection, and recording the radio.**
@@ -92,7 +110,6 @@ On the i3 this is developed on:
 
 Config: a new `[record]` section (`max_seconds`, `max_gb`). Nothing else
 changes, and a config without it loads as before.
->>>>>>> upstream/main
 
 ## [0.6.2] - 2026-09-27
 
